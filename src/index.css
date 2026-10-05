@@ -1,0 +1,136 @@
+@import './styles/fonts.css';
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  background: #0a0a0f;
+  overflow: hidden;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-family: 'Chakra Petch', Inter, system-ui, sans-serif;
+  letter-spacing: 0.01em;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.02);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+input,
+textarea,
+select,
+button {
+  font-family: inherit;
+}
+
+.titlebar-drag {
+  -webkit-app-region: drag;
+}
+.titlebar-no-drag {
+  -webkit-app-region: no-drag;
+}
+
+.krypt-sprite {
+  display: inline-block;
+  image-rendering: pixelated;
+}
+
+.krypt-pet {
+  animation: krypt-bob 2.8s ease-in-out infinite;
+  filter: drop-shadow(0 0 6px rgba(56, 189, 248, 0.45));
+}
+@keyframes krypt-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-2px); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .krypt-pet {
+    animation: none;
+  }
+}
+
+@layer components {
+  .krypt-card {
+    @apply rounded-xl border border-krypt-border bg-krypt-surface p-5;
+  }
+  .krypt-card-hover {
+    @apply transition-colors hover:border-krypt-borderHi;
+  }
+  .krypt-input {
+    @apply w-full rounded-md border border-krypt-border bg-krypt-surface2 px-3 py-2 text-sm text-white outline-none transition-colors placeholder:text-krypt-dim focus:border-krypt-indigo;
+  }
+  .krypt-label {
+    @apply mb-1 block text-xs font-medium uppercase tracking-wider text-krypt-muted;
+  }
+  .krypt-help {
+    @apply mt-1 text-xs text-krypt-dim;
+  }
+  .krypt-btn {
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-md border border-krypt-border px-3 py-2 text-sm font-medium text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+  }
+  .krypt-btn-default {
+    @apply krypt-btn bg-krypt-surface2 hover:border-krypt-borderHi hover:bg-white/5;
+  }
+  .krypt-btn-primary {
+    @apply krypt-btn border-transparent bg-gradient-to-r from-krypt-indigo via-krypt-purple to-krypt-pink shadow-krypt-soft hover:shadow-krypt-strong;
+  }
+  .krypt-btn-danger {
+    @apply krypt-btn border-krypt-loss/40 bg-krypt-loss/10 text-krypt-loss hover:border-krypt-loss hover:bg-krypt-loss/15;
+  }
+  .krypt-btn-ghost {
+    @apply krypt-btn border-transparent bg-transparent hover:bg-white/5;
+  }
+  .krypt-btn-rainbow {
+    @apply krypt-btn border-transparent font-semibold text-white shadow-krypt-soft hover:shadow-krypt-strong;
+    background-image: linear-gradient(90deg, #ff4d6d, #ff9e00, #ffe600, #38f59b, #2bd6ff, #8b5cf6, #ff4d6d);
+    background-size: 300% 100%;
+    animation: krypt-rainbow 5s linear infinite;
+  }
+  .krypt-pill {
+    @apply inline-flex items-center gap-1 rounded-full border border-krypt-border bg-krypt-surface2 px-2 py-0.5 text-[11px] font-medium uppercase tracking-wider;
+  }
+  .krypt-section-title {
+    @apply mb-4 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-krypt-muted;
+  }
+  .krypt-table {
+    @apply w-full text-sm;
+  }
+  .krypt-table th {
+    @apply border-b border-krypt-border px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wider text-krypt-muted;
+  }
+  .krypt-table td {
+    @apply border-b border-krypt-border/50 px-3 py-2 text-white/90;
+  }
+  .krypt-table tr:hover td {
+    @apply bg-white/[0.02];
+  }
+}
+
+@keyframes krypt-rainbow {
+  0% { background-position: 0% 50%; }
+  100% { background-position: 300% 50%; }
+}

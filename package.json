@@ -1,0 +1,137 @@
+{
+  "name": "krypt-trader",
+  "productName": "Krypt Trader",
+  "version": "6.0.0",
+  "description": "A free, fully-featured Kalshi trading app. Whale tracker, momentum scanner, manual trading terminal and a configurable auto-trading engine in one polished desktop app. Part of the Krypt free tools suite.",
+  "main": "dist-electron/main.js",
+  "author": {
+    "name": "Krypt",
+    "email": "hi@krypt.cc",
+    "url": "https://krypt.cc"
+  },
+  "homepage": "https://krypt.cc/tools/trader",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/scripflipped/krypt-trader.git"
+  },
+  "bugs": {
+    "url": "https://github.com/scripflipped/krypt-trader/issues"
+  },
+  "license": "MIT",
+  "private": true,
+  "scripts": {
+    "predev": "node scripts/setup-python.mjs",
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.node.json --noEmit && tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:all": "npm run typecheck && vitest run && node scripts/test-python.mjs",
+    "py:setup": "node scripts/setup-python.mjs",
+    "py:test": "node scripts/test-python.mjs",
+    "py:backtest": "node scripts/backtest.mjs",
+    "py:backtest15m": "node scripts/backtest.mjs --c15",
+    "py:backfill": "node scripts/backfill.mjs",
+    "py:turbine": "node scripts/turbine.mjs",
+    "gen:referrals": "node scripts/referrals.mjs",
+    "py:dist": "node scripts/build-python.mjs",
+    "dist": "npm run build && npm run py:dist && electron-builder"
+  },
+  "dependencies": {
+    "discord-rpc": "^4.0.1"
+  },
+  "devDependencies": {
+    "@codemirror/lang-python": "^6.2.1",
+    "@codemirror/state": "^6.7.1",
+    "@codemirror/view": "^6.43.6",
+    "@testing-library/dom": "^10.4.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/discord-rpc": "^4.0.9",
+    "@types/node": "^20.12.7",
+    "@types/react": "^18.2.74",
+    "@types/react-dom": "^18.2.24",
+    "@vitejs/plugin-react": "^4.2.1",
+    "autoprefixer": "^10.4.19",
+    "codemirror": "^6.0.2",
+    "electron": "^30.0.1",
+    "electron-builder": "^24.13.3",
+    "jsdom": "^25.0.1",
+    "lucide-react": "^0.368.0",
+    "postcss": "^8.4.38",
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "recharts": "^2.12.7",
+    "tailwindcss": "^3.4.3",
+    "typescript": "^5.4.5",
+    "vite": "^5.2.9",
+    "vite-plugin-electron": "^0.28.4",
+    "vite-plugin-electron-renderer": "^0.14.5",
+    "vitest": "^2.1.9"
+  },
+  "build": {
+    "appId": "cc.krypt.trader",
+    "productName": "Krypt Trader",
+    "files": [
+      "dist/**",
+      "dist-electron/**",
+      "resources/**"
+    ],
+    "extraResources": [
+      {
+        "from": "python/dist/krypt-trader-backend",
+        "to": "python",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "asarUnpack": [
+      "**/node_modules/discord-rpc/**",
+      "resources/**"
+    ],
+    "afterPack": "./scripts/mac-adhoc-sign.cjs",
+    "directories": {
+      "buildResources": "build",
+      "output": "release"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "resources/krypt.ico",
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb"
+      ],
+      "icon": "build/icon.png",
+      "category": "Office",
+      "maintainer": "Krypt <hi@krypt.cc>",
+      "artifactName": "${productName}-${version}.${ext}"
+    },
+    "mac": {
+      "target": [
+        "dmg"
+      ],
+      "icon": "build/icon.png",
+      "category": "public.app-category.finance",
+      "artifactName": "${productName}-${version}-${arch}.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "menuCategory": false,
+      "runAfterFinish": true,
+      "installerIcon": "resources/krypt.ico",
+      "uninstallerIcon": "resources/krypt.ico",
+      "uninstallDisplayName": "Krypt Trader",
+      "include": "build/installer.nsh",
+      "shortcutName": "Krypt Trader"
+    },
+    "publish": null
+  }
+}

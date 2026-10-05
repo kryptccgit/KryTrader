@@ -1,0 +1,185 @@
+import { contextBridge, ipcRenderer } from 'electron';
+import type {
+  AccountSnapshot, ActionResult, AppState, BackendInfo, BotPosition, CredentialsInput,
+  CredentialsState, KryptApi, LogEntry, PnlPoint, PositionFilter, Profile,
+  ScannerStats, SignalFilter, SignalRow, StrategyPreset, TraderConfig,
+} from '../shared/types';
+import type { McpTradeMode } from '../shared/market';
+
+const sub = <T>(channel: string, cb: (val: T) => void): (() => void) => {
+  const handler = (_e: unknown, val: T) => cb(val);
+  ipcRenderer.on(channel, handler);
+  return () => ipcRenderer.removeListener(channel, handler);
+};
+
+const api: KryptApi = {
+  app: {
+    version: () => ipcRenderer.invoke('app:version'),
+    openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
+    showItemInFolder: (p) => ipcRenderer.invoke('app:showItemInFolder', p),
+    getUserDataPath: () => ipcRenderer.invoke('app:getUserDataPath'),
+    getReferralUrl: () => ipcRenderer.invoke('app:getReferralUrl'),
+    factoryReset: () => ipcRenderer.invoke('app:factoryReset'),
+    onDataReset: (cb) => sub<unknown>('data:reset', cb),
+  },
+  state: {
+    get: (): Promise<AppState> => ipcRenderer.invoke('state:get'),
+    onChange: (cb) => sub<AppState>('state:changed', cb),
+    setStartMinimized: (v) => ipcRenderer.invoke('state:setStartMinimized', v),
+    setStartWithWindows: (v) => ipcRenderer.invoke('state:setStartWithWindows', v),
+    setEnableDiscordRpc: (v) => ipcRenderer.invoke('state:setEnableDiscordRpc', v),
+    acceptDisclaimer: () => ipcRenderer.invoke('state:acceptDisclaimer'),
+  },
+  config: {
+    get: (): Promise<TraderConfig> => ipcRenderer.invoke('config:get'),
+    update: (patch) => ipcRenderer.invoke('config:update', patch),
+    replace: (cfg) => ipcRenderer.invoke('config:replace', cfg),
+    reset: () => ipcRenderer.invoke('config:reset'),
+    listStrategies: (): Promise<StrategyPreset[]> =>
+      ipcRenderer.invoke('config:listStrategies'),
+    applyStrategy: (id) => ipcRenderer.invoke('config:applyStrategy', id),
+  },
+  profiles: {
+    list: (): Promise<Profile[]> => ipcRenderer.invoke('profiles:list'),
+    save: (name, description, kind) => ipcRenderer.invoke('profiles:save', name, description, kind),
+    apply: (id) => ipcRenderer.invoke('profiles:apply', id),
+    rename: (id, name) => ipcRenderer.invoke('profiles:rename', id, name),
+    update: (id) => ipcRenderer.invoke('profiles:update', id),
+    delete: (id) => ipcRenderer.invoke('profiles:delete', id),
+    duplicate: (id) => ipcRenderer.invoke('profiles:duplicate', id),
+    export: (id) => ipcRenderer.invoke('profiles:export', id),
+    import: (json) => ipcRenderer.invoke('profiles:import', json),
+  },
+  credentials: {
+    status: (): Promise<CredentialsState> => ipcRenderer.invoke('credentials:status'),
+    statusAll: () => ipcRenderer.invoke('credentials:statusAll'),
+    save: (input: CredentialsInput) => ipcRenderer.invoke('credentials:save', input),
+    test: (env?: string) => ipcRenderer.invoke('credentials:test', env),
+    clear: (env?: string) => ipcRenderer.invoke('credentials:clear', env),
+    onChanged: (cb) => sub<unknown>('credentials:changed', cb),
+  },
+  backend: {
+    info: (): Promise<BackendInfo> => ipcRenderer.invoke('backend:info'),
+    start: () => ipcRenderer.invoke('backend:start'),
+    stop: () => ipcRenderer.invoke('backend:stop'),
+    restart: () => ipcRenderer.invoke('backend:restart'),
+    onInfo: (cb) => sub<BackendInfo>('backend:info', cb),
+    runOnce: (action) => ipcRenderer.invoke('backend:runOnce', action),
+  },
+  trading: {
+    setEnabled: (v: boolean): Promise<ActionResult> =>
+      ipcRenderer.invoke('trading:setEnabled', v),
+    cancelAllOpen: () => ipcRenderer.invoke('trading:cancelAllOpen'),
+    status: () => ipcRenderer.invoke('trading:status'),
+    collection: () => ipcRenderer.invoke('backtest:collection'),
+    exportData: () => ipcRenderer.invoke('backtest:export'),
+    flatten: () => ipcRenderer.invoke('trading:flatten'),
+  },
+  data: {
+    account: (): Promise<AccountSnapshot> => ipcRenderer.invoke('data:account'),
+    pnlSeries: (sinceHours?: number): Promise<PnlPoint[]> =>
+      ipcRenderer.invoke('data:pnlSeries', sinceHours),
+    positions: (filter?: PositionFilter): Promise<BotPosition[]> =>
+      ipcRenderer.invoke('data:positions', filter),
+    signals: (filter?: SignalFilter): Promise<SignalRow[]> =>
+      ipcRenderer.invoke('data:signals', filter),
+    scannerStats: (): Promise<ScannerStats> => ipcRenderer.invoke('data:scannerStats'),
+    botRuns: (env, limit) =>
+      ipcRenderer.invoke('data:botRuns', env ?? null, limit),
+    onAccount: (cb) => sub<AccountSnapshot>('data:account', cb),
+    onPosition: (cb) => sub<BotPosition>('data:position', cb),
+    onSignal: (cb) => sub<SignalRow>('data:signal', cb),
+  },
+  crypto15m: {
+    snapshot: () => ipcRenderer.invoke('crypto15m:snapshot'),
+    status: () => ipcRenderer.invoke('crypto15m:status'),
+    edgeHealth: () => ipcRenderer.invoke('crypto15m:edgeHealth'),
+    backtest: (args?: { sinceDays?: number; config?: Record<string, unknown> }) => ipcRenderer.invoke('crypto15m:backtest', args),
+    backtestMain: (args?: { sinceDays?: number; config?: Record<string, unknown> }) => ipcRenderer.invoke('main:backtest', args),
+    history: (args?: { limit?: number; includePaper?: boolean }) => ipcRenderer.invoke('crypto15m:history', args),
+  },
+  scripts: {
+    list: () => ipcRenderer.invoke('scripts:list'),
+    save: (s) => ipcRenderer.invoke('scripts:save', s),
+    delete: (id: string) => ipcRenderer.invoke('scripts:delete', id),
+    setEnabled: (id: string, enabled: boolean) => ipcRenderer.invoke('scripts:setEnabled', id, enabled),
+    setTrusted: (id: string, trusted: boolean) => ipcRenderer.invoke('scripts:setTrusted', id, trusted),
+    validate: (code: string, trusted?: boolean) => ipcRenderer.invoke('scripts:validate', code, trusted),
+    backtest: (args) => ipcRenderer.invoke('scripts:backtest', args),
+    contextPack: () => ipcRenderer.invoke('scripts:contextPack'),
+    docs: () => ipcRenderer.invoke('scripts:docs'),
+    exportPack: () => ipcRenderer.invoke('scripts:exportPack'),
+    onStatus: (cb) => sub<{ id: string; enabled: boolean; lastError?: string }>('scripts:status', cb),
+    onLog: (cb) => sub<{ id: string; lines: string[] }>('scripts:log', cb),
+  },
+  turbine: {
+    library: (args?: { rerun?: boolean; days?: number }) => ipcRenderer.invoke('turbine:library', args),
+    optimize: (args: { coin: string; granularityH?: number; sinceDays?: number; minTrades?: number; minTradesCoin?: number; holdout?: string; strategyNames?: string[] }) =>
+      ipcRenderer.invoke('turbine:optimize', args),
+  },
+  perps: {
+    status: () => ipcRenderer.invoke('perps:status'),
+    farmFlatten: () => ipcRenderer.invoke('perps:farmFlatten'),
+  },
+  kalshi: {
+    marketUrl: (args) => ipcRenderer.invoke('kalshi:marketUrl', args),
+  },
+  terminal: {
+    discover: (args) => ipcRenderer.invoke('terminal:discover', args),
+    search: (args) => ipcRenderer.invoke('terminal:search', args),
+    market: (args) => ipcRenderer.invoke('terminal:market', args),
+    book: (args) => ipcRenderer.invoke('terminal:book', args),
+    candles: (args) => ipcRenderer.invoke('terminal:candles', args),
+    tape: (args) => ipcRenderer.invoke('terminal:tape', args),
+    portfolio: () => ipcRenderer.invoke('terminal:portfolio'),
+    orders: () => ipcRenderer.invoke('terminal:orders'),
+    history: (args) => ipcRenderer.invoke('terminal:history', args),
+    rules: (args) => ipcRenderer.invoke('terminal:rules', args),
+    armRule: (req) => ipcRenderer.invoke('terminal:armRule', req),
+    cancelRule: (args) => ipcRenderer.invoke('terminal:cancelRule', args),
+    micro: (args) => ipcRenderer.invoke('terminal:micro', args),
+    hosts: () => ipcRenderer.invoke('terminal:hosts'),
+    crossVenue: (args) => ipcRenderer.invoke('terminal:crossVenue', args),
+    remoteStatus: () => ipcRenderer.invoke('remote:status'),
+    remoteSetToken: (args) => ipcRenderer.invoke('remote:setToken', args),
+    remotePairCode: () => ipcRenderer.invoke('remote:pairCode'),
+    remoteUnpair: (args) => ipcRenderer.invoke('remote:unpair', args),
+    remoteTest: () => ipcRenderer.invoke('remote:test'),
+    onRule: (cb) => sub<{ rule: any; message: string }>('terminal:rule', cb),
+    preview: (req) => ipcRenderer.invoke('terminal:preview', req),
+    submit: (req) => ipcRenderer.invoke('terminal:submit', req),
+    cancel: (args) => ipcRenderer.invoke('terminal:cancel', args),
+    shardTransfer: (args) => ipcRenderer.invoke('shard:transfer', args),
+    watchlist: () => ipcRenderer.invoke('terminal:watchlist'),
+    setWatched: (args) => ipcRenderer.invoke('terminal:setWatched', args),
+    aiStatus: () => ipcRenderer.invoke('ai:status'),
+    aiSetKey: (args) => ipcRenderer.invoke('ai:setKey', args),
+    aiAnalyze: (args) => ipcRenderer.invoke('ai:analyze', args),
+    aiScoreboard: () => ipcRenderer.invoke('ai:scoreboard'),
+    mcpStatus: () => ipcRenderer.invoke('mcp:status'),
+    mcpRotateToken: () => ipcRenderer.invoke('mcp:rotateToken'),
+    mcpCopyConfig: (args) => ipcRenderer.invoke('mcp:copyConfig', args),
+    mcpActivity: (args) => ipcRenderer.invoke('mcp:activity', args),
+    mcpPaperReset: () => ipcRenderer.invoke('mcp:paperReset'),
+    mcpDecide: (args) => ipcRenderer.invoke('mcp:decide', args),
+    autopilotStatus: () => ipcRenderer.invoke('autopilot:status'),
+    autopilotRunNow: () => ipcRenderer.invoke('autopilot:runNow'),
+    onMcpOrder: (cb) => sub<{ mode: McpTradeMode | 'action'; message: string }>('mcp:order', cb),
+  },
+  logs: {
+    tail: (limit?: number): Promise<LogEntry[]> => ipcRenderer.invoke('logs:tail', limit),
+    onAppend: (cb) => sub<LogEntry>('logs:append', cb),
+    clear: () => ipcRenderer.invoke('logs:clear'),
+    openFolder: () => ipcRenderer.invoke('logs:openFolder'),
+    diagnostics: (args) => ipcRenderer.invoke('logs:diagnostics', args),
+  },
+  window: {
+    minimize: () => ipcRenderer.send('window:minimize'),
+    maximize: () => ipcRenderer.send('window:maximize'),
+    close: () => ipcRenderer.send('window:close'),
+    isMaximized: () => ipcRenderer.invoke('window:isMaximized'),
+    onMaximizeChange: (cb) => sub<boolean>('window:maximizeChange', cb),
+  },
+};
+
+contextBridge.exposeInMainWorld('krypt', api);

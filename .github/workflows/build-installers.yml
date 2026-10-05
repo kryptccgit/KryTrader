@@ -1,0 +1,69 @@
+name: Build Installers
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+          - os: windows-latest
+            name: windows
+          - os: macos-13
+            name: mac-intel
+          - os: macos-latest
+            name: mac-apple-silicon
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Node dependencies
+        run: npm install
+
+      - name: Build app, bundle backend, package installer
+        run: npm run dist
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Verify macOS signature
+        if: startsWith(matrix.os, 'macos')
+        run: |
+          APP=$(ls -d release/mac*/*.app | head -1)
+          codesign --verify --deep --strict --verbose=2 "$APP"
+
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "version=$(node -p "require('./package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Attach installers to release v${{ steps.ver.outputs.version }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Krypt Trader v${{ steps.ver.outputs.version }}
+          overwrite_files: true
+          files: |
+            release/*.AppImage
+            release/*.deb
+            release/*.exe
+            release/*.blockmap
+            release/*.dmg

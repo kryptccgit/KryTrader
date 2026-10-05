@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Node dependencies
+        run: npm install
+
+      - name: TypeScript typecheck
+        run: npm run typecheck
+
+      - name: Renderer tests (vitest)
+        run: npm test
+
+      - name: Install Python test dependencies
+        run: pip install -r python/requirements-dev.txt
+
+      - name: Run Python tests
+        working-directory: python
+        run: python -m pytest -q
