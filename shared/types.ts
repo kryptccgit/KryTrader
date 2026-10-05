@@ -203,9 +203,11 @@ export interface TraderConfig {
 export interface CredentialsState {
   env?: 'demo' | 'production';
   hasApiKey: boolean;
+  /** Kept as `hasRsaKey` for IPC compatibility; true for an RSA or Ed25519 key. */
   hasRsaKey: boolean;
   apiKeyPreview: string;
   fingerprint: string;
+  keyType?: 'rsa' | 'ed25519';
 }
 
 export interface CredentialsStatusAll {

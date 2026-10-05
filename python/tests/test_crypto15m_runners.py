@@ -321,7 +321,7 @@ def test_sweep_settles_other_envs_exiting_row_with_env_pinned_order_calls(fresh_
         return {"status": "finalized", "result": "yes",
                 "yes_bid_dollars": 1.0, "yes_ask_dollars": 1.0}
 
-    async def _cancel(_kid, *, pin_env=None):
+    async def _cancel(_kid, *, ticker=None, pin_env=None):
         pins["cancel"] = pin_env
 
     async def _get(_kid, *, pin_env=None):

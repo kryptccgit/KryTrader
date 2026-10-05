@@ -73,14 +73,48 @@ def test_cancel_order_uses_v2_events_path(monkeypatch):
     captured: dict = {}
 
     async def fake_signed(method, path, *, json=None, params=None, **kw):
-        captured.update(method=method, path=path)
+        captured.update(method=method, path=path, params=params)
         return {"order_id": "ord_1", "reduced_by": "5"}
 
     monkeypatch.setattr(kalshi_api, "_signed_request", fake_signed)
-    asyncio.run(kalshi_api.cancel_order("ord_1"))
+    asyncio.run(kalshi_api.cancel_order("ord_1", ticker="KXBTC15M-T1"))
 
     assert captured["method"] == "DELETE"
     assert captured["path"] == "/portfolio/events/orders/ord_1"
+    # Without market_ticker Kalshi routes the cancel to shard 0; crypto is shard 2.
+    assert captured["params"] == {"market_ticker": "KXBTC15M-T1"}
+
+
+def test_cancel_order_looks_up_ticker_when_not_given(monkeypatch):
+    calls: list = []
+
+    async def fake_signed(method, path, *, json=None, params=None, **kw):
+        calls.append((method, path, params))
+        if method == "GET":
+            return {"order": {"order_id": "ord_2", "ticker": "KXETH15M-T2"}}
+        return {"order_id": "ord_2"}
+
+    monkeypatch.setattr(kalshi_api, "_signed_request", fake_signed)
+    asyncio.run(kalshi_api.cancel_order("ord_2"))
+
+    assert calls[0][:2] == ("GET", "/portfolio/orders/ord_2")
+    assert calls[1] == ("DELETE", "/portfolio/events/orders/ord_2",
+                        {"market_ticker": "KXETH15M-T2"})
+
+
+def test_cancel_order_still_sends_when_lookup_fails(monkeypatch):
+    calls: list = []
+
+    async def fake_signed(method, path, *, json=None, params=None, **kw):
+        calls.append((method, params))
+        if method == "GET":
+            raise RuntimeError("network")
+        return {"order_id": "ord_3"}
+
+    monkeypatch.setattr(kalshi_api, "_signed_request", fake_signed)
+    asyncio.run(kalshi_api.cancel_order("ord_3"))
+
+    assert calls[-1] == ("DELETE", None)
 
 
 def test_place_limit_order_rejects_bad_inputs():

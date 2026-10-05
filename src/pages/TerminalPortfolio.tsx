@@ -289,7 +289,7 @@ export function TerminalPortfolioPage() {
                       </button>
                     </td>
                     <td className="krypt-td"><SidePill side={o.side} /></td>
-                    <td className="krypt-td text-krypt-muted">{o.action}</td>
+                    <td className="krypt-td text-krypt-muted">{o.action ?? <Unknown />}</td>
                     <td className="krypt-td text-right">
                       {o.remaining ?? o.count ?? <Unknown why="Kalshi reported no remaining count for this order." />}
                     </td>

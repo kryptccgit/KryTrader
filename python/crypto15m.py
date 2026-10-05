@@ -96,22 +96,36 @@ def _to_float(v) -> float:
         return 0.0
 
 
-def _price_dollars(m: dict, key: str) -> float:
+def _price_dollars(m: dict, key: str) -> Optional[float]:
+    # Kalshi sends "0.0000" for an empty book side and a never-traded market,
+    # and derives no_ask_dollars "1.0000" when there is no YES bid. Neither is
+    # a price. Read as one, an absent ask became a $0 entry cost and an absent
+    # bid a 99.9c paper exit. Only the open interval (0, 1) is a quote.
     d = m.get(f"{key}_dollars")
     if d is not None:
-        return _to_float(d)
-    return _to_float(m.get(key)) / 100.0
+        v = _to_float(d)
+    elif m.get(key) is not None:
+        v = _to_float(m.get(key)) / 100.0
+    else:
+        return None
+    return v if 0.0 < v < 1.0 else None
 
 
-def _mid_up(yes_bid: float, yes_ask: float, last_price: float) -> float:
+def _mid_up(
+    yes_bid: Optional[float], yes_ask: Optional[float], last_price: Optional[float],
+) -> Optional[float]:
     if yes_bid and yes_ask:
         up = (yes_bid + yes_ask) / 2
     elif yes_bid:
         up = yes_bid
     elif yes_ask:
         up = yes_ask
-    else:
+    elif last_price:
         up = last_price
+    else:
+        # No bid, no ask, never traded: nothing says which side is favoured.
+        # This used to fall through to 0.0 -- "down at 100%".
+        return None
     return max(0.0, min(1.0, up))
 
 
@@ -475,13 +489,20 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
     yes_bid = _price_dollars(m, "yes_bid")
     yes_ask = _price_dollars(m, "yes_ask")
     up = _mid_up(yes_bid, yes_ask, _price_dollars(m, "last_price"))
-    down = 1.0 - up
-    favorite = "up" if up >= down else "down"
-    fav_price = up if favorite == "up" else down
+    if up is None:
+        down = favorite = fav_price = None
+    else:
+        down = 1.0 - up
+        favorite = "up" if up >= down else "down"
+        fav_price = up if favorite == "up" else down
 
     no_ask = _price_dollars(m, "no_ask")
-    entry_cost = yes_ask if favorite == "up" else (no_ask if no_ask else 1.0 - yes_bid)
-    entry_cost = max(0.0, min(1.0, entry_cost))
+    if favorite == "up":
+        entry_cost = yes_ask
+    elif favorite == "down":
+        entry_cost = no_ask if no_ask else ((1.0 - yes_bid) if yes_bid else None)
+    else:
+        entry_cost = None
 
     mins_left = (close_epoch - now_epoch) / 60.0
     hour_utc = datetime.fromtimestamp(now_epoch, timezone.utc).hour
@@ -497,6 +518,8 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         delta_ok = delta_signed <= -min_dp
     signal = (
         in_window
+        and fav_price is not None
+        and entry_cost is not None
         and hours_ok(cfg)
         and fav_price >= _const(cfg, "entry_threshold")
         and entry_cost <= _const(cfg, "entry_max")
@@ -511,9 +534,11 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         ),
         "hasMarket": True, "ticker": m.get("ticker"),
         "closeTime": m.get("close_time"), "minsLeft": round(mins_left, 2),
-        "upProb": round(up, 4), "downProb": round(down, 4),
-        "favorite": favorite, "favoritePrice": round(fav_price, 4),
-        "entryCost": round(entry_cost, 4),
+        "upProb": round(up, 4) if up is not None else None,
+        "downProb": round(down, 4) if down is not None else None,
+        "favorite": favorite,
+        "favoritePrice": round(fav_price, 4) if fav_price is not None else None,
+        "entryCost": round(entry_cost, 4) if entry_cost is not None else None,
         "yesBid": round(yes_bid, 4) if yes_bid else None,
         "yesAsk": round(yes_ask, 4) if yes_ask else None,
         "inWindow": in_window, "signal": signal, "hourUtc": hour_utc,

@@ -240,8 +240,9 @@ export interface RestingOrder {
   clientOrderId: string | null;
   ticker: string;
   title: string | null;
-  side: MarketSideName;
-  action: OrderAction;
+  /** null when Kalshi sent no direction at all — never guessed as "buy YES". */
+  side: MarketSideName | null;
+  action: OrderAction | null;
   priceCents: number | null;
   count: number | null;
   remaining: number | null;

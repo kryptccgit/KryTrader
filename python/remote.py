@@ -234,8 +234,8 @@ async def _orders(authed: bool) -> str:
     rows = res["orders"]
     if not rows:
         return res.get("note") or "Nothing resting."
-    out = [f"{o['orderId']}\n  {o['action']} {o['remaining'] or o['count']} "
-           f"{o['side'].upper()} {o['ticker']} @ {_cents(o['priceCents'])}"
+    out = [f"{o['orderId']}\n  {o['action'] or '--'} {o['remaining'] or o['count']} "
+           f"{(o['side'] or '--').upper()} {o['ticker']} @ {_cents(o['priceCents'])}"
            for o in rows[:20]]
     out.append("Cancel one with: cancel ORDER_ID")
     return "\n".join(out)

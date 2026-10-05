@@ -1147,7 +1147,7 @@ def test_chase_exit_aborts_when_order_state_unknown(fresh_db, env_prod, cfg, mon
         return {"yes": [[50, 100]], "no": []}
     monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
 
-    async def _boom(_kid):
+    async def _boom(_kid, **_kw):
         raise RuntimeError("gateway timeout")
     monkeypatch.setattr(kalshi_api, "cancel_order", _boom)
     monkeypatch.setattr(kalshi_api, "get_order", _boom)
@@ -1994,3 +1994,63 @@ def test_a_fill_still_wins_over_the_closed_market_shortcut(
     res = run_async(ct._cancel_entry_and_finalize(pos, "OID-FILLED", 0))
     assert res["status"] == "filled"
     assert res["filled_contracts"] == 4
+
+
+# Kalshi sends "0.0000" for an empty side and derives "1.0000" on the other leg.
+# Read as prices, a never-traded market was "down at 100%", an absent ask was a
+# $0 entry cost, and a paper exit with no bid filled at 99.9c.
+
+def test_price_dollars_reads_kalshi_placeholders_as_absent():
+    m = {"yes_bid_dollars": "0.0000", "no_ask_dollars": "1.0000",
+         "yes_ask_dollars": "0.4200"}
+    assert crypto15m._price_dollars(m, "yes_bid") is None
+    assert crypto15m._price_dollars(m, "no_ask") is None
+    assert crypto15m._price_dollars(m, "yes_ask") == pytest.approx(0.42)
+    assert crypto15m._price_dollars({}, "last_price") is None
+
+
+def test_snapshot_with_no_quotes_has_no_favorite(cfg, monkeypatch):
+    cfg["crypto15m_strict_threshold"] = False
+    market = _snapshot_market(
+        yes_bid_dollars="0.0000", yes_ask_dollars="0.0000",
+        no_ask_dollars="1.0000", last_price_dollars="0.0000",
+    )
+    out = _run_asset_snapshot(cfg, monkeypatch, market)
+    assert out["upProb"] is None and out["favorite"] is None
+    assert out["favoritePrice"] is None and out["entryCost"] is None
+    assert out["signal"] is False
+
+
+def test_snapshot_absent_ask_is_not_a_free_entry(cfg, monkeypatch):
+    cfg["crypto15m_strict_threshold"] = False
+    cfg["crypto15m_entry_threshold"] = 0.50
+    market = _snapshot_market(
+        yes_bid_dollars="0.9000", yes_ask_dollars="0.0000",
+        no_ask_dollars="0.1000", last_price_dollars="0.9000",
+    )
+    out = _run_asset_snapshot(cfg, monkeypatch, market)
+    assert out["favorite"] == "up"
+    assert out["entryCost"] is None
+    assert out["signal"] is False
+
+
+def test_side_prob_from_market_without_quotes_is_none():
+    assert ct.side_prob_from_market({"yes_bid_dollars": "0.0000"}, "no") is None
+
+
+def test_paper_prices_need_a_real_opposite_quote():
+    no_book = {"yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0000"}
+    assert ct._paper_side_ask_cents(no_book, "down") is None
+    assert ct._paper_side_bid_cents(no_book, "down") is None
+    book = {"yes_bid_dollars": "0.3000", "yes_ask_dollars": "0.3500"}
+    assert ct._paper_side_ask_cents(book, "down") == pytest.approx(70.0)
+    assert ct._paper_side_bid_cents(book, "down") == pytest.approx(65.0)
+
+
+def test_open_entry_refuses_contrarian_flip_of_no_favorite(cfg, monkeypatch):
+    cfg["crypto15m_direction_mode"] = "contrarian"
+    calls = _capture_orders(monkeypatch)
+    a = {"favorite": None, "favoritePrice": None, "entryCost": None,
+         "ticker": "KXBTC15M-T1", "hasMarket": True}
+    assert run_async(ct._open_entry(a, cfg, "demo", 100.0)) is None
+    assert calls == []

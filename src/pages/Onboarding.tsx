@@ -65,7 +65,7 @@ export function OnboardingModal({ onDone }: { onDone: () => void }) {
               <h3 className="text-base font-semibold">Quick start</h3>
               <ol className="list-decimal space-y-2 pl-4 text-sm text-krypt-muted">
                 <li>Open the <span className="text-white">Terminal</span> and look around — browsing markets, charts and resolution rules needs no key at all.</li>
-                <li>Create a Kalshi API key + RSA private key in your account settings.</li>
+                <li>Create a Kalshi API key + private key (Ed25519 or RSA) in your account settings.</li>
                 <li>Paste both into the API Keys page (we&apos;ll send you there).</li>
                 <li>Start on the <span className="text-white">demo</span> environment and paper-test a strategy before risking money.</li>
                 <li>Verify the connection &amp; balance, then unpause trading.</li>

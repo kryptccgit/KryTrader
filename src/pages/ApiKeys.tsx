@@ -171,7 +171,7 @@ export function ApiKeysPage() {
         <Card>
           <ul className="list-disc space-y-1.5 pl-5 text-xs text-krypt-muted">
             <li>Keys are written per-env to <span className="font-mono text-white">%APPDATA%/Krypt Trader/credentials/apikey.&lt;env&gt;.txt</span> with default user-only permissions.</li>
-            <li>The Python backend signs requests locally with RSA-PSS; nothing is sent to any server other than Kalshi&apos;s.</li>
+            <li>The Python backend signs requests locally (Ed25519 or RSA-PSS, whichever key you paste); nothing is sent to any server other than Kalshi&apos;s.</li>
             <li>You can save Demo and Live credentials at the same time and flip between them with the Active session toggle.</li>
             <li>Click &quot;Delete saved keys&quot; on a slot before uninstalling if you want them gone.</li>
           </ul>
@@ -232,7 +232,7 @@ function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
     }
     if (!apiKey.trim()) { toast.error(`${title}: paste your Kalshi API key (UUID) above`); return; }
     if (!rsaPem.trim() || !rsaPem.includes('-----BEGIN')) {
-      toast.error(`${title}: paste your RSA private key (PEM) above`); return;
+      toast.error(`${title}: paste your private key (PEM) above`); return;
     }
     setBusy(true);
     try {
@@ -309,7 +309,7 @@ function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
             <div>
               API key …<span className="font-mono text-white">{status?.apiKeyPreview || '????'}</span>
               <span className="mx-2 text-krypt-dim">·</span>
-              RSA fp <span className="font-mono text-white">{status?.fingerprint || '—'}</span>
+              {status?.keyType === 'ed25519' ? 'Ed25519' : 'RSA'} fp <span className="font-mono text-white">{status?.fingerprint || '—'}</span>
             </div>
             <div className="text-[10px] text-krypt-dim">
               To replace these, paste new values below and hit Save. To remove them, click Delete.
@@ -347,7 +347,7 @@ function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
       </p>
 
       <label className="krypt-label mt-3 flex items-center justify-between">
-        RSA private key (PEM)
+        Private key (PEM, Ed25519 or RSA)
         <button
           type="button"
           onClick={() => setShowPem((v) => !v)}
@@ -358,7 +358,7 @@ function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
       </label>
       <textarea
         className="krypt-input min-h-[140px] font-mono text-[11px]"
-        placeholder={'-----BEGIN RSA PRIVATE KEY-----\n…\n-----END RSA PRIVATE KEY-----'}
+        placeholder={'-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----'}
         value={rsaPem}
         onChange={(e) => setRsaPem(e.target.value)}
         spellCheck={false}

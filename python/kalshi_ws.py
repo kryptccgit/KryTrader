@@ -66,6 +66,25 @@ def _cents(price_dollars) -> Optional[float]:
         return None
 
 
+def taker_outcome_side(t: dict) -> str:
+    """'yes' / 'no' for a public trade's taker, or '' when Kalshi didn't say.
+
+    `taker_side` was deprecated on 2026-05-06 ("not removed before May 28,
+    2026" -- that date has passed). Its replacements carry the same bit:
+    taker_outcome_side yes|no, taker_book_side bid|ask (bid == yes). Without
+    a direction the scanner skips the trade, so dropping the old field would
+    blind whale detection on every path that read it.
+    """
+    v = str(t.get("taker_outcome_side") or "").lower()
+    if v in ("yes", "no"):
+        return v
+    b = str(t.get("taker_book_side") or "").lower()
+    if b in ("bid", "ask"):
+        return "yes" if b == "bid" else "no"
+    v = str(t.get("taker_side") or "").lower()
+    return v if v in ("yes", "no") else ""
+
+
 def _fp(v) -> float:
     try:
         return float(v)
@@ -465,10 +484,12 @@ class _Client:
         trade = {
             "trade_id": msg.get("trade_id", ""),
             "ticker": t,
-            "count_fp": msg.get("count_fp", "0"),
-            "yes_price_dollars": msg.get("yes_price_dollars", "0"),
-            "no_price_dollars": msg.get("no_price_dollars", "0"),
-            "taker_side": msg.get("taker_side", ""),
+            # Absent stays absent: a "0" default here read downstream as a
+            # real zero-size or zero-price trade.
+            "count_fp": msg.get("count_fp"),
+            "yes_price_dollars": msg.get("yes_price_dollars"),
+            "no_price_dollars": msg.get("no_price_dollars"),
+            "taker_side": taker_outcome_side(msg),
             "is_block_trade": bool(msg.get("is_block_trade")),
             "created_time": msg.get("ts_ms") or msg.get("ts") or "",
             "observed_ms": int(time.time() * 1000),

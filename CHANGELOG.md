@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Kalshi API catch-up (October 2026)
+- **Ed25519 API keys work.** Kalshi's site has generated Ed25519 keys by
+  default since Oct 1; the app only accepted RSA, so a new user following
+  Kalshi's own flow couldn't connect. Both key types now load, sign and show a
+  fingerprint.
+- **Cancels reach the right exchange shard.** A cancel by order id alone goes
+  to shard 0, but crypto, combos, sports and commodities live elsewhere, so the
+  cancel could 404 while the order kept resting -- and a cancel 404 was read as
+  "already gone". Cancels now carry the market ticker, and a 404 on an order
+  Kalshi still shows as resting no longer marks it gone.
+- **"No price" stays no price in the 15-minute crypto bot.** Kalshi's
+  `0.0000` (empty side) and derived `1.0000` were read as prices: a quoteless
+  market showed "down at 100%", a missing ask was a $0 entry cost, and a paper
+  exit with no bid filled at 99.9c. They are now absent, and an entry needs a
+  real side and a real price.
+- **Ready for Kalshi dropping the old direction fields.** `action`/`side` and
+  `taker_side` are deprecated and past their earliest removal date. Trades now
+  read the taker's side from the replacement fields (whale detection would have
+  gone blind), and orders/fills from `outcome_side` -- using your position to
+  tell a sell of YES from a buy of NO, instead of the old default of "buy YES".
+  A resting order with no direction at all shows a dash.
+
 ### AI agents over MCP
 - **Connect Cursor, Claude Code, Claude Desktop or Codex** to a loopback MCP
   server inside the app (AI Agents page). One click copies a ready config for

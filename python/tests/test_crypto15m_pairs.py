@@ -483,7 +483,7 @@ def test_second_leg_never_placed_against_unfilled_first_leg(fresh_db, env_prod, 
                           "status": "resting"}}
     monkeypatch.setattr(kalshi_api, "get_order", _order)
 
-    async def _cancel(_kid):
+    async def _cancel(_kid, **_kw):
         return {"ok": True}
     monkeypatch.setattr(kalshi_api, "cancel_order", _cancel)
     calls = _capture_orders(monkeypatch)
@@ -510,7 +510,7 @@ def test_pair_entry_ttl_cancels_stale_marketable_order(fresh_db, env_prod, cfg, 
 
     canceled = []
 
-    async def _cancel(kid):
+    async def _cancel(kid, **_kw):
         canceled.append(kid)
     monkeypatch.setattr(kalshi_api, "cancel_order", _cancel)
 

@@ -16,7 +16,7 @@ from kalshi_api import (
     KalshiAPIError, cancel_order, fetch_market, find_order_by_client_id,
     get_balance,
     get_fills_for_order, get_order, get_orderbook, get_positions,
-    place_limit_order,
+    order_direction, place_limit_order,
 )
 
 _CRYPTO15M_SERIES = {s["series"] for s in crypto15m.SERIES}
@@ -814,12 +814,23 @@ def _parse_kalshi_order(order: dict) -> dict:
     }
 
 
+def _is_entry_buy(f: dict, pos_side: Optional[str]) -> bool:
+    # Only the buys on an entry order count toward its cost. Once Kalshi drops
+    # the deprecated `action`, a fill whose outcome is the position's own side
+    # is a buy of it; the opposite outcome would be a sell. A fill that says
+    # nothing either way is kept, as `action or "buy"` always did.
+    if f.get("action"):
+        return str(f["action"]).lower() == "buy"
+    _, side = order_direction(f)
+    return side is None or side == str(pos_side or "").lower()
+
+
 def _parse_kalshi_fill(f: dict, default_side: str = "") -> dict:
     if f.get("count") is not None:
         count = int(_f(f.get("count")))
     else:
         count = int(round(_f(f.get("count_fp"))))
-    side = str(f.get("side") or default_side).lower()
+    side = str(f.get("side") or default_side or order_direction(f)[1] or "").lower()
     if side == "yes":
         cents = f.get("yes_price")
         if cents in (None, "") and f.get("yes_price_dollars") is not None:
@@ -1161,7 +1172,7 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
             age_sec = float(age[0]) if age and age[0] is not None else 0.0
             if age_sec > float(cfg["order_expiration_sec"]):
                 try:
-                    await cancel_order(kid)
+                    await cancel_order(kid, ticker=pos.get("ticker"))
                 except KalshiAPIError as e:
                     if e.status == 404:
                         final404 = None
@@ -1182,6 +1193,15 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                             logger.warning(
                                 f"cancel {kid}: 404 but order shows "
                                 f"{final404.get('filled')} fills; leaving row for next poll"
+                            )
+                            continue
+                        if final404 is not None and final404.get("status") == "resting":
+                            # A 404 from the cancel is not proof the order is gone:
+                            # misrouted to the wrong shard, Kalshi 404s while the
+                            # order keeps resting. Marking it gone would orphan it.
+                            logger.warning(
+                                f"cancel {kid}: 404 but order still resting; "
+                                f"leaving row for next poll"
                             )
                             continue
                         with db.get_db() as conn:
@@ -1235,6 +1255,9 @@ def _side_mark_cents(quote: dict | None, side: str) -> Optional[float]:
     yb = float(quote.get("yes_bid") or 0)
     ya = float(quote.get("yes_ask") or 0)
     lp = float(quote.get("last_price") or 0)
+    # The markets cache stores Kalshi's "0.0000" (absent) as 0, and Kalshi
+    # derives 1.0000 for a side with nothing behind it: only (0, 1) is a quote.
+    yb, ya, lp = (v if 0.0 < v < 1.0 else 0.0 for v in (yb, ya, lp))
     if yb > 0 and ya > 0:
         yes = (yb + ya) / 2.0
     elif lp > 0:
@@ -1453,10 +1476,7 @@ async def reconcile_fills_from_kalshi() -> dict:
             )
             continue
 
-        ours = [
-            f for f in ours
-            if str(f.get("action") or "buy").lower() == "buy"
-        ]
+        ours = [f for f in ours if _is_entry_buy(f, pos.get("direction"))]
 
         total_filled = 0
         total_cost_cents = 0
@@ -1988,7 +2008,7 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
 async def cancel_all_open() -> int:
     with db.get_db() as conn:
         rows = conn.execute(
-            """SELECT id, kalshi_order_id, target_contracts FROM bot_positions
+            """SELECT id, ticker, kalshi_order_id, target_contracts FROM bot_positions
                WHERE status IN ('submitted','partial')
                  AND resolved=0 AND kalshi_env=?""",
             (get_env(),),
@@ -1999,7 +2019,7 @@ async def cancel_all_open() -> int:
         if not kid:
             continue
         try:
-            await cancel_order(kid)
+            await cancel_order(kid, ticker=r["ticker"])
         except Exception as e:
             logger.warning(f"cancel_all: {kid}: {e}")
             continue

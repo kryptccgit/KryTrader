@@ -303,11 +303,20 @@ async def fetch_all_open_markets(max_pages: int = 10) -> list:
     return out
 
 
+def _normalize_trades(trades: list) -> list:
+    # Every consumer reads `taker_side`; fill it from the fields Kalshi still
+    # sends once the deprecated one is gone.
+    for t in trades:
+        if isinstance(t, dict):
+            t["taker_side"] = kalshi_ws.taker_outcome_side(t)
+    return trades
+
+
 async def fetch_recent_trades(limit: int = 1000) -> list | None:
     data = await _pub_get(f"{PUBLIC_BASE}/markets/trades", params={"limit": limit})
     if not isinstance(data, dict):
         return None
-    return data.get("trades", []) or []
+    return _normalize_trades(data.get("trades", []) or [])
 
 
 async def fetch_trades_for_market(ticker: str, limit: int = 100) -> list | None:
@@ -317,7 +326,38 @@ async def fetch_trades_for_market(ticker: str, limit: int = 100) -> list | None:
     )
     if not isinstance(data, dict):
         return None
-    return data.get("trades", []) or []
+    return _normalize_trades(data.get("trades", []) or [])
+
+
+def order_direction(
+    o: dict, *, held_side: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str]]:
+    """(action, side) of an Order or Fill, or (None, None) when unknowable.
+
+    `action`/`side` were deprecated on 2026-05-06 and may now be removed in
+    any release. Their replacement, outcome_side (or book_side, bid == yes),
+    merges buy-NO with sell-YES -- both leave you long NO -- so `action` can't
+    be read back from it alone. Kalshi nets YES and NO on one market into a
+    single position, though, so the position decides it: an order for the
+    outcome opposite to what you hold reduces that holding (a sell of the
+    held side); anything else is a buy of the outcome. Callers that can't
+    supply a holding get the buy reading -- right for a flat book -- and the
+    old code's silent default of "buy YES" is gone either way.
+    """
+    action = str(o.get("action") or "").lower()
+    side = str(o.get("side") or "").lower()
+    if action in ("buy", "sell") and side in ("yes", "no"):
+        return action, side
+    outcome = str(o.get("outcome_side") or "").lower()
+    if outcome not in ("yes", "no"):
+        book = str(o.get("book_side") or "").lower()
+        outcome = {"bid": "yes", "ask": "no"}.get(book, "")
+    if not outcome:
+        return None, None
+    held = (held_side or "").lower()
+    if held in ("yes", "no") and held != outcome:
+        return "sell", held
+    return "buy", outcome
 
 
 async def fetch_events(
@@ -1040,10 +1080,26 @@ async def place_limit_order(
     )
 
 
-async def cancel_order(order_id: str, *, pin_env: str | None = None) -> dict:
+async def cancel_order(
+    order_id: str, *, ticker: str | None = None, pin_env: str | None = None,
+) -> dict:
+    # Cancel V2 routes by market_ticker; with an order id alone Kalshi sends the
+    # cancel to shard 0. Crypto, combos, sports and commodities live on other
+    # shards, so a bare cancel there 404s while the order keeps resting -- and
+    # callers read a cancel 404 as "already gone". Callers that know the ticker
+    # pass it; otherwise look it up so no cancel goes out unrouted.
     if pin_env is None:
         async with ENV_LOCK:
             pin_env = get_env()
+    if not ticker:
+        try:
+            resp = await get_order(order_id, pin_env=pin_env)
+            o = (resp.get("order") if isinstance(resp, dict) else None) or {}
+            ticker = str(o.get("ticker") or "") or None
+        except Exception as e:
+            logger.info(f"cancel {order_id}: ticker lookup failed ({e}); sending unrouted")
     return await _signed_request(
-        "DELETE", f"{ORDERS_V2_PATH}/{order_id}", timeout=HOT_TIMEOUT, pin_env=pin_env,
+        "DELETE", f"{ORDERS_V2_PATH}/{order_id}",
+        params={"market_ticker": ticker} if ticker else None,
+        timeout=HOT_TIMEOUT, pin_env=pin_env,
     )

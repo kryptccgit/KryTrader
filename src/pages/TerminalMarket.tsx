@@ -420,7 +420,7 @@ function RestingOrders({
           className="flex items-center gap-2 rounded-lg border border-krypt-border bg-krypt-surface2/40 px-2.5 py-2 text-[11px]"
         >
           <SidePill side={o.side} />
-          <span className="text-krypt-muted">{o.action}</span>
+          <span className="text-krypt-muted">{o.action ?? <Unknown />}</span>
           <span className="font-mono text-white">
             {o.remaining ?? o.count ?? <Unknown />}
           </span>

@@ -238,6 +238,8 @@ def side_prob_from_market(market: Optional[dict], direction: str) -> Optional[fl
     yes_bid = crypto15m._price_dollars(market, "yes_bid")
     yes_ask = crypto15m._price_dollars(market, "yes_ask")
     up = crypto15m._mid_up(yes_bid, yes_ask, crypto15m._price_dollars(market, "last_price"))
+    if up is None:
+        return None
     return up if direction == "yes" else (1.0 - up)
 
 
@@ -657,6 +659,11 @@ async def _open_entry(
         side = favorite
         entry_cost = float(a.get("entryCost") or fav_price)
         conf = fav_price * 100.0
+    # A market with no quotes has no favourite, and contrarian mode would flip
+    # that None into "up"; the fallbacks above can also land on 0 or 1. Neither
+    # is a price anyone could fill at.
+    if side not in ("up", "down") or not (0.0 < entry_cost < 1.0):
+        return None
     direction = direction_for_favorite(side)
     style = (cfg.get("crypto15m_entry_style") or "maker").lower()
     if mode == "model":
@@ -871,7 +878,7 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
 async def _cancel_entry_and_finalize(pos: dict, kid: str, filled: int) -> Optional[dict]:
     pid = pos["id"]
     try:
-        await kalshi_api.cancel_order(kid)
+        await kalshi_api.cancel_order(kid, ticker=pos.get("ticker"))
     except Exception:
         pass
     final_filled, final_cost, final_avg, final_fees = filled, None, None, None
@@ -1106,7 +1113,7 @@ async def _settle_if_closed(pos: dict, *, pin_env: Optional[str] = None) -> Opti
         return None
     if kid:
         try:
-            await kalshi_api.cancel_order(kid, pin_env=pin_env)
+            await kalshi_api.cancel_order(kid, ticker=pos.get("ticker"), pin_env=pin_env)
         except Exception:
             pass
         try:
@@ -1180,7 +1187,7 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
         return None
     if kid:
         try:
-            await kalshi_api.cancel_order(kid)
+            await kalshi_api.cancel_order(kid, ticker=pos.get("ticker"))
         except Exception:
             pass
         try:

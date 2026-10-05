@@ -383,7 +383,7 @@ def test_poll_auto_cancels_stale_resting_order(fresh_db, env_demo, cfg, monkeypa
 
     cancels: list[str] = []
 
-    async def _cancel(oid):
+    async def _cancel(oid, **_kw):
         cancels.append(oid)
         return {}
 
@@ -536,7 +536,7 @@ def test_cancel_all_books_raced_partial_fill(fresh_db, env_demo, monkeypatch):
     pid = seed_position(status="submitted", kalshi_order_id="OID-CA1",
                         target_contracts=5, limit_price_cents=50)
 
-    async def _cancel(_oid):
+    async def _cancel(_oid, **_kw):
         return {}
 
     async def _order(_oid):
@@ -564,7 +564,7 @@ def test_cancel_all_confirmed_zero_fill_books_canceled(fresh_db, env_demo, monke
     pid = seed_position(status="submitted", kalshi_order_id="OID-CA2",
                         target_contracts=5)
 
-    async def _cancel(_oid):
+    async def _cancel(_oid, **_kw):
         return {}
 
     async def _order(_oid):
@@ -586,7 +586,7 @@ def test_cancel_all_unconfirmed_read_leaves_row_for_poll(fresh_db, env_demo, mon
     pid = seed_position(status="submitted", kalshi_order_id="OID-CA3",
                         target_contracts=5)
 
-    async def _cancel(_oid):
+    async def _cancel(_oid, **_kw):
         return {}
 
     async def _order(_oid):
@@ -637,7 +637,7 @@ def test_poll_cancel_404_rereads_fills_before_gone(fresh_db, env_demo, cfg, monk
             "place_count": 5, "remaining_count": 0,
         }}
 
-    async def _cancel_404(_oid):
+    async def _cancel_404(_oid, **_kw):
         raise KalshiAPIError(404, "order not found")
 
     monkeypatch.setattr(trader, "get_positions", _no_positions)
@@ -669,7 +669,7 @@ def test_poll_cancel_404_with_order_truly_unknown_books_gone(fresh_db, env_demo,
             }}
         raise KalshiAPIError(404, "not found")
 
-    async def _cancel_404(_oid):
+    async def _cancel_404(_oid, **_kw):
         raise KalshiAPIError(404, "order not found")
 
     monkeypatch.setattr(trader, "get_positions", _no_positions)

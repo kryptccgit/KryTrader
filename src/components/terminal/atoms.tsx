@@ -126,7 +126,8 @@ export function Caveat({ children, className }: { children: ReactNode; className
 
 export function SidePill({
   side, className,
-}: { side: 'yes' | 'no'; className?: string }) {
+}: { side: 'yes' | 'no' | null; className?: string }) {
+  if (side === null) return <Unknown why="Kalshi did not say which side this order is on." className={className} />;
   return (
     <span
       className={cls(

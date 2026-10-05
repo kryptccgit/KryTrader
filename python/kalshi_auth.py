@@ -14,7 +14,7 @@ from typing import Optional
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import padding, rsa
+from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 
 
 logger = logging.getLogger(__name__)
@@ -234,7 +234,15 @@ _SERVER_BASES = {
 }
 
 _cached_api_key: Optional[str] = None
-_cached_private_key: Optional[rsa.RSAPrivateKey] = None
+# Kalshi accepts RSA (signed RSA-PSS) or Ed25519 keys, with the same headers and
+# pre-sign text. Since 2026-10-01 the web app's "Create New API Key" dialog
+# hands out Ed25519 by default, so an RSA-only loader turned away every new
+# user who followed Kalshi's own flow. The on-disk name stays rsakey.<env>.pem
+# so existing installs keep their credentials.
+SigningKey = rsa.RSAPrivateKey | ed25519.Ed25519PrivateKey
+_SIGNING_KEY_TYPES = (rsa.RSAPrivateKey, ed25519.Ed25519PrivateKey)
+
+_cached_private_key: Optional[SigningKey] = None
 _server_offset_ms: int = 0
 
 
@@ -298,17 +306,17 @@ def _load_api_key() -> str:
     raise ValueError(f"No API key parsed from {f}")
 
 
-def _load_private_key() -> rsa.RSAPrivateKey:
+def _load_private_key() -> SigningKey:
     global _cached_private_key
     if _cached_private_key is not None:
         return _cached_private_key
     f = _rsa_key_file()
     if not f.exists():
-        raise FileNotFoundError(f"Kalshi RSA private key not configured ({f})")
+        raise FileNotFoundError(f"Kalshi private key not configured ({f})")
     pem_bytes = _read_secret_bytes(f)
     key = serialization.load_pem_private_key(pem_bytes, password=None)
-    if not isinstance(key, rsa.RSAPrivateKey):
-        raise TypeError("RSA key file does not contain an RSA private key")
+    if not isinstance(key, _SIGNING_KEY_TYPES):
+        raise TypeError("Kalshi key file does not contain an RSA or Ed25519 private key")
     _cached_private_key = key
     return key
 
@@ -344,9 +352,17 @@ def credentials_status(env: Optional[str] = None) -> dict:
                 _read_secret_bytes(rkf), password=None
             )
             if isinstance(key, rsa.RSAPrivateKey):
+                # Kept as-is so a saved RSA key shows the fingerprint it always has.
                 pub = key.public_key().public_numbers().n
                 fp = hashlib.sha256(str(pub).encode()).hexdigest()[:8].upper()
                 info["fingerprint"] = fp
+                info["keyType"] = "rsa"
+            elif isinstance(key, ed25519.Ed25519PrivateKey):
+                raw = key.public_key().public_bytes(
+                    serialization.Encoding.Raw, serialization.PublicFormat.Raw
+                )
+                info["fingerprint"] = hashlib.sha256(raw).hexdigest()[:8].upper()
+                info["keyType"] = "ed25519"
         except Exception:
             pass
     return info
@@ -372,9 +388,9 @@ def save_credentials(api_key: str, rsa_pem: str, env: Optional[str] = None) -> N
             rsa_pem.encode("utf-8"), password=None
         )
     except Exception as ex:
-        raise ValueError(f"RSA key did not parse: {ex}") from ex
-    if not isinstance(key, rsa.RSAPrivateKey):
-        raise ValueError("RSA key file is not an RSA private key")
+        raise ValueError(f"Private key did not parse: {ex}") from ex
+    if not isinstance(key, _SIGNING_KEY_TYPES):
+        raise ValueError("Private key must be an RSA or Ed25519 key")
     api_path = _env_api_key_file(e)
     pem_path = _env_rsa_key_file(e)
     _write_secret_bytes(api_path, (api_key + "\n").encode("utf-8"))
@@ -456,6 +472,9 @@ def now_ms() -> int:
 
 def _sign(message: bytes) -> str:
     private_key = _load_private_key()
+    if isinstance(private_key, ed25519.Ed25519PrivateKey):
+        # Ed25519 signs the pre-sign text itself: no hash, no padding.
+        return base64.b64encode(private_key.sign(message)).decode("ascii")
     signature = private_key.sign(
         message,
         padding.PSS(

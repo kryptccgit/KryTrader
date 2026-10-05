@@ -223,7 +223,7 @@ export function GuidePage() {
               body={
                 <>
                   Kalshi → <span className="text-white">Account → API Keys → New Key</span>.
-                  Save the API key ID and download the RSA private key file (it's a
+                  Save the API key ID and download the private key file (Ed25519 or RSA both work; it's a
                   one-time download). For demo, do this on{' '}
                   <button
                     onClick={open('https://demo.kalshi.co')}
@@ -303,7 +303,7 @@ export function GuidePage() {
             <Step n={3} title="Generate demo API keys" body={
               <>On{' '}
                 <button onClick={open(KALSHI_DEMO_URL)} className="text-krypt-purple hover:underline">demo.kalshi.co</button>
-                {' '}→ Account → API Keys → New Key. Save the key ID and download the RSA private key.
+                {' '}→ Account → API Keys → New Key. Save the key ID and download the private key.
                 Demo keys are completely separate from production.
               </>
             } />

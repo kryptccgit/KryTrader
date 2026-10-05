@@ -1019,8 +1019,7 @@ def _tape_row(t: dict, source: str) -> dict:
     n = _count(t.get("count"))
     if n is None:
         n = _count(t.get("count_fp"))
-    side = _text(t.get("taker_side"))
-    side = side.lower() if side in ("yes", "no", "YES", "NO") else None
+    side = kalshi_ws.taker_outcome_side(t) or None
 
     observed = None
     ms = _count(t.get("observed_ms"))
@@ -1564,15 +1563,19 @@ def _first_count(o: dict, *keys: str) -> Optional[int]:
     return None
 
 
-def _order_row(o: dict, title: Optional[str] = None) -> dict:
-    side = _text(o.get("side"))
-    side = side.lower() if side in ("yes", "no", "YES", "NO") else "yes"
-    action = _text(o.get("action")) or ""
-    action = action.lower() if action.lower() in ("buy", "sell") else "buy"
-    px = price_cents(o.get("yes_price") if side == "yes" else o.get("no_price"))
-    if px is None:
-        d = _num(o.get("yes_price_dollars") if side == "yes" else o.get("no_price_dollars"))
-        px = price_cents(d * 100) if d is not None else None
+def _order_row(
+    o: dict, title: Optional[str] = None, held_side: Optional[str] = None,
+) -> dict:
+    # A missing side/action used to default to "buy YES"; once Kalshi drops
+    # the deprecated fields that turned every resting sell into a buy, and
+    # the stop rules stopped seeing the exits already working.
+    action, side = kalshi_api.order_direction(o, held_side=held_side)
+    px = None
+    if side is not None:
+        px = price_cents(o.get("yes_price") if side == "yes" else o.get("no_price"))
+        if px is None:
+            d = _num(o.get("yes_price_dollars") if side == "yes" else o.get("no_price_dollars"))
+            px = price_cents(d * 100) if d is not None else None
     if px is None:
         d = _num(o.get("price"))
         px = price_cents(d * 100 if d is not None and d <= 1.5 else d)
@@ -1597,7 +1600,8 @@ async def resting_orders(authed: bool, ticker: str = "") -> dict:
     if not authed:
         return {"orders": [], "note": "No verified credentials for this environment."}
     raw = await kalshi_api.fetch_orders(status="resting", ticker=ticker or "")
-    orders = [_order_row(o) for o in raw]
+    held = await _held_sides(raw)
+    orders = [_order_row(o, held_side=held.get(str(o.get("ticker") or ""))) for o in raw]
     note = None
     if len(raw) >= 1000:
         note = (
@@ -1605,6 +1609,26 @@ async def resting_orders(authed: bool, ticker: str = "") -> dict:
             "than are shown. Cancel from the Kalshi web app if one is missing."
         )
     return {"orders": orders, "note": note}
+
+
+async def _held_sides(raw: list) -> dict[str, str]:
+    # Only needed once Kalshi stops sending action/side: then the position is
+    # what tells a sell of YES from a buy of NO (see order_direction).
+    if all(o.get("action") and o.get("side") for o in raw):
+        return {}
+    try:
+        positions = await kalshi_api.get_positions()
+    except Exception as e:
+        logger.info("terminal: positions read for order direction failed: %s", e)
+        return {}
+    out: dict[str, str] = {}
+    for p in positions:
+        q = _num(p.get("position_fp"))
+        if q is None:
+            q = _num(p.get("position"))
+        if q:
+            out[str(p.get("ticker") or "")] = "yes" if q > 0 else "no"
+    return out
 
 
 def _fee_usd(price_c: float, contracts: int) -> float:
