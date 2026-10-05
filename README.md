@@ -12,8 +12,12 @@ Whale tracker, momentum scanner, a manual trading terminal and a configurable tr
 &nbsp;[![Windows 10 | 11](https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?logo=windows&logoColor=white)](#download)
 &nbsp;[![Status: beta](https://img.shields.io/badge/status-beta-F59E0B)](#download)
 &nbsp;[![Price: free](https://img.shields.io/badge/Price-free-EC4899)](#download)
-&nbsp;[![Discord](https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white)](https://discord.gg/muzFKR657F)
-&nbsp;[![Website](https://img.shields.io/badge/web-krypt.cc-A855F7?logo=googlechrome&logoColor=white)](https://krypt.cc)
+
+<br /><br />
+
+<a href="https://krypt.cc/tools/trader"><img src="https://img.shields.io/badge/Download%20.exe-Windows-A855F7?style=for-the-badge&logo=windows&logoColor=white" alt="Download the Windows .exe" height="44" /></a>
+&nbsp;<a href="https://discord.gg/muzFKR657F"><img src="https://img.shields.io/badge/Join%20the-Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Join the Discord" height="44" /></a>
+&nbsp;<a href="https://krypt.cc/tools"><img src="https://img.shields.io/badge/More%20free%20tools-krypt.cc%2Ftools-EC4899?style=for-the-badge&logo=googlechrome&logoColor=white" alt="More free tools at krypt.cc/tools" height="44" /></a>
 
 </div>
 
@@ -50,9 +54,11 @@ Krypt Trader watches the public Kalshi markets for whale orders and momentum, sc
 
 ## Download
 
-<a href="../../releases/latest"><img src="https://img.shields.io/badge/Download%20for%20Windows-Krypt%20Trader-A855F7?style=for-the-badge&logo=windows&logoColor=white" alt="Download Krypt Trader" /></a>
+<a href="https://krypt.cc/tools/trader"><img src="https://img.shields.io/badge/Download%20for%20Windows-Krypt%20Trader-A855F7?style=for-the-badge&logo=windows&logoColor=white" alt="Download Krypt Trader" height="44" /></a>
 
-Grab the latest installer from the [**Releases**](../../releases/latest) page, run it, then open **API Keys** and connect your Kalshi key + RSA private key. It starts on demo with auto-trading off, so nothing trades until you switch to Production and arm it. Releases also carry **unsigned Linux (AppImage/deb) and macOS (dmg, Intel + Apple Silicon)** builds — they get less testing than the Windows one.
+**Direct download (.exe):** [krypt.cc/tools/trader](https://krypt.cc/tools/trader)
+
+Grab the installer from the link above (or the [**Releases**](../../releases/latest) page), run it, then open **API Keys** and connect your Kalshi key + RSA private key. It starts on demo with auto-trading off, so nothing trades until you switch to Production and arm it. Releases also carry **unsigned Linux (AppImage/deb) and macOS (dmg, Intel + Apple Silicon)** builds — they get less testing than the Windows one.
 
 > Builds aren't code-signed yet, so the first launch may show a SmartScreen prompt — click **More info → Run anyway**. The full source is right here if you'd rather build it yourself.
 
@@ -85,11 +91,6 @@ npm run dist     # build the installer for your OS into /release
 ```
 
 Requires [Node.js](https://nodejs.org) 18+ and [Python](https://python.org) 3.10+ on PATH. Development runs on macOS/Linux/Windows. `npm run dist` builds the installer for the OS you're on; CI builds Windows, Linux (AppImage/deb) and macOS (dmg, both architectures) installers and attaches them to each GitHub Release — the Linux/macOS ones are unsigned and less tested than Windows.
-
-## Need a Kalshi account?
-
-Sign up through our referral and Kalshi gives you **$25 free** after your first deposit (the referral credit goes to the authors or to a community member who donated their link — it costs you nothing extra):
-<https://kalshi.com/sign-up/?referral=b1483a75-2984-48c0-87d4-42a1d4714e78>
 
 ## Links
 
