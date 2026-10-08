@@ -1,3 +1,22 @@
+"""LIVE exchange-sharding check. Run by hand.
+
+Kalshi split trading across matching engines in August 2026 — crypto to shard 2
+on the 24th, tennis and baseball to shard 3. This verifies the app against the
+LIVE assignment rather than against what the docs said on the day they were
+read, because Kalshi is adding shards incrementally and the mapping will move
+again.
+
+Run it unauthenticated for the market-side check. With credentials saved it
+also answers the question that actually costs money:
+
+    IS THERE COLLATERAL ON THE SHARD YOUR MARKETS LIVE ON?
+
+Kalshi requires collateral to be preallocated per shard. An account whose cash
+all sits on shard 0 cannot open a crypto position on shard 2, and the rejection
+does not announce that as the reason.
+
+    python/.venv/Scripts/python.exe python/live_sharding_check.py
+"""
 from __future__ import annotations
 
 import asyncio

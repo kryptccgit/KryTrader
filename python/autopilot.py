@@ -1,3 +1,36 @@
+"""Autopilot: the app runs an AI agent on a schedule, with the user's own key.
+
+Everything else that talks to a model in this app does it on a click, because
+every call is billed to the user (invariant 8). Autopilot is the one deliberate
+exception, and it is built so that it cannot become a surprise on a bill or a
+surprise in an account:
+
+  * **Off until switched on**, with its own confirmation, separate from the
+    MCP server and from every permission.
+  * **It is just another MCP client.** It sees exactly the tools a connected
+    Cursor or Claude would (mcp_server.visible_tools) and calls them through
+    mcp_server.call_tool — the same forecast gate, caps, daily loss stop,
+    "only what it opened" rule and, in live mode, the same approval queue.
+    Autopilot adds no order path of its own.
+  * **Three budgets, all enforced here before a call is made:** runs per UTC
+    day, tokens per UTC day across all runs, and tool calls per run. A run
+    that would cross the token budget mid-way stops, and says so.
+  * **One run at a time.** A slow run is never overlapped by the next tick.
+  * **Switching it off stops a run in progress** at the next step.
+  * **Every run is recorded** — model, steps, tokens, cost where the provider
+    publishes prices, every tool it called, and its own report of what it did.
+
+The key, provider and model are the AI Analysis settings: one key, one bill.
+
+Any provider works whose model can call tools — Autopilot does nothing except
+through tools, so a model that cannot is refused BEFORE the run starts, with
+the reason, rather than failing on its first turn. Anthropic and OpenAI keep
+their SDK loops below; OpenRouter, Gemini, Ollama and LM Studio run through
+ai_providers.ToolChat. The budgets are enforced by the same code for all of
+them. Where a provider reports no token usage (a local server can omit it),
+the run counts an estimate from the text length instead of counting zero,
+and its report says the figures are estimates.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -52,12 +85,25 @@ approval and why, and anything the user should look at.
 THE USER'S MISSION
 {mission}"""
 
+AGENT_BLOCK = """
+YOU ARE RUNNING AS: {name}
+{guide}
+YOUR HARD RULES (the app refuses any order outside them):
+{rules}
+"""
+
+
+def run_agent(cfg: dict) -> Optional[dict]:
+    """The named agent Autopilot runs as, or None if it no longer exists."""
+    return mcp_server.mcp_agents.get(cfg, str(cfg.get("autopilot_agent_id") or "default"))
+
 DEFAULT_MISSION = (
     "Look through markets closing in the next few days. Pick the ones where "
     "you can actually reason about the outcome, read their resolution rules, "
     "and record honest forecasts. Trade only where your edge after fees clears "
     "the minimum, and keep sizes small."
 )
+
 
 
 def _now() -> str:
@@ -111,6 +157,7 @@ def runs(limit: int = 30) -> list[dict]:
     return out
 
 
+
 def _limits(cfg: dict) -> dict:
     return {
         "intervalMin": int(cfg.get("autopilot_interval_min") or 60),
@@ -121,10 +168,17 @@ def _limits(cfg: dict) -> dict:
 
 
 def blocked_reason(cfg: dict) -> Optional[str]:
+    """Why a run cannot start now, or None."""
     lim = _limits(cfg)
-    provider = cfg.get("ai_provider") or "anthropic"
-    if not ai_analyst.has_key(provider):
-        return (f"No {'OpenAI' if provider == 'openai' else 'Anthropic'} key — set it "
+    provider = _provider(cfg)
+    agent = run_agent(cfg)
+    if agent is None:
+        return ("The agent Autopilot runs as no longer exists. Pick one under "
+                "AI Agents → Autopilot → Run as agent.")
+    if not agent.get("enabled", True):
+        return f"Autopilot runs as {agent['name']}, which is switched off."
+    if not ai_analyst.ready(provider):
+        return (f"No {ai_analyst.CAPS[provider].label} key — set it "
                 f"under Settings → AI analysis.")
     u = usage_today()
     if u["runs"] >= lim["maxRunsPerDay"]:
@@ -132,6 +186,25 @@ def blocked_reason(cfg: dict) -> Optional[str]:
     if u["tokens"] >= lim["dailyTokenBudget"]:
         return f"Today's token budget is spent ({u['tokens']:,} of {lim['dailyTokenBudget']:,})."
     return None
+
+
+def _provider(cfg: dict) -> str:
+    return ai_analyst._norm_provider(cfg.get("ai_provider"))
+
+
+def tool_refusal(cfg: dict) -> Optional[str]:
+    """Why this provider/model cannot run Autopilot at all, or None.
+
+    Blocking — for a per-model provider it is a local call or a free listing —
+    so it is NOT part of blocked_reason(), which the scheduler and the status
+    poll read on the event loop. run_once() and the Run-now handler ask it
+    off the loop, before anything is recorded or billed."""
+    provider = _provider(cfg)
+    ok, why = ai_analyst.tool_support(provider, cfg.get("ai_model"))
+    if ok:
+        return None
+    return why or (f"{ai_analyst.CAPS[provider].label} can't call tools with this "
+                   f"model, and Autopilot works only through tools.")
 
 
 def _parse(ts: Optional[str]) -> Optional[float]:
@@ -171,11 +244,15 @@ def status(cfg: dict) -> dict:
         "blockedReason": blocked_reason(cfg) if cfg.get("autopilot_enabled") else None,
         "today": usage_today(),
         "limits": _limits(cfg),
-        "provider": cfg.get("ai_provider") or "anthropic",
-        "model": ai_analyst.normalize_model(cfg.get("ai_provider") or "anthropic",
-                                            cfg.get("ai_model")),
+        "provider": _provider(cfg),
+        "providerLabel": ai_analyst.CAPS[_provider(cfg)].label,
+        "model": ai_analyst.normalize_model(_provider(cfg), cfg.get("ai_model")),
+        "tokenAccounting": ai_analyst.CAPS[_provider(cfg)].tokens,
         "toolCount": len(mcp_server.visible_tools(cfg)),
+        "agentId": str(cfg.get("autopilot_agent_id") or "default"),
+        "agentName": (run_agent(cfg) or {}).get("name"),
     }
+
 
 
 def _clip(text: str) -> str:
@@ -193,21 +270,33 @@ class _Run:
     def __init__(self, cfg: dict, trigger: str):
         self.cfg = cfg
         self.trigger = trigger
-        self.provider = cfg.get("ai_provider") or "anthropic"
+        self.provider = _provider(cfg)
         self.model = ai_analyst.normalize_model(self.provider, cfg.get("ai_model"))
         self.lim = _limits(cfg)
         self.in_tok = 0
         self.out_tok = 0
         self.cost: Optional[float] = 0.0
+        self.estimated = False
         self.steps = 0
         self.tool_log: list[dict] = []
-        self.ctx = {"client": f"autopilot ({self.model})"}
+        self.agent_id = str(cfg.get("autopilot_agent_id") or "default")
+        self.ctx = {"client": f"autopilot ({self.model})", "agent": self.agent_id}
         self.budget_left = self.lim["dailyTokenBudget"] - usage_today()["tokens"]
 
     def system(self) -> str:
         mission = str(self.cfg.get("autopilot_mission") or "").strip() or DEFAULT_MISSION
-        return SYSTEM.format(instructions=mcp_server.INSTRUCTIONS,
+        text = SYSTEM.format(instructions=mcp_server.INSTRUCTIONS,
                              max_steps=self.lim["maxSteps"], mission=mission)
+        agent = run_agent(self.cfg)
+        if agent is not None and mcp_server.mcp_agents.is_customised(agent):
+            rails = mcp_server._agent_rails(self.cfg, agent)
+            mode = mcp_server._agent_mode(self.cfg, agent)
+            rules = "\n".join(f"- {s}" for s in
+                              mcp_server.mcp_agents.rules_summary(agent, rails, mode))
+            guide = (f"\nTHE USER'S GUIDE FOR YOU:\n{agent['guide']}\n"
+                     if agent.get("guide") else "")
+            text += "\n" + AGENT_BLOCK.format(name=agent["name"], guide=guide, rules=rules)
+        return text
 
     def tools(self) -> list[dict]:
         return [t.spec() for t in mcp_server.visible_tools(self.cfg)]
@@ -239,8 +328,17 @@ class _Run:
 
 
 async def _loop_anthropic(run: _Run, key: str) -> tuple[str, str]:
+    http = ai_analyst.ai_providers.counted_client(_TIMEOUT_SEC)
+    try:
+        return await _anthropic_turns(run, key, http)
+    finally:
+        http.close()
+
+
+async def _anthropic_turns(run: _Run, key: str, http) -> tuple[str, str]:
     import anthropic
-    client = anthropic.Anthropic(api_key=key, timeout=_TIMEOUT_SEC, max_retries=2)
+    client = anthropic.Anthropic(api_key=key, timeout=_TIMEOUT_SEC, max_retries=2,
+                                 http_client=http)
     tools = [{"name": t["name"], "description": t["description"],
               "input_schema": t["inputSchema"]} for t in run.tools()]
     system = [{"type": "text", "text": run.system(), "cache_control": {"type": "ephemeral"}}]
@@ -284,8 +382,17 @@ async def _loop_anthropic(run: _Run, key: str) -> tuple[str, str]:
 
 
 async def _loop_openai(run: _Run, key: str) -> tuple[str, str]:
+    http = ai_analyst.ai_providers.counted_client(_TIMEOUT_SEC)
+    try:
+        return await _openai_turns(run, key, http)
+    finally:
+        http.close()
+
+
+async def _openai_turns(run: _Run, key: str, http) -> tuple[str, str]:
     import openai
-    client = openai.OpenAI(api_key=key, timeout=_TIMEOUT_SEC, max_retries=2)
+    client = openai.OpenAI(api_key=key, timeout=_TIMEOUT_SEC, max_retries=2,
+                           http_client=http)
     tools = [{"type": "function", "name": t["name"], "description": t["description"],
               "parameters": t["inputSchema"], "strict": False} for t in run.tools()]
     items: list = [{"role": "user", "content": "Run now. Today is "
@@ -322,10 +429,53 @@ async def _loop_openai(run: _Run, key: str) -> tuple[str, str]:
                           "output": text})
 
 
+async def _loop_generic(run: _Run, key: str) -> tuple[str, str]:
+    """OpenRouter, Gemini, Ollama, LM Studio. Same order of checks as the two
+    SDK loops — stop/budget, call, account, refusal, done, step limit, tools —
+    so a budget means the same thing whichever provider is spending it."""
+    import ai_providers
+    first = ("Run now. Today is "
+             + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + ".")
+    chat = await asyncio.to_thread(
+        ai_providers.open_tool_chat, run.provider, key or None, run.model,
+        run.system(), run.tools(), first)
+    run.model = chat.model
+    run.ctx = {**run.ctx, "client": f"autopilot ({run.model})"}
+    final = ""
+    while True:
+        stop = run.should_stop()
+        if stop:
+            return final or "Stopped before finishing.", stop
+        too_big = chat.context_problem()
+        if too_big:
+            return (final + "\n\n" if final else "") + too_big, "context"
+        turn = await asyncio.to_thread(chat.send)
+        run.estimated = run.estimated or turn.estimated
+        run.add_usage(turn.input_tokens, turn.output_tokens, turn.cost)
+        if getattr(turn, "failed", None):
+            raise ai_analyst.AiError(turn.failed)
+        if turn.text:
+            final = turn.text
+        if turn.refusal:
+            return final or "The model declined to continue.", "error"
+        if not turn.calls:
+            return final, "ok"
+        if run.steps + len(turn.calls) > run.lim["maxSteps"]:
+            return final or "Reached the tool-call limit for one run.", "steps"
+        results = []
+        for c in turn.calls:
+            text, is_err = await run.tool(c.name, c.args)
+            results.append((c, text, is_err))
+        chat.add_results(turn, results)
+
+
 async def run_once(cfg: dict, trigger: str = "schedule") -> dict:
+    """One autopilot session. Returns the stored run row."""
     if _LOCK.locked():
         return {"ok": False, "message": "Autopilot is already running."}
     why = blocked_reason(cfg)
+    if not why:
+        why = await asyncio.to_thread(tool_refusal, cfg)
     if why:
         STATE.last_error = why
         return {"ok": False, "message": why}
@@ -343,8 +493,14 @@ async def run_once(cfg: dict, trigger: str = "schedule") -> dict:
         summary, status_, error = "", "error", None
         try:
             key = ai_analyst._read_key(run.provider)
-            loop = _loop_openai if run.provider == "openai" else _loop_anthropic
+            loop = {"openai": _loop_openai,
+                    "anthropic": _loop_anthropic}.get(run.provider, _loop_generic)
             summary, status_ = await loop(run, key or "")
+            if run.estimated:
+                summary = ((summary or "").rstrip() + "\n\n[Token counts for this run "
+                           "are estimates from text length: "
+                           f"{ai_analyst.CAPS[run.provider].label} did not report usage "
+                           "for every turn. The daily budget counted the estimates.]")
             STATE.last_error = None
         except ai_analyst.AiError as e:
             error = str(e)
@@ -356,10 +512,10 @@ async def run_once(cfg: dict, trigger: str = "schedule") -> dict:
         finally:
             with db.get_db() as conn:
                 conn.execute(
-                    "UPDATE autopilot_runs SET finished_at=?, status=?, steps=?, "
+                    "UPDATE autopilot_runs SET finished_at=?, model=?, status=?, steps=?, "
                     "input_tokens=?, output_tokens=?, cost_usd=?, summary=?, "
                     "tool_log=?, error=? WHERE id=?",
-                    (_now(), status_ if error is None else "error", run.steps,
+                    (_now(), run.model, status_ if error is None else "error", run.steps,
                      run.in_tok, run.out_tok,
                      round(run.cost, 4) if run.cost is not None else None,
                      (summary or "")[:6000], json.dumps(run.tool_log[:80]), error, rid))

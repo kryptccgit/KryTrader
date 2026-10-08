@@ -1,3 +1,16 @@
+"""Backtest a user strategy script over the recorded tick corpus.
+
+Same data, same fill honesty as `replay.py` (recorded-ask taker fills,
+Kalshi fee curve with per-order round-up), but the entry decision comes from
+the script's `decide(ctx)` instead of the built-in gates. Windows are
+replayed in chronological close-time order so a stateful script sees history
+the way it would live; `state` persists across the whole run and `on_start`
+/ `on_fill` / `on_settle` fire at the equivalent points.
+
+Structurally order-free: this module never imports kalshi_api and the
+sandbox exposes no order functions — decide() returns data, the harness
+does the accounting. A backtest cannot place an order by construction.
+"""
 from __future__ import annotations
 
 import math
@@ -15,6 +28,9 @@ DECIDE_BUDGET_MS = 20.0
 
 
 def sanitize_intent(raw: Any) -> tuple[Optional[dict], Optional[str]]:
+    """Coerce whatever decide() returned into a clean order intent, or a
+    human-readable rejection. Shared by backtest and the live engine so the
+    two can never disagree on the contract."""
     if raw is None:
         return None, None
     if not isinstance(raw, dict):
@@ -61,6 +77,10 @@ def sanitize_intent(raw: Any) -> tuple[Optional[dict], Optional[str]]:
 
 
 def sanitize_manage(raw: Any) -> tuple[Optional[dict], Optional[str]]:
+    """Coerce whatever manage() returned into a clean action, or a rejection.
+    None / "hold" = keep holding; "sell" (or {"action":"sell"}) = flatten the
+    whole position at the bid now; {"action":"update", take_profit_pct?,
+    stop_loss_cents?} = retune the exit targets (0 clears one)."""
     if raw is None or raw == "hold":
         return None, None
     if raw == "sell":
@@ -93,6 +113,11 @@ def sanitize_manage(raw: Any) -> tuple[Optional[dict], Optional[str]]:
 
 
 def sanitize_signal_action(raw: Any) -> tuple[Optional[dict], Optional[str]]:
+    """decide_signal() contract: None = skip; True (or {"follow": True,
+    "sizeUsd"?}) = follow the signal's own side with follower economics.
+    Scripts FILTER and SIZE signals — they can't flip sides (side-flipped
+    fills aren't derivable from the recorded data, so they'd be
+    unbacktestable)."""
     if raw is None or raw is False:
         return None, None
     if raw is True:
@@ -114,6 +139,9 @@ def sanitize_signal_action(raw: Any) -> tuple[Optional[dict], Optional[str]]:
 
 
 def signal_to_js(sig: dict, source: str) -> dict:
+    """The dict handed to decide_signal(signal) — shared by the live engine
+    and the backtest so they can never drift. Confidence/edge/cost come from
+    the same helpers the main engine's gates use."""
     import trader as trader_mod
     try:
         _, cost_cents = trader_mod._signal_cost_cents(sig, source)
@@ -151,6 +179,10 @@ def signal_to_js(sig: dict, source: str) -> dict:
 
 
 def _exec_ask(t: dict, side: str) -> Optional[float]:
+    """Executable ask (0..1) to BUY `side` from a recorded tick: up buys YES
+    at yes_ask; down buys NO at no_ask (or 1−yes_bid on the complementary
+    book, same convention as replay.tick_to_asset). None = no executable
+    quote this tick."""
     if side == "up":
         a = t.get("yes_ask")
     else:
@@ -164,6 +196,8 @@ def _exec_ask(t: dict, side: str) -> Optional[float]:
 
 
 def _t_stat(trades: list[dict]) -> Optional[float]:
+    """t-statistic of the mean per-trade P&L (is the edge distinguishable
+    from noise?). None below 3 trades or at zero variance."""
     n = len(trades)
     if n < 3:
         return None
@@ -181,6 +215,12 @@ def _sim_exits(
     sl_cents: Optional[int], ticker: str, asset_name: str, cfg: dict,
     close_iso: str, portfolio: dict,
 ) -> Optional[tuple[float, str]]:
+    """Walk post-entry ticks simulating the exit layer: static tp/sl triggers
+    (retunable by manage) checked first each tick, then the script's manage()
+    hook. Sells fill into that tick's REAL bid with both taker fees charged.
+    Returns (pnl_per_contract, reason) or None → held to settlement. Raises
+    ScriptError if manage() dies or returns garbage (matches live, where that
+    auto-disables the script)."""
     has_manage = "manage" in script.hooks
     if not has_manage and not tp_pct and not sl_cents:
         return None
@@ -232,6 +272,9 @@ def _sim_exits(
 
 def run(cfg: dict, code: str, *, trusted: bool = False,
         env: str = "production", since_days: int = 60) -> dict:
+    """Backtest `code` over recorded resolved windows. Returns the standard
+    Crypto15mBacktest payload extended with scriptLogs / scriptError /
+    intent-rejection counters."""
     cfg = dict(cfg)
     contracts = max(1, int(cfg.get("crypto15m_order_size") or 1))
     max_entry_cents = int(cfg.get("script_max_entry_cents") or 97)
@@ -453,6 +496,12 @@ def run(cfg: dict, code: str, *, trusted: bool = False,
 def _replay_signals(script: "script_sandbox.CompiledScript", cfg: dict, *,
                     since_days: int = 60, slippage_cents: float = 1.0,
                     started: Optional[float] = None) -> dict:
+    """Replay recorded whale prints + momentum alerts through the script's
+    decide_signal(signal) filter with follower economics — the same model as
+    the main-engine backtest (entry at signal price + slippage, Kalshi fee,
+    outcome from the recorded resolution). Shares the run's MAX_RUN_SECS
+    wall-clock cap via `started` — a large corpus must not pin the backtest
+    worker past the promised cap."""
     if started is None:
         started = time.perf_counter()
     partial = False

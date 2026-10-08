@@ -1,12 +1,17 @@
 import { useEffect, useState } from 'react';
-import { ChevronDown, Loader2, Play } from 'lucide-react';
+import { ChevronDown, Loader2, Play, Sparkles } from 'lucide-react';
 import type { AutopilotRun, AutopilotStatus } from '@shared/market';
-import { Card, ConfirmDialog, NumberInput, Section, Switch } from './common';
+import { Card, ConfirmDialog, Modal, NumberInput, Section, Switch } from './common';
+import { AutopilotQuickstart } from './AutopilotQuickstart';
 import { Caveat } from './terminal/atoms';
 import { useApp } from '../state/AppStateProvider';
 import { usePoll } from '../state/TerminalProvider';
 import { useToast } from '../state/ToastProvider';
 import { cls, fmtNum, fmtTimeShort, fmtUsd } from '../utils/format';
+import { fmtTokens } from '../utils/stats';
+import { agentsOf, DEFAULT_AGENT_ID } from '@shared/agents';
+import { AgentPicker } from './agents/AgentPicker';
+import { userMessage } from '../utils/errors';
 
 const PLACEHOLDER =
   'e.g. Look through markets closing in the next few days. Read the rules, record honest '
@@ -17,6 +22,7 @@ const STATUS_TONE: Record<AutopilotRun['status'], string> = {
   ok: 'text-krypt-win',
   steps: 'text-krypt-muted',
   budget: 'text-krypt-warn',
+  context: 'text-krypt-warn',
   stopped: 'text-krypt-muted',
   error: 'text-krypt-loss',
 };
@@ -25,6 +31,7 @@ export function AutopilotPanel() {
   const { config, refresh } = useApp();
   const toast = useToast();
   const [arm, setArm] = useState(false);
+  const [quick, setQuick] = useState(false);
   const [mission, setMission] = useState(config?.autopilotMission ?? '');
   const [open, setOpen] = useState<number | null>(null);
   useEffect(() => { setMission(config?.autopilotMission ?? ''); }, [config?.autopilotMission]);
@@ -44,7 +51,7 @@ export function AutopilotPanel() {
       if (res.ok) toast.success(res.message); else toast.warn(res.message);
       st.reload();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     }
   };
 
@@ -54,6 +61,21 @@ export function AutopilotPanel() {
       title="Autopilot"
       description="The app runs an agent on a schedule with your AI analysis key. It gets exactly the tools and rails a connected client would."
     >
+      {!config?.autopilotEnabled && (
+        <div className="mb-3 flex flex-col items-start gap-3 rounded-xl border border-krypt-purple/40 bg-gradient-to-r from-krypt-indigo/10 via-krypt-purple/10 to-krypt-pink/10 p-4 md:flex-row md:items-center">
+          <Sparkles className="h-5 w-5 shrink-0 text-krypt-purple" />
+          <div className="flex-1 text-sm">
+            <div className="font-medium text-white">New to Autopilot? Set it up in a few steps.</div>
+            <div className="mt-0.5 text-xs text-krypt-muted">
+              Pick an AI, add its key (or use a free local one), choose a mission and a budget.
+              It starts on paper: real order books, imaginary money.
+            </div>
+          </div>
+          <button type="button" className="krypt-btn-primary" onClick={() => setQuick(true)} data-testid="autopilot-quickstart-open">
+            <Sparkles className="h-4 w-4" /> Quick setup
+          </button>
+        </div>
+      )}
       <Card>
         <div className="grid gap-3 md:grid-cols-2">
           <Switch
@@ -66,7 +88,7 @@ export function AutopilotPanel() {
             <div className="text-right text-[11px] text-krypt-muted">
               <div>
                 Model: <span className="font-mono text-white">{a?.model ?? '—'}</span>
-                {' '}({a?.provider === 'openai' ? 'OpenAI' : 'Anthropic'}, from AI analysis settings)
+                {' '}({a?.providerLabel ?? a?.provider ?? '—'}, from AI analysis settings)
               </div>
               <div>
                 {a?.running
@@ -77,10 +99,15 @@ export function AutopilotPanel() {
                 {a && ` · ${a.toolCount} tools available`}
               </div>
             </div>
-            <button onClick={() => void runNow()} disabled={!!a?.running} className="krypt-btn-default">
+            <button onClick={() => void runNow()} disabled={!!a?.running} className="krypt-btn-default shrink-0 whitespace-nowrap">
               {a?.running ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
               Run now
             </button>
+            {config?.autopilotEnabled && (
+              <button onClick={() => setQuick(true)} className="krypt-btn-ghost shrink-0 whitespace-nowrap" title="Walk through provider, mission and budget again">
+                <Sparkles className="h-4 w-4" /> Quick setup
+              </button>
+            )}
           </div>
         </div>
 
@@ -94,6 +121,16 @@ export function AutopilotPanel() {
             Last run failed: {a.lastError}
           </Caveat>
         )}
+
+        <div className="mt-4 max-w-sm">
+          <AgentPicker
+            agents={agentsOf(config)}
+            value={config?.autopilotAgentId ?? DEFAULT_AGENT_ID}
+            onChange={(id) => void patch({ autopilotAgentId: id })}
+            testId="autopilot-agent"
+            hint="Its guide shapes each run and its rules bind every order, exactly as when it is connected from Cursor or Claude."
+          />
+        </div>
 
         <div className="mt-4">
           <span className="krypt-label">Mission</span>
@@ -153,8 +190,9 @@ export function AutopilotPanel() {
                   <span className={cls('w-16 uppercase tracking-wider', STATUS_TONE[r.status])}>{r.status}</span>
                   <span className="w-20 text-krypt-muted">{r.trigger}</span>
                   <span className="font-mono text-krypt-muted">{r.steps} steps</span>
-                  <span className="font-mono text-krypt-muted">
-                    {fmtNum((r.inputTokens ?? 0) + (r.outputTokens ?? 0))} tok
+                  <span className="font-mono text-krypt-muted" title={r.inputTokens === null && r.outputTokens === null
+                    ? 'This provider reported no token usage for the run.' : undefined}>
+                    {fmtTokens(r.inputTokens, r.outputTokens, r.tokensEstimated)}
                   </span>
                   <span className="font-mono text-krypt-muted">{fmtUsd(r.costUsd)}</span>
                   <span className="ml-2 truncate text-white/80">
@@ -181,6 +219,13 @@ export function AutopilotPanel() {
         </Card>
       )}
 
+      <Modal open={quick} onClose={() => setQuick(false)} maxWidth="max-w-2xl">
+        <AutopilotQuickstart
+          onDone={() => { setQuick(false); st.reload(); }}
+          onSkip={() => setQuick(false)}
+        />
+      </Modal>
+
       <ConfirmDialog
         open={arm}
         title="Run an AI agent on a schedule?"
@@ -199,6 +244,10 @@ export function AutopilotPanel() {
               It can do exactly what your AI Agents settings allow a connected client to do: the
               trading mode, caps, loss stop and permissions above all apply, and live orders still
               wait for your approval unless you turned that off.
+            </p>
+            <p>
+              It runs as <span className="text-white">{a?.agentName ?? 'the agent you picked'}</span>:
+              that agent&apos;s guide and rules apply to every run.
             </p>
           </div>
         }

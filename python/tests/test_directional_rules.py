@@ -1,3 +1,5 @@
+"""Directional rule mode: YES/NO rule-sets pick the side (for imported
+momentum strategies like Turbine's)."""
 from __future__ import annotations
 
 import crypto15m_trader as ct

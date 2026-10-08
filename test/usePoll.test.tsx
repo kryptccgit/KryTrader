@@ -2,6 +2,7 @@ import { act, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { usePoll } from '../src/state/TerminalProvider';
 
+
 function Probe({ ticker, fetcher, interval = 0, enabled = true }: {
   ticker: string;
   fetcher: (t: string) => Promise<string>;

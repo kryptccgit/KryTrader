@@ -16,6 +16,7 @@ def run_async(coro):
 
 
 
+
 class _FakeResp:
     def __init__(self, status_code=200, body=None):
         self.status_code = status_code
@@ -31,6 +32,7 @@ class _FakeResp:
 
 
 def _stub_signing(monkeypatch, envs: list[str]):
+    """get_env pops from `envs` (last value sticks); signing is a no-op."""
     seq = list(envs)
 
     def _env():
@@ -42,7 +44,7 @@ def _stub_signing(monkeypatch, envs: list[str]):
 
 
 def test_signed_request_aborts_when_env_flips_mid_retry(monkeypatch):
-    _stub_signing(monkeypatch, ["production", "demo"])
+    _stub_signing(monkeypatch, ["production", "paper"])
 
     import httpx
 
@@ -67,7 +69,7 @@ def test_signed_request_aborts_when_env_flips_mid_retry(monkeypatch):
 
 
 def test_signed_request_pin_env_rejects_preflipped_env(monkeypatch):
-    _stub_signing(monkeypatch, ["demo"])
+    _stub_signing(monkeypatch, ["paper"])
     sent = {"n": 0}
 
     class _Client:
@@ -101,6 +103,7 @@ def test_signed_request_happy_path_single_env(monkeypatch):
     monkeypatch.setattr(kalshi_api, "_get_signed_client", _client)
     out = run_async(kalshi_api._signed_request("GET", "/portfolio/balance"))
     assert out == {"balance": 123}
+
 
 
 
@@ -140,6 +143,7 @@ def test_ws_quote_market_rejects_empty_quote(monkeypatch):
         "ts_ms": time.time() * 1000.0,
     })
     assert ct._ws_quote_market("KXBTC15M-T1") is None
+
 
 
 

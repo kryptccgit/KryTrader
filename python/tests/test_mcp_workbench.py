@@ -1,3 +1,10 @@
+"""The agent workbench: research data, backtests, scripts, settings.
+
+Every tool here sits behind a permission toggle the USER switches on. What is
+pinned is mostly the edges no toggle crosses: the environment, the agent's own
+permissions and caps, trusted scripts, the user's own scripts, and any config
+key nobody has classified yet.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -64,7 +71,10 @@ def _allow(state, *perms):
         state["cfg"][p] = True
 
 
+
 def test_every_config_key_is_classified():
+    """A new config knob must be placed deliberately. Unclassified keys are
+    refused at runtime; this makes the omission a failing test instead."""
     unclassified = [k for k in DEFAULT_CONFIG if wb.classify(k) == "unknown"]
     assert not unclassified, unclassified
     overlap = (wb.LIVE & wb.SETTINGS) | (wb.PROTECTED & (wb.LIVE | wb.SETTINGS))
@@ -72,8 +82,9 @@ def test_every_config_key_is_classified():
 
 
 def test_the_lines_no_toggle_crosses():
-    for k in ("kalshi_env", "mcp_trade_mode", "mcp_max_order_usd",
-              "mcp_allow_live_switches", "remote_trading_enabled", "ai_model",
+    for k in ("account_mode", "paper_bankroll_usd", "mcp_trade_mode", "mcp_max_order_usd",
+              "mcp_allow_live_switches", "mcp_http_enabled",
+              "remote_trading_enabled", "ai_model",
               "stats_webhook_url", "terminal_max_notional_usd",
               "crypto15m_record_signals"):
         assert wb.classify(k) == "protected", k
@@ -89,6 +100,7 @@ def test_permissions_cannot_be_switched_on_by_a_malformed_config():
     assert cfg["mcp_allow_scripts"] is False
 
 
+
 def test_workbench_tools_are_absent_until_switched_on(state):
     names = {t.name for t in mcp_server.visible_tools(merge_with_defaults(state["cfg"]))}
     assert not names & {"summarize_research", "save_script", "update_engine_config",
@@ -98,6 +110,7 @@ def test_workbench_tools_are_absent_until_switched_on(state):
     _allow(state, "mcp_allow_research")
     names = {t.name for t in mcp_server.visible_tools(merge_with_defaults(state["cfg"]))}
     assert "summarize_research" in names and "save_script" not in names
+
 
 
 def test_settings_permission_does_not_reach_live_switches(state):
@@ -123,8 +136,9 @@ def test_live_permission_can_start_an_engine_and_is_audited(state):
 
 def test_no_toggle_lets_an_agent_change_env_or_its_own_rails(state):
     _allow(state, *mcp_server.PERMISSIONS)
-    for key in ("kalshi_env", "mcp_max_order_usd", "mcp_trade_mode",
-                "mcp_allow_live_switches", "kalshiEnv", "mcpDailySpendUsd"):
+    for key in ("account_mode", "accountMode", "paper_bankroll_usd", "mcp_max_order_usd", "mcp_trade_mode",
+                "mcp_allow_live_switches", "paperBankrollUsd", "mcpDailySpendUsd",
+                "mcp_http_enabled", "mcpHttpEnabled"):
         err, body = _call("update_engine_config", {"patch": {key: "x"}})
         assert err and "never" in body, key
         wb._last_patch = 0.0
@@ -161,6 +175,7 @@ def test_unknown_keys_are_refused():
     sanitized, refusals = wb.vet_patch({"definitely_not_a_key": 1},
                                        merge_with_defaults({"mcp_allow_live_switches": True}))
     assert not sanitized and "not a setting" in refusals[0]
+
 
 
 def _user_script(sid="user-1", trusted=False, author=None):
@@ -225,6 +240,7 @@ def test_a_trusted_script_is_never_backtested_unsandboxed_by_an_agent(state):
     _user_script("t-1", trusted=True)
     err, body = _call("backtest_script", {"id": "t-1"})
     assert err and "trusted" in body.lower()
+
 
 
 def test_crypto15m_summary_reports_gross_edge_against_price_paid(state):

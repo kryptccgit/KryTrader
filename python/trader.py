@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import random
 import time
 import uuid
 from datetime import datetime, timezone
@@ -16,7 +15,7 @@ from kalshi_api import (
     KalshiAPIError, cancel_order, fetch_market, find_order_by_client_id,
     get_balance,
     get_fills_for_order, get_order, get_orderbook, get_positions,
-    order_direction, place_limit_order,
+    place_limit_order,
 )
 
 _CRYPTO15M_SERIES = {s["series"] for s in crypto15m.SERIES}
@@ -38,6 +37,8 @@ async def refresh_balance(cfg: dict, force: bool = False) -> tuple[int, int]:
     async with ENV_LOCK:
         env = get_env()
         cached = _balance_cache.get(env)
+        if env == "paper":
+            force = True
         if not force and cached and (now - cached["at"]) < interval:
             return cached["cents"], cached["portfolio_cents"]
     try:
@@ -72,6 +73,9 @@ async def refresh_balance(cfg: dict, force: bool = False) -> tuple[int, int]:
 
 
 def cached_shard_balances(env: str | None = None) -> dict | None:
+    """{exchange_index: dollars} from the last successful balance read, or
+    None when we do not know — no successful read yet, or a key whose response
+    carries no breakdown. None is UNKNOWN and callers must fail OPEN on it."""
     c = _balance_cache.get(env or get_env())
     if not c:
         return None
@@ -79,6 +83,10 @@ def cached_shard_balances(env: str | None = None) -> dict | None:
 
 
 def cached_balance(env: str | None = None) -> dict | None:
+    """Last successfully-fetched balance for `env` (or the active env) as
+    {cents, portfolio_cents, at}, or None if none has succeeded yet this session.
+    Display code reads this so a transient failed poll (or a cold cache right
+    after an env switch / backend restart) can't flash the balance to $0."""
     return _balance_cache.get(env or get_env())
 
 
@@ -181,11 +189,17 @@ def _compute_edge(signal: dict, source: str) -> float:
 
 
 def _taker_fee_cents(price_cents: int) -> float:
+    """Kalshi taker fee in cents per contract at `price_cents` — the continuous
+    marginal rate 7·p·(1−p) (per-order round-up is negligible at the main
+    engine's multi-contract sizes). ~1.75c at 50c, ~0.9c at 85c."""
     p = max(1, min(99, int(price_cents))) / 100.0
     return 7.0 * p * (1.0 - p)
 
 
 def _net_edge(signal: dict, source: str, cfg: dict) -> float:
+    """Signal edge with the taker fee subtracted (when fee_aware_edge is on),
+    so the min_edge gates compare NET expectation — a "5pt" gross edge at 50c
+    is really ~3.3pts after the ~1.75c fee."""
     edge = _compute_edge(signal, source)
     if cfg.get("fee_aware_edge", True):
         _, cost_cents = _signal_cost_cents(signal, source)
@@ -194,6 +208,9 @@ def _net_edge(signal: dict, source: str, cfg: dict) -> float:
 
 
 def _days_until_close(close_time: str) -> Optional[float]:
+    """Days from now until a market's close/resolution time (ISO8601). Returns None
+    when the time is missing or unparseable, which callers treat as 'unknown' and
+    do NOT gate on."""
     if not close_time:
         return None
     from datetime import datetime, timezone
@@ -209,6 +226,8 @@ def _days_until_close(close_time: str) -> Optional[float]:
 
 
 def _enrich_close_time(conn, sig: dict) -> None:
+    """Attach the market's close_time to a signal for the resolution-horizon gate.
+    Whale/momentum signal rows don't carry it; the markets table does."""
     if sig.get("close_time"):
         return
     m = db.get_market(conn, sig.get("ticker") or "")
@@ -219,13 +238,6 @@ def _enrich_close_time(conn, sig: dict) -> None:
 def should_trade(signal: dict, source: str, cfg: dict) -> tuple[bool, str]:
     if (signal.get("ticker") or "").split("-")[0] in _CRYPTO15M_SERIES:
         return False, "crypto15m series (owned by the 15m executor)"
-
-    if cfg.get("gambling_mode"):
-        prob = float(cfg.get("gambling_trade_probability", 0.10) or 0.0)
-        pct = int(round(prob * 100))
-        if random.random() < prob:
-            return True, f"\U0001F3B0 gambling: HIT ({pct}%)"
-        return False, f"\U0001F3B0 gambling: no hit ({pct}%)"
 
     conf = float(signal.get("confidence") or 0.0)
     edge = _net_edge(signal, source, cfg)
@@ -547,6 +559,7 @@ async def execute_signal(
             count=contracts,
             price_cents=limit_cents,
             client_order_id=client_order_id,
+            pin_env=env,
         )
     except KalshiAPIError as e:
         body_l = str(e.body).lower()
@@ -585,6 +598,16 @@ async def execute_signal(
 async def _book_lost_entry(
     row: dict, signal: dict, client_order_id: str, err: str
 ) -> Optional[dict]:
+    """An entry POST raised but may have been delivered. Adopt the live order
+    if the coid lookup finds it; book 'error' only on a confirmed miss. On an
+    unconfirmable lookup, book 'submitted' with no order id — the poll loop's
+    NULL-kid recovery resolves it rather than letting the signal re-fire.
+
+    A confirmed miss requires looking in the env the order was SENT to: after
+    an env flip the current credentials query the other account, where the
+    order can never appear — that's an unconfirmable lookup, not a miss. The
+    row stays 'submitted' and the env-scoped poll resolves it when its env is
+    active again."""
     found = None
     confirmed = False
     row_env = row.get("kalshi_env")
@@ -766,6 +789,10 @@ _last_split_log: dict = {}
 
 
 def _cap_log_dict(d: dict, cap: int = 2000, keep: int = 1500) -> None:
+    """Bound the log-dedup dicts for multi-week runs: they gain a key per
+    filtered signal / skipped import forever. Evict oldest-inserted first
+    (dicts preserve insertion order; exact LRU isn't worth the bookkeeping
+    for a dedup cache — worst case an evicted key logs once more)."""
     if len(d) > cap:
         for k in list(d)[: len(d) - keep]:
             d.pop(k, None)
@@ -782,6 +809,10 @@ def _f(v) -> float:
 
 
 def _order_fees_usd(order: dict) -> float:
+    """Kalshi trading fees on an order, in dollars. The order object reports
+    them as `taker_fees_dollars`/`maker_fees_dollars` (fp shape) or
+    `taker_fees`/`maker_fees` (integer cents). fill_cost EXCLUDES fees, so
+    P&L that ignores these overstates every round trip."""
     fees = _f(order.get("taker_fees_dollars")) + _f(order.get("maker_fees_dollars"))
     if fees:
         return fees
@@ -814,23 +845,36 @@ def _parse_kalshi_order(order: dict) -> dict:
     }
 
 
-def _is_entry_buy(f: dict, pos_side: Optional[str]) -> bool:
-    # Only the buys on an entry order count toward its cost. Once Kalshi drops
-    # the deprecated `action`, a fill whose outcome is the position's own side
-    # is a buy of it; the opposite outcome would be a sell. A fill that says
-    # nothing either way is kept, as `action or "buy"` always did.
-    if f.get("action"):
-        return str(f["action"]).lower() == "buy"
-    _, side = order_direction(f)
-    return side is None or side == str(pos_side or "").lower()
+def _fill_contract_side(f: dict, order_side: str = "") -> str:
+    """Which contract a fill traded — the side whose price is ours.
+
+    Kalshi's fills now carry `outcome_side` ("buy-yes and sell-no produce
+    'yes'; buy-no and sell-yes produce 'no'"), and the deprecated `side`
+    follows it. Read as the contract, a SELL of YES at 1c came back as a NO
+    fill at 99c: the real-key smoke test of 6.4.0 sold a 2c contract for 1c and
+    booked +$0.96 of profit that never happened. Every caller here placed the
+    order itself and knows its side, so that wins; the fill's own fields are
+    only a fallback, with outcome_side flipped back for a sell.
+    """
+    s = str(order_side or "").lower()
+    if s in ("yes", "no"):
+        return s
+    outcome = str(f.get("outcome_side") or "").lower()
+    if outcome in ("yes", "no"):
+        if str(f.get("action") or "").lower() == "sell":
+            return "no" if outcome == "yes" else "yes"
+        return outcome
+    return str(f.get("side") or "").lower()
 
 
 def _parse_kalshi_fill(f: dict, default_side: str = "") -> dict:
+    """`default_side` is the side of the ORDER this fill belongs to, when the
+    caller knows it (it always should); see _fill_contract_side."""
     if f.get("count") is not None:
         count = int(_f(f.get("count")))
     else:
         count = int(round(_f(f.get("count_fp"))))
-    side = str(f.get("side") or default_side or order_direction(f)[1] or "").lower()
+    side = _fill_contract_side(f, default_side)
     if side == "yes":
         cents = f.get("yes_price")
         if cents in (None, "") and f.get("yes_price_dollars") is not None:
@@ -849,6 +893,8 @@ def _parse_kalshi_fill(f: dict, default_side: str = "") -> dict:
 
 
 def _position_fees_usd(p: dict) -> float:
+    """Trading fees a /portfolio/positions row reports for the market, in
+    dollars (`fees_paid_dollars`, or legacy `fees_paid` cents)."""
     fees = _f(p.get("fees_paid_dollars"))
     if fees:
         return fees
@@ -918,13 +964,14 @@ async def poll_open_orders(cfg: dict) -> list[dict]:
 
 async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
     with db.get_db() as conn:
-        pending = db.get_pending_bot_positions(conn, get_env())
+        env = get_env()
+        pending = db.get_pending_bot_positions(conn, env)
     if not pending:
         return []
 
     pos_by_key: dict[tuple[str, str], dict] = {}
     try:
-        live_positions = await get_positions(limit=1000)
+        live_positions = await get_positions(limit=1000, pin_env=env)
         for lp in live_positions:
             qty = 0.0
             for k in ("position_fp", "position"):
@@ -1035,6 +1082,8 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
             return db.fetch_position_by_id(conn, pos["id"])
 
     for pos in pending:
+        if get_env() != env:
+            break
         kid = pos.get("kalshi_order_id")
         if pos["status"] == "dry_run":
             continue
@@ -1053,7 +1102,8 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
             lookup_ok = False
             if coid:
                 try:
-                    found = await find_order_by_client_id(coid, ticker=pos.get("ticker") or "")
+                    found = await find_order_by_client_id(
+                        coid, ticker=pos.get("ticker") or "", pin_env=env)
                     lookup_ok = True
                 except Exception:
                     found = None
@@ -1090,8 +1140,9 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                 _clear_failure(pos["id"])
             continue
 
+        pos_env = pos.get("kalshi_env") or env
         try:
-            resp = await get_order(kid)
+            resp = await get_order(kid, pin_env=pos_env)
             order = (resp.get("order") if isinstance(resp, dict) else resp) or {}
             parsed = _parse_kalshi_order(order)
         except KalshiAPIError as e:
@@ -1172,13 +1223,13 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
             age_sec = float(age[0]) if age and age[0] is not None else 0.0
             if age_sec > float(cfg["order_expiration_sec"]):
                 try:
-                    await cancel_order(kid, ticker=pos.get("ticker"))
+                    await cancel_order(kid, ticker=pos.get("ticker"), pin_env=pos_env)
                 except KalshiAPIError as e:
                     if e.status == 404:
                         final404 = None
                         for _ in range(3):
                             try:
-                                resp2 = await get_order(kid)
+                                resp2 = await get_order(kid, pin_env=pos_env)
                                 final404 = _parse_kalshi_order(
                                     (resp2.get("order") if isinstance(resp2, dict) else resp2) or {}
                                 )
@@ -1193,15 +1244,6 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                             logger.warning(
                                 f"cancel {kid}: 404 but order shows "
                                 f"{final404.get('filled')} fills; leaving row for next poll"
-                            )
-                            continue
-                        if final404 is not None and final404.get("status") == "resting":
-                            # A 404 from the cancel is not proof the order is gone:
-                            # misrouted to the wrong shard, Kalshi 404s while the
-                            # order keeps resting. Marking it gone would orphan it.
-                            logger.warning(
-                                f"cancel {kid}: 404 but order still resting; "
-                                f"leaving row for next poll"
                             )
                             continue
                         with db.get_db() as conn:
@@ -1222,7 +1264,7 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
                 final = None
                 for _ in range(3):
                     try:
-                        resp2 = await get_order(kid)
+                        resp2 = await get_order(kid, pin_env=pos_env)
                         final = _parse_kalshi_order(
                             (resp2.get("order") if isinstance(resp2, dict) else resp2) or {}
                         )
@@ -1250,14 +1292,14 @@ async def _poll_open_orders_inner(cfg: dict) -> list[dict]:
 
 
 def _side_mark_cents(quote: dict | None, side: str) -> Optional[float]:
+    """Current price of the held side, in cents, from a stored market quote.
+    Mid of yes_bid/yes_ask when both are present, else last_price, else a single
+    quote — clamped to [0, 100]. None when there's no usable quote yet."""
     if not quote:
         return None
     yb = float(quote.get("yes_bid") or 0)
     ya = float(quote.get("yes_ask") or 0)
     lp = float(quote.get("last_price") or 0)
-    # The markets cache stores Kalshi's "0.0000" (absent) as 0, and Kalshi
-    # derives 1.0000 for a side with nothing behind it: only (0, 1) is a quote.
-    yb, ya, lp = (v if 0.0 < v < 1.0 else 0.0 for v in (yb, ya, lp))
     if yb > 0 and ya > 0:
         yes = (yb + ya) / 2.0
     elif lp > 0:
@@ -1476,7 +1518,10 @@ async def reconcile_fills_from_kalshi() -> dict:
             )
             continue
 
-        ours = [f for f in ours if _is_entry_buy(f, pos.get("direction"))]
+        ours = [
+            f for f in ours
+            if str(f.get("action") or "buy").lower() == "buy"
+        ]
 
         total_filled = 0
         total_cost_cents = 0
@@ -1616,9 +1661,11 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
     env = get_env()
 
     try:
-        live = await get_positions(limit=1000)
+        live = await get_positions(limit=1000, pin_env=env)
     except Exception as e:
         logger.warning(f"reconcile: get_positions failed: {e}")
+        return summary, changed
+    if get_env() != env:
         return summary, changed
 
     def _signed_qty(p: dict) -> float:
@@ -2006,12 +2053,13 @@ async def reconcile_positions_with_kalshi() -> tuple[dict, list[dict]]:
 
 
 async def cancel_all_open() -> int:
+    env = get_env()
     with db.get_db() as conn:
         rows = conn.execute(
-            """SELECT id, ticker, kalshi_order_id, target_contracts FROM bot_positions
+            """SELECT id, kalshi_order_id, target_contracts, ticker FROM bot_positions
                WHERE status IN ('submitted','partial')
                  AND resolved=0 AND kalshi_env=?""",
-            (get_env(),),
+            (env,),
         ).fetchall()
     canceled = 0
     for r in rows:
@@ -2019,7 +2067,7 @@ async def cancel_all_open() -> int:
         if not kid:
             continue
         try:
-            await cancel_order(kid, ticker=r["ticker"])
+            await cancel_order(kid, ticker=r["ticker"], pin_env=env)
         except Exception as e:
             logger.warning(f"cancel_all: {kid}: {e}")
             continue
@@ -2027,7 +2075,7 @@ async def cancel_all_open() -> int:
         final = None
         for _ in range(3):
             try:
-                resp2 = await get_order(kid)
+                resp2 = await get_order(kid, pin_env=env)
                 final = _parse_kalshi_order(
                     (resp2.get("order") if isinstance(resp2, dict) else resp2) or {}
                 )

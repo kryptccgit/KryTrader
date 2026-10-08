@@ -1,3 +1,17 @@
+"""Every wss:// client must verify against the bundled certifi CA store.
+
+This is a packaging invariant, not a style rule. A frozen (PyInstaller) build
+carries its own Python whose OpenSSL default verify paths point at the build
+machine. On macOS nothing fills that gap, so a stock SSL context fails every
+websocket handshake with SSLCertVerificationError while httpx REST calls keep
+working off the certifi bundle httpx carries.
+
+That asymmetry is what made the v5 macOS build so hard to diagnose: the app
+launched, the backend ran, REST answered, and not one price ever arrived. A new
+websockets.connect() call site that forgets ssl= reintroduces exactly that, and
+it cannot be caught on Windows or Linux, where the default paths happen to
+resolve. So catch it here instead.
+"""
 from __future__ import annotations
 
 import os
@@ -23,6 +37,8 @@ def _modules_opening_websockets() -> list[str]:
 
 
 def test_some_module_actually_opens_a_websocket():
+    """Guards the guard: if the scan finds nothing, the tests below pass
+    vacuously and the invariant stops being enforced at all."""
     assert _modules_opening_websockets(), "no websockets.connect() call sites found"
 
 
@@ -52,12 +68,17 @@ def test_client_context_is_a_verifying_context_with_real_roots():
 
 
 def test_client_context_is_cached():
+    """Built once per process: create_default_context parses ~120 certs, and
+    these contexts are built inside reconnect loops."""
     import ws_ssl
 
     assert ws_ssl.client_context() is ws_ssl.client_context()
 
 
 def test_certifi_is_a_direct_requirement():
+    """certifi arrives transitively via httpx, and a transitive-only dep can
+    drop out of a PyInstaller bundle without any build error. Pinning it
+    directly is what keeps cacert.pem in the frozen app."""
     with open(os.path.join(PY_DIR, "requirements.txt"), encoding="utf-8") as fh:
         reqs = fh.read()
     assert re.search(r"^certifi", reqs, re.M), "certifi is not a direct requirement"

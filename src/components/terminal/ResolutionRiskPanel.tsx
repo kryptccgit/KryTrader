@@ -5,6 +5,7 @@ import {
 import type { ResolutionRisk, RiskVerdict } from '@shared/market';
 import { cls } from '../../utils/format';
 
+
 const ICON: Record<RiskVerdict, React.ComponentType<{ className?: string }>> = {
   pass: CheckCircle2,
   warn: AlertTriangle,

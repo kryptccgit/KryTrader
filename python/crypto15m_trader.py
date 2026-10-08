@@ -17,6 +17,7 @@ import kalshi_api
 import kalshi_auth
 import kalshi_ws
 import rules as rules_engine
+import shard_rail
 import trader
 
 logger = logging.getLogger("crypto15m")
@@ -29,6 +30,11 @@ _warn_at: dict[str, float] = {}
 
 
 def _warn_once(key: str, every_sec: float) -> bool:
+    """True at most once per `every_sec` for this key.
+
+    A warning inside a ~4s poll is not a warning, it is a denial of service on
+    the log file — and on the diagnostics bundle, which carries a fixed number
+    of lines and would otherwise be entirely one repeated message."""
     now = time.monotonic()
     last = _warn_at.get(key, 0.0)
     if now - last < every_sec:
@@ -114,6 +120,15 @@ def check_model_calibration(env: str) -> dict:
 
 
 def edge_health(env: str) -> dict:
+    """Rolling forward measurement of every strategy class this account has
+    actually traded — the honest answer to "is the edge holding?".
+
+    Per (strategy, paper|live, window ∈ 7d/30d/90d): n, win rate, net ¢/ct
+    after fees, t-stat, avg entry price, windows since the last loss — plus a
+    plain-words verdict. Built after the 2026-07-16 historical replay showed
+    the mid-window model edge DECAYED within two months of launch: on this
+    venue an edge must be re-measured continuously, never trusted from a
+    one-time backtest. Paper and live are never conflated."""
     with db.get_db() as conn:
         rows = db.crypto15m_resolved_for_health(conn, env, since_days=90)
     now = time.time()
@@ -213,6 +228,10 @@ def direction_for_favorite(favorite: str) -> str:
 
 
 def evaluate_rules(asset: dict, rules: list) -> tuple[bool, str]:
+    """Evaluate the crypto entry rule-set against an asset snapshot (fields are
+    snapshot keys like favoritePrice / macdHist / rsi / minsLeft / arbEdgeCents).
+    Thin wrapper over the shared engine so crypto and the main bot evaluate
+    rules identically."""
     return rules_engine.evaluate_rules(asset, rules)
 
 
@@ -238,8 +257,6 @@ def side_prob_from_market(market: Optional[dict], direction: str) -> Optional[fl
     yes_bid = crypto15m._price_dollars(market, "yes_bid")
     yes_ask = crypto15m._price_dollars(market, "yes_ask")
     up = crypto15m._mid_up(yes_bid, yes_ask, crypto15m._price_dollars(market, "last_price"))
-    if up is None:
-        return None
     return up if direction == "yes" else (1.0 - up)
 
 
@@ -247,6 +264,12 @@ _WS_QUOTE_MAX_AGE_MS = 15_000.0
 
 
 def _ws_quote_market(ticker: str) -> Optional[dict]:
+    """The live WS ticker quote as a market-shaped dict (yes_bid/ask/last in
+    dollars) usable by side_prob_from_market / _place_exit's price fallback —
+    or None when the socket is down, the ticker isn't subscribed, or the quote
+    is stale (> ~15s), in which case the caller REST-falls-back. The loop
+    subscribes every HELD ticker to the WS `ticker` channel, so this replaces a
+    per-position REST fetch_market on every 4s tick with a local read."""
     q = kalshi_ws.ticker_quote(ticker)
     if not q:
         return None
@@ -265,10 +288,15 @@ def _ws_quote_market(ticker: str) -> Optional[dict]:
 
 
 def _is_directional_rules(cfg: dict) -> bool:
+    """Directional rule mode is on when custom rules are enabled AND a NO-side
+    rule-set exists — then the rules pick the side (yes→up / no→down)."""
     return bool(cfg.get("crypto15m_use_rules")) and bool(cfg.get("crypto15m_rules_no"))
 
 
 def _directional_rules_side(asset: dict, cfg: dict) -> tuple[Optional[str], str]:
+    """Which side the YES/NO rule-sets select for this asset. YES-side rules
+    (crypto15m_rules) → 'up'; NO-side rules (crypto15m_rules_no) → 'down';
+    None when neither matches. YES wins if both somehow match (deterministic)."""
     ok_y, _ = evaluate_rules(asset, cfg.get("crypto15m_rules") or [])
     if ok_y:
         return "up", "yes-rules matched"
@@ -279,6 +307,10 @@ def _directional_rules_side(asset: dict, cfg: dict) -> tuple[Optional[str], str]
 
 
 def _bought_side(asset: dict, cfg: dict) -> Optional[str]:
+    """The side the executor would BUY for this asset — the favorite, its
+    opposite in contrarian mode, the settlement model's side in model (sniper)
+    mode, or the side the directional rule-sets select. None until the relevant
+    signal exists."""
     if _is_directional_rules(cfg):
         return _directional_rules_side(asset, cfg)[0]
     mode = (cfg.get("crypto15m_direction_mode") or "favorite").lower()
@@ -296,6 +328,13 @@ def _bought_side(asset: dict, cfg: dict) -> Optional[str]:
 
 
 def momentum_filters_ok(asset: dict, cfg: dict) -> tuple[bool, str]:
+    """Direction-aware RSI/MACD confirmation layered on the built-in favorite
+    gate: the underlying momentum must AGREE with the side being bought. An
+    up-bet needs rsi>=min_rsi and macdHist>=min_macd; a down-bet needs the
+    mirror (rsi<=100-min_rsi and macdHist<=-min_macd). Each threshold 0 = off.
+    A filter that's on but whose indicator isn't populated (detector off or too
+    few candles yet) rejects the entry, matching the rule builder's
+    missing-field behaviour."""
     try:
         min_rsi = float(cfg.get("crypto15m_min_rsi", 0.0) or 0.0)
     except (TypeError, ValueError):
@@ -416,6 +455,9 @@ def should_enter(asset: dict, cfg: dict, *, has_open: bool, open_count: int) -> 
 
 
 def stop_loss_pct(cfg: dict) -> float:
+    """Per-bet stop-loss as a FRACTION of the entry cost (`crypto15m_stop_loss_pct`,
+    stored 0..1). 0 = off. E.g. 0.20 stops out once a position is down 20% from
+    what it cost. Independent of the cents/price stop (`exit_threshold`)."""
     try:
         return max(0.0, min(1.0, float(cfg.get("crypto15m_stop_loss_pct", 0.0) or 0.0)))
     except (TypeError, ValueError):
@@ -450,6 +492,8 @@ def should_stop_loss(position: dict, side_prob: Optional[float], cfg: dict) -> b
 
 
 def take_profit_cents(cfg: dict) -> int:
+    """Per-bet take-profit price in cents (`crypto15m_take_profit_cents`). 0 =
+    off. Clamped to a valid sell price."""
     try:
         return max(0, min(99, int(cfg.get("crypto15m_take_profit_cents", 0) or 0)))
     except (TypeError, ValueError):
@@ -457,6 +501,9 @@ def take_profit_cents(cfg: dict) -> int:
 
 
 def should_take_profit(position: dict, side_prob: Optional[float], cfg: dict) -> bool:
+    """Lock in a winner: sell once the held side's market probability reaches the
+    per-bet take-profit price. 0 = off. (Set it ABOVE the entry price, or it
+    would sell the instant a position fills.)"""
     if side_prob is None:
         return False
     if position.get("status") != "filled":
@@ -480,11 +527,24 @@ def should_take_profit(position: dict, side_prob: Optional[float], cfg: dict) ->
 
 def exec_side_prob(market: Optional[dict], side: Optional[str],
                    mid_prob: Optional[float]) -> Optional[float]:
+    """The held side's EXECUTABLE sell value (best bid, as a 0..1 fraction) —
+    what the position is actually worth if it must be liquidated now. The
+    stop-loss must evaluate on this, not the mid: the exit sells at the bid
+    (− slippage), and in a fast drop the spread widens so the mid lingers
+    above the threshold while the sellable value has already fallen through
+    it — the configured stop was silently bypassed and the position rode to
+    settlement. Falls back to the mid when the book can't price the bid.
+    (Take-profit stays on the mid: firing TP off the bid would only delay
+    locking a winner, the harmless direction.)"""
     bid_c = _paper_side_bid_cents(market, side or "")
     return (bid_c / 100.0) if bid_c is not None else mid_prob
 
 
 def _stop_slippage(cfg: dict) -> int:
+    """Cents below the bid to price a stop-loss SELL (user setting
+    `crypto15m_stop_slippage_cents`), so it sweeps book depth and fills in a fast
+    drop instead of resting at the top of a falling book. 0 = sell at the bid.
+    Clamped 0..50."""
     try:
         return max(0, min(50, int(cfg.get("crypto15m_stop_slippage_cents", 0) or 0)))
     except (TypeError, ValueError):
@@ -514,6 +574,10 @@ def _mgmt_snapshot_json(cfg: dict) -> str:
 
 
 def _with_mgmt_snapshot(pos: dict, cfg: dict) -> dict:
+    """Overlay a position's entry-time exit-management snapshot onto cfg, so its
+    protection rules can't silently change when its runner is deleted/renamed or
+    a scheduled slot rolls over mid-window. Legacy rows with no snapshot fall
+    through to the live cfg unchanged."""
     raw = pos.get("mgmt_config")
     if not raw:
         return cfg
@@ -545,6 +609,12 @@ def compute_entry_contracts(
 
 
 def _crypto_shard_cash_usd() -> Optional[float]:
+    """Cash on the exchange shard hosting the 15m crypto markets, or None.
+
+    None means UNKNOWN — no successful balance read, a key whose response
+    carries no per-shard breakdown, or a series we have not seen a market from
+    yet — and every caller must fail OPEN on it.
+    """
     series = crypto15m.SERIES[0]["series"] if crypto15m.SERIES else ""
     idx = kalshi_api.shard_for_ticker(series)
     if idx is None:
@@ -556,12 +626,27 @@ def _crypto_shard_cash_usd() -> Optional[float]:
 
 
 async def _bankroll_usd(cfg: dict, authed: bool) -> float:
+    """Money this engine can actually deploy.
+
+    Kalshi's balance is the account-wide sum across every exchange shard, but a
+    15m crypto order can only be collateralised by cash sitting on the CRYPTO
+    shard. Sizing from the account total therefore computed orders the exchange
+    would refuse: $1,950 on the general shard and $50 on crypto, at a 5%
+    balance_pct, asked for ~$99 of contracts against $50 — rejected, booked as
+    an error, and recomputed identically every 15-minute window while the UI
+    showed a healthy bankroll. The starved-shard banner did not fire either,
+    because that test is for an affirmative ZERO, not for "not enough".
+
+    Clamped only when the shard balance is KNOWN, preserving the fail-open the
+    rest of the shard handling documents. Only `balance_pct` sizing reads this;
+    the default `fixed` mode is balance-independent and unaffected.
+    """
     if authed:
         try:
             cents, _port = await trader.refresh_balance(cfg, force=False)
             if cents > 0:
                 usd = cents / 100.0
-                here = _crypto_shard_cash_usd()
+                here = None if shard_rail.enabled(cfg) else _crypto_shard_cash_usd()
                 return min(usd, here) if here is not None else usd
         except Exception:
             pass
@@ -609,7 +694,7 @@ def _pos_to_js(r: dict) -> dict:
         "closeTime": _iso(r.get("close_time")) or "",
         "strategy": r.get("strategy") or "",
         "runnerId": r.get("runner_id") or "",
-        "kalshiEnv": r.get("kalshi_env") or "demo",
+        "kalshiEnv": r.get("kalshi_env") or db.RETIRED_ENV,
         "createdAt": _iso(r.get("created_at")) or "",
         "resolvedAt": _iso(r.get("resolved_at")),
         "error": r.get("error"),
@@ -619,6 +704,21 @@ def _pos_to_js(r: dict) -> dict:
 
 
 def _unfunded_shard(ticker: str) -> Optional[str]:
+    """The engine hosting `ticker` if it holds none of our collateral.
+
+    Kalshi allocates collateral PER SHARD and crypto lives on its own one, so
+    an account whose cash all sits on the general shard cannot open a crypto
+    position — and the rejection says only `user_not_found: <uuid>`, naming
+    nothing the user can act on. A beta user hit exactly that on a BTC entry
+    (2026-08-25). Catching it here turns a doomed order, repeated every cycle,
+    into one clear line.
+
+    FAILS OPEN, deliberately. Three different unknowns — no successful balance
+    read, a key whose response carries no per-shard breakdown, or a series we
+    have not seen a market from yet — all return None and let the order go.
+    Blocking trading on a number we could not read would be a worse failure
+    than the rejection it prevents.
+    """
     idx = kalshi_api.shard_for_ticker(ticker)
     if idx is None:
         return None
@@ -659,11 +759,6 @@ async def _open_entry(
         side = favorite
         entry_cost = float(a.get("entryCost") or fav_price)
         conf = fav_price * 100.0
-    # A market with no quotes has no favourite, and contrarian mode would flip
-    # that None into "up"; the fallbacks above can also land on 0 or 1. Neither
-    # is a price anyone could fill at.
-    if side not in ("up", "down") or not (0.0 < entry_cost < 1.0):
-        return None
     direction = direction_for_favorite(side)
     style = (cfg.get("crypto15m_entry_style") or "maker").lower()
     if mode == "model":
@@ -753,7 +848,7 @@ async def _open_entry(
     with db.get_db() as conn:
         pid = db.insert_crypto15m_position(conn, row)
 
-    starved = _unfunded_shard(ticker or "")
+    starved = None if shard_rail.enabled(cfg) else _unfunded_shard(ticker or "")
     if starved and not paper:
         logger.error(
             f"[crypto15m] skip {a.get('asset')}: Kalshi holds $0.00 of your "
@@ -774,9 +869,13 @@ async def _open_entry(
         resp = await kalshi_api.place_limit_order(
             ticker=ticker, side=direction, action="buy",
             count=order_size, price_cents=limit_cents, client_order_id=coid,
+            pin_env=env,
         )
     except Exception as e:
-        recovered, lookup_ok = await _lookup_lost_order(coid, ticker or "")
+        if kalshi_api.is_scope_changed(e):
+            recovered, lookup_ok = None, True
+        else:
+            recovered, lookup_ok = await _lookup_lost_order(coid, ticker or "", pin_env=env)
         detail = str(e)
         if kalshi_api.is_user_not_found(e):
             try:
@@ -827,7 +926,8 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
         coid = pos.get("client_order_id")
         if not coid:
             return None
-        found, confirmed = await _lookup_lost_order(coid, pos.get("ticker") or "")
+        found, confirmed = await _lookup_lost_order(coid, pos.get("ticker") or "",
+                                                    pin_env=pos.get("kalshi_env") or None)
         with db.get_db() as conn:
             if found and found.get("order_id"):
                 db.update_crypto15m_position(
@@ -840,7 +940,7 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
             return db.fetch_crypto15m_by_id(conn, pid)
     parsed = None
     try:
-        resp = await kalshi_api.get_order(kid)
+        resp = await kalshi_api.get_order(kid, pin_env=pos.get("kalshi_env") or None)
         order = (resp.get("order") if isinstance(resp, dict) else resp) or {}
         parsed = trader._parse_kalshi_order(order)
     except Exception as e:
@@ -876,9 +976,19 @@ async def _poll_entry(pos: dict, cfg: dict) -> Optional[dict]:
 
 
 async def _cancel_entry_and_finalize(pos: dict, kid: str, filled: int) -> Optional[dict]:
+    """Cancel a resting entry and book its CONFIRMED final state: any filled
+    portion becomes a real (smaller) 'filled' position, a confirmed zero fill
+    books 'canceled', an unconfirmable read keeps the row open to retry.
+    Shared by the expiry path and the partial-fill stop-loss path.
+
+    Reads the FINAL fill state with retries — the cancel can race a fill, and
+    a single stale/failed read here once booked a maker-FILLED order as
+    "canceled 0/8" (real order a18e5ca1: 8 untracked contracts rode into
+    settlement, −$6.56 off the books). Never book canceled without a CONFIRMED
+    zero-fill read (a second cancel next tick just 404s)."""
     pid = pos["id"]
     try:
-        await kalshi_api.cancel_order(kid, ticker=pos.get("ticker"))
+        await kalshi_api.cancel_order(kid, ticker=pos.get("ticker"), pin_env=pos.get("kalshi_env") or None)
     except Exception:
         pass
     final_filled, final_cost, final_avg, final_fees = filled, None, None, None
@@ -890,7 +1000,7 @@ async def _cancel_entry_and_finalize(pos: dict, kid: str, filled: int) -> Option
                      and time.time() > _close_epoch + _CLOSED_ORDER_GRACE_SEC)
     for attempt in range(3):
         try:
-            resp2 = await kalshi_api.get_order(kid)
+            resp2 = await kalshi_api.get_order(kid, pin_env=pos.get("kalshi_env") or None)
             order2 = (resp2.get("order") if isinstance(resp2, dict) else resp2) or {}
             p2 = trader._parse_kalshi_order(order2)
             read_ok = True
@@ -955,6 +1065,19 @@ def _pair_entry_stale(pos: dict) -> bool:
 
 
 async def _protect_partial_entry(pos: dict, cfg: dict) -> Optional[dict]:
+    """Stop-loss protection for the FILLED portion of a still-resting entry.
+
+    A partial fill deliberately keeps status='submitted' while the remainder
+    rests — but those filled contracts are real exposure, and the stop-loss
+    path only ran on status=='filled', so a partial rode unprotected until the
+    entry expired (with maker_cancel_min=0 that promotion happens AT the
+    close: the configured stop was silently bypassed). When the stop fires on
+    the filled portion: cancel the resting remainder, book the confirmed
+    filled portion as a real (smaller) position, and place the exit.
+
+    Take-profit is deliberately NOT evaluated here — missing a TP on a partial
+    leaves profit on the table (the harmless direction); the stop is the
+    safety rail. Live rows only: paper fills are all-or-nothing."""
     with db.get_db() as conn:
         fresh = db.fetch_crypto15m_by_id(conn, pos["id"]) or pos
     filled = int(fresh.get("filled_contracts") or 0)
@@ -985,6 +1108,12 @@ async def _protect_partial_entry(pos: dict, cfg: dict) -> Optional[dict]:
 async def _place_exit(
     pos: dict, market: Optional[dict], cfg: dict, *, reason: str = "stop_loss"
 ) -> Optional[dict]:
+    """Sell the held position at the best bid. Shared by the stop-loss and the
+    per-bet take-profit; `reason` ('stop_loss' | 'take_profit') tags the exit leg
+    so _chase_exit/_settle_if_closed preserve it and the UI can label it. A
+    stop-loss prices `crypto15m_stop_slippage_cents` THROUGH the bid to sweep a
+    falling book; a take-profit sells AT the bid (it's already a winner — no need
+    to give up extra cents)."""
     pid, ticker, direction = pos["id"], pos["ticker"], pos["direction"]
     filled = int(pos.get("filled_contracts") or 0)
     slippage = _stop_slippage(cfg) if reason == "stop_loss" else 0
@@ -1006,9 +1135,11 @@ async def _place_exit(
         resp = await kalshi_api.place_limit_order(
             ticker=ticker, side=direction, action="sell",
             count=filled, price_cents=exit_cents, client_order_id=coid,
+            pin_env=pos.get("kalshi_env") or None,
         )
     except Exception as e:
-        found, confirmed = await _lookup_lost_order(coid, ticker)
+        found, confirmed = await _lookup_lost_order(coid, ticker,
+                                                    pin_env=pos.get("kalshi_env") or None)
         with db.get_db() as conn:
             if found:
                 db.update_crypto15m_position(
@@ -1041,9 +1172,18 @@ async def _place_exit(
         return db.fetch_crypto15m_by_id(conn, pid)
 
 
-async def _lookup_lost_order(coid: str, ticker: str) -> tuple[Optional[dict], bool]:
+async def _lookup_lost_order(coid: str, ticker: str,
+                             pin_env: Optional[str] = None) -> tuple[Optional[dict], bool]:
+    """After a place-order exception, find out whether the POST actually
+    landed. Returns (order_or_None, confirmed): confirmed=True means the
+    lookup itself succeeded, so a None order is a REAL absence — only then is
+    it safe to re-place without risking a double order.
+
+    `pin_env`: the scope the order was sent under. Looked up anywhere else (a
+    live order looked for in the paper book after a switch) a miss proves
+    nothing, so a pinned lookup across a switch fails instead of confirming."""
     try:
-        found = await kalshi_api.find_order_by_client_id(coid, ticker=ticker)
+        found = await kalshi_api.find_order_by_client_id(coid, ticker=ticker, pin_env=pin_env)
         return found, True
     except Exception:
         return None, False
@@ -1055,7 +1195,8 @@ async def _poll_exit(pos: dict) -> Optional[dict]:
         coid = pos.get("exit_client_order_id")
         if not coid:
             return None
-        found, confirmed = await _lookup_lost_order(coid, pos.get("ticker") or "")
+        found, confirmed = await _lookup_lost_order(coid, pos.get("ticker") or "",
+                                                    pin_env=pos.get("kalshi_env") or None)
         with db.get_db() as conn:
             if found:
                 db.update_crypto15m_position(
@@ -1065,7 +1206,7 @@ async def _poll_exit(pos: dict) -> Optional[dict]:
                 db.update_crypto15m_position(conn, pid, status="filled")
         return None
     try:
-        resp = await kalshi_api.get_order(kid)
+        resp = await kalshi_api.get_order(kid, pin_env=pos.get("kalshi_env") or None)
         order = (resp.get("order") if isinstance(resp, dict) else resp) or {}
         parsed = trader._parse_kalshi_order(order)
     except Exception:
@@ -1100,6 +1241,11 @@ async def _poll_exit(pos: dict) -> Optional[dict]:
 
 
 async def _settle_if_closed(pos: dict, *, pin_env: Optional[str] = None) -> Optional[dict]:
+    """pin_env: sign the exit-order cancel/re-read against the position's OWN
+    env. The cross-env settlement sweep manages the non-active env's rows —
+    signing those order lookups with the active env 404s forever, so the
+    exiting row could never confirm its final fills and was eventually reaped
+    to 'error' despite being cleanly settleable."""
     try:
         market = await kalshi_api.fetch_market(pos["ticker"])
     except Exception:
@@ -1161,6 +1307,21 @@ async def _settle_if_closed(pos: dict, *, pin_env: Optional[str] = None) -> Opti
 
 
 async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
+    """Re-price a resting stop-loss SELL that has gone stale so it actually fills.
+
+    A stop-loss fires precisely when the held side is dropping, so a limit sell
+    placed at the best bid is, within seconds, left ABOVE the now-lower bid and
+    rests UNFILLED — the position then rides to settlement at the full loss (the
+    #1 'stop-loss didn't work' complaint). While the market is still open and the
+    resting exit has NOT partially filled, cancel it and re-place the full size
+    at the current best bid, walking the order down with the market until it
+    clears (a marketable sell AT the bid is a taker and matches immediately).
+
+    Only a zero-fill order is chased (safe to fully re-place). A partially-filled
+    exit is left to ride to settlement, where _settle_if_closed credits the
+    partial and settles only the residual — so we can never double-sell. A
+    race-guard re-reads the cancelled order's FINAL fill in case it filled
+    between the last poll and the cancel."""
     if int(pos.get("exit_filled_contracts") or 0) > 0:
         return None
     filled = int(pos.get("filled_contracts") or 0)
@@ -1187,11 +1348,11 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
         return None
     if kid:
         try:
-            await kalshi_api.cancel_order(kid, ticker=pos.get("ticker"))
+            await kalshi_api.cancel_order(kid, ticker=pos.get("ticker"), pin_env=pos.get("kalshi_env") or None)
         except Exception:
             pass
         try:
-            resp = await kalshi_api.get_order(kid)
+            resp = await kalshi_api.get_order(kid, pin_env=pos.get("kalshi_env") or None)
             parsed = trader._parse_kalshi_order(
                 (resp.get("order") if isinstance(resp, dict) else resp) or {}
             )
@@ -1228,9 +1389,11 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
         resp = await kalshi_api.place_limit_order(
             ticker=pos["ticker"], side=direction, action="sell",
             count=filled, price_cents=new_cents, client_order_id=coid,
+            pin_env=pos.get("kalshi_env") or None,
         )
     except Exception as e:
-        found, confirmed = await _lookup_lost_order(coid, pos["ticker"])
+        found, confirmed = await _lookup_lost_order(coid, pos["ticker"],
+                                                    pin_env=pos.get("kalshi_env") or None)
         with db.get_db() as conn:
             if found:
                 db.update_crypto15m_position(
@@ -1266,16 +1429,21 @@ async def _chase_exit(pos: dict, cfg: dict) -> Optional[dict]:
         return db.fetch_crypto15m_by_id(conn, pos["id"])
 
 
+
 _PAPER_FEE_COEFF = {"maker": 0.0175, "taker": 0.07}
 
 
 def _paper_fee_usd(price_cents: int, contracts: int, style: str) -> float:
+    """Estimate the Kalshi fee on a simulated fill, mirroring the backtest's
+    fee model (coeff·P·(1−P) per contract). Maker rests cheaper than taker."""
     p = max(0.0, min(1.0, price_cents / 100.0))
     coeff = _PAPER_FEE_COEFF.get(style, 0.07)
     return round(coeff * p * (1.0 - p) * max(0, contracts), 4)
 
 
 def _paper_side_ask_cents(market: Optional[dict], side: str) -> Optional[float]:
+    """Executable ask in cents to BUY the bought side (up→yes ask; down→no ask
+    = 1−yes bid). None when the quote can't price it."""
     if not market:
         return None
     yb = crypto15m._price_dollars(market, "yes_bid")
@@ -1287,6 +1455,8 @@ def _paper_side_ask_cents(market: Optional[dict], side: str) -> Optional[float]:
 
 
 def _paper_side_bid_cents(market: Optional[dict], side: str) -> Optional[float]:
+    """Executable bid in cents to SELL the held side (up→yes bid; down→no bid
+    = 1−yes ask)."""
     if not market:
         return None
     yb = crypto15m._price_dollars(market, "yes_bid")
@@ -1443,6 +1613,7 @@ async def _manage_position(pos: dict, cfg: dict, env: str) -> Optional[dict]:
 
 
 
+
 _PAIR_FIRST_LEG_MIN_MINS = 5.0
 _PAIR_LEG_MIN_MINS = 1.0
 _PAIR_HIST_MIN = 8
@@ -1483,6 +1654,8 @@ def _pair_leg_ok(
     mins_left: float,
     first_leg_min_cents: float = 35.0,
 ) -> tuple[bool, str]:
+    """Decide one pair leg. `other_cost_cents` is what the other side has
+    (or will, for a resting order) cost — None means this is the FIRST leg."""
     if mins_left < _PAIR_LEG_MIN_MINS:
         return False, "final minute"
     if len(own_hist) < _PAIR_HIST_MIN:
@@ -1537,9 +1710,10 @@ async def _open_pair_leg(
         resp = await kalshi_api.place_limit_order(
             ticker=ticker, side=direction, action="buy",
             count=count, price_cents=limit_cents, client_order_id=coid,
+            pin_env=env,
         )
     except Exception as e:
-        recovered, lookup_ok = await _lookup_lost_order(coid, ticker or "")
+        recovered, lookup_ok = await _lookup_lost_order(coid, ticker or "", pin_env=env)
         if isinstance(recovered, dict) and recovered.get("order_id"):
             row.update({"status": "submitted",
                         "kalshi_order_id": recovered.get("order_id"),
@@ -1588,6 +1762,8 @@ async def _run_pairs(
     cfg: dict, env: str, assets: dict, open_positions: list[dict],
     balance_usd: float, runner_id: str = "",
 ) -> list[dict]:
+    """One pass of the complement-accumulation engine (already gated on live +
+    daily-risk + session-TP by run_tick). At most one clip per side per window."""
     if not crypto15m.hours_ok(cfg):
         return []
     ceiling = float(cfg.get("crypto15m_pairs_ceiling_cents", 95.0) or 95.0)
@@ -1694,6 +1870,9 @@ async def _run_pairs(
 
 
 async def _manage_pair(pos: dict) -> Optional[dict]:
+    """Pair legs have NO stop-loss and NO take-profit — a matched pair pays $1
+    at settlement, and selling one leg would turn locked margin into a naked
+    directional bet. Only settlement is checked (REST, after the close)."""
     close_epoch = crypto15m._parse_close_epoch(pos.get("close_time") or "")
     if close_epoch is not None and kalshi_auth.server_now() < close_epoch - 2:
         return None
@@ -1719,6 +1898,8 @@ async def _manage_pair(pos: dict) -> Optional[dict]:
 
 
 def session_take_profit_target(cfg: dict) -> float:
+    """Dollar target for the session take-profit (`crypto15m_session_take_profit_usd`).
+    0 = off."""
     try:
         return max(0.0, float(cfg.get("crypto15m_session_take_profit_usd", 0.0) or 0.0))
     except (TypeError, ValueError):
@@ -1726,6 +1907,7 @@ def session_take_profit_target(cfg: dict) -> float:
 
 
 def session_realized_pnl(env: str, session_start: Optional[str]) -> float:
+    """Realized 15m P&L for `env` since the backend started (`session_start`)."""
     with db.get_db() as conn:
         return db.crypto15m_session_realized_pnl(conn, env, session_start)
 
@@ -1733,6 +1915,8 @@ def session_realized_pnl(env: str, session_start: Optional[str]) -> float:
 def is_blocked_by_session_take_profit(
     cfg: dict, env: str, session_start: Optional[str]
 ) -> tuple[bool, str, float]:
+    """Halt NEW 15m entries once realized session P&L reaches the take-profit
+    target (open positions keep being managed). Returns (blocked, reason, pnl)."""
     target = session_take_profit_target(cfg)
     pnl = session_realized_pnl(env, session_start)
     if target > 0 and pnl >= target:
@@ -1753,6 +1937,16 @@ def _runner_needs_balance(cfg: dict) -> bool:
 
 
 def _resolve_runners(cfg: dict) -> list[dict]:
+    """Resolve `crypto15m_runners` into concrete, coin-DISJOINT runners.
+
+    Each returned runner is {id, name, mode, enabled, coins:[symbols], cfg},
+    where cfg is the effective config (base cfg + that runner's overrides).
+    None/empty crypto15m_runners → ONE implicit 'default' runner over all enabled
+    assets, governed by the legacy crypto15m_live/_assets keys — so existing
+    installs and the whole test suite behave exactly as before. When two ENABLED
+    runners claim the same coin the earlier one wins (a coin belongs to at most
+    one runner), which is what lets different strategies trade different coins in
+    parallel without fighting over a market."""
     raw = cfg.get("crypto15m_runners")
     all_assets = list(crypto15m.ALL_ASSETS)
     if not raw:
@@ -1798,6 +1992,9 @@ def _resolve_runners(cfg: dict) -> list[dict]:
 
 
 def _runner_cfg_for(pos: dict, runners: list[dict], base_cfg: dict) -> dict:
+    """The effective config to MANAGE a position with — its runner's config so
+    each position keeps the stop-loss/take-profit rules of the strategy that
+    opened it. Falls back to the base config for unknown/legacy runner ids."""
     rid = pos.get("runner_id") or ""
     for r in runners:
         if r["id"] == rid:
@@ -1808,14 +2005,27 @@ def _runner_cfg_for(pos: dict, runners: list[dict], base_cfg: dict) -> dict:
 async def _run_runner_entries(
     r: dict, env: str, assets: dict, open_positions: list[dict],
     updated: list[dict], held: set[str], errored: set[str], stopped: set[str],
-    live_ok: bool, balance_usd: float,
+    live_ok: bool, balance_usd: float, live_why: str = "",
+    force_paper: bool = False,
 ) -> list[dict]:
+    """One runner's entry pass over its own coins with its own config/mode.
+
+    `live_ok` is decided ONCE from the BASE config (run_tick), never from the
+    runner's merged cfg: a runner's config overrides may carry any crypto15m_*
+    key, and a runner must not be able to arm itself.
+
+    `force_paper`: the app is in Paper mode. Every runner — live-set ones
+    included — trades the paper simulation, because in Paper the whole app is
+    paper; a live runner sitting idle there would make Paper a worse rehearsal
+    of Live than it has to be. It can only narrow: force_paper never makes a
+    runner live, and live_ok is False in Paper regardless."""
     rcfg = r["cfg"]
-    paper = r["mode"] == "paper"
-    rlive = (r["mode"] == "live") and live_ok
+    paper = r["mode"] == "paper" or force_paper
+    rlive = (r["mode"] == "live") and live_ok and not force_paper
     if not (paper or rlive):
+        why = live_why or "live runner not armed (needs production + auth)"
         for sym in r["coins"]:
-            _block_reasons.setdefault(sym, "live runner not armed (needs production + auth)")
+            _block_reasons.setdefault(sym, why)
         return []
     out: list[dict] = []
     open_count = len([
@@ -1858,6 +2068,12 @@ _STALE_GIVEUP_SEC = 60 * 60
 
 
 async def _reap_stale(pos: dict) -> Optional[dict]:
+    """Last-resort resolution for a position stuck well past its close that the
+    settle path can't resolve (market result never became readable, or an
+    unconfirmable order). Frees the slot / exposure budget / coin lock. Never
+    invents a payout: an unfilled row books 'canceled'; a filled-but-
+    unsettleable row books 'error' with PnL left NULL and flagged for manual
+    review, rather than guessing a win/loss."""
     pid = pos["id"]
     filled = int(pos.get("filled_contracts") or 0)
     with db.get_db() as conn:
@@ -1875,9 +2091,15 @@ async def _reap_stale(pos: dict) -> Optional[dict]:
 
 
 async def _sweep_other_envs_and_reap(active_env: str) -> list[dict]:
+    """run_tick manages only the ACTIVE env's rows, so a mid-window env switch
+    would strand the other env's positions — settlement never booked, slot/cap/
+    coin leaked forever. 15m markets resolve IDENTICALLY across envs and
+    settlement places no orders, so book the non-active envs' CLOSED positions
+    here (the active env's are settled by _manage_position); then reap any row,
+    in any env, stuck long past close that settlement still can't resolve."""
     out: list[dict] = []
     now = kalshi_auth.server_now()
-    for env in ("production", "demo"):
+    for env in (db.LIVE_ENV, db.PAPER_ENV):
         with db.get_db() as conn:
             rows = db.get_open_crypto15m(conn, env)
         for pos in rows:
@@ -1949,7 +2171,13 @@ async def run_tick(
         logger.info(f"[crypto15m] skip entries: {tp_why}")
         return updated
 
-    live_ok = bool(authed) and env == "production"
+    paper_account = env == db.PAPER_ENV
+    live_ok = (bool(authed) and env == db.LIVE_ENV and not paper_account
+               and bool(cfg.get("crypto15m_live")))
+    live_why = ("" if live_ok else
+                "live runner waiting for the 15m 'Real orders (LIVE)' switch"
+                if not cfg.get("crypto15m_live") else
+                "live runner not armed (needs Live mode + a verified key)")
     need_balance = any(_runner_needs_balance(r["cfg"]) for r in enabled)
     balance_usd = await _bankroll_usd(cfg, bool(authed)) if need_balance else 0.0
 
@@ -1959,6 +2187,7 @@ async def run_tick(
             updated.extend(await _run_runner_entries(
                 r, env, assets, open_positions, updated, held,
                 errored_tickers, stopped_tickers, live_ok, balance_usd,
+                live_why=live_why, force_paper=paper_account,
             ))
         except Exception as e:
             logger.warning(f"[crypto15m] runner {r.get('id') or 'default'} failed: {e}")
@@ -2009,6 +2238,19 @@ async def _sizing_preview(cfg: dict, authed: bool) -> dict:
 
 
 def _shard_funding(cfg: dict) -> dict:
+    """Where the 15m crypto markets settle their collateral, and whether the
+    account actually has any there.
+
+    Kalshi allocates collateral PER EXCHANGE SHARD and the 15m crypto series
+    live on their own one, so an account whose cash all sits on the general
+    shard is refused with `user_not_found: <uuid>` — a message naming nothing
+    the user can act on. A beta user hit exactly that on 2026-08-25. The bot
+    page is where they were looking when it happened, so the answer belongs
+    here and not only on the portfolio screen.
+
+    Every field is None when unknown. `starved` is True ONLY on an
+    affirmative zero, never on a number we could not read.
+    """
     series = crypto15m.SERIES[0]["series"] if crypto15m.SERIES else ""
     idx = kalshi_api.shard_for_ticker(series)
     shards = trader.cached_shard_balances()
@@ -2051,24 +2293,30 @@ async def status(
         b["losses"] += s["losses"]
         b["pnlUsd"] += s["pnl_usd"] or 0.0
         b["openN"] += s["open_n"]
+    live_armed = bool(cfg.get("crypto15m_live"))
+    live_supported = env == db.LIVE_ENV
+    engine_live = (bool(cfg.get("crypto15m_enabled")) and live_armed
+                   and bool(authed) and live_supported)
     runners_out = []
     for r in _resolve_runners(cfg):
         st = agg.get(r["id"], {})
+        live_mode = r["mode"] == "live"
         runners_out.append({
             "id": r["id"], "name": r["name"], "mode": r["mode"],
             "enabled": r["enabled"], "coins": r["coins"],
+            "realOrders": bool(r["enabled"] and live_mode and engine_live),
             "n": st.get("n", 0), "wins": st.get("wins", 0), "losses": st.get("losses", 0),
             "pnlUsd": round(st.get("pnlUsd", 0.0), 4), "openN": st.get("openN", 0),
         })
-    live_armed = bool(cfg.get("crypto15m_live"))
-    live_supported = env == "production"
+    live_runners = sum(1 for r in runners_out if r["realOrders"])
     tp_target = session_take_profit_target(cfg)
     session_pnl = session_realized_pnl(env, session_start)
     return {
         "enabled": bool(cfg.get("crypto15m_enabled")),
         "blockReasons": dict(_block_reasons),
         "modelCalibration": dict(_CAL_CACHE),
-        "live": bool(cfg.get("crypto15m_enabled")) and live_armed and bool(authed) and live_supported,
+        "live": engine_live and live_runners > 0,
+        "liveRunners": live_runners,
         "liveArmed": live_armed,
         "liveSupported": live_supported,
         "authed": bool(authed),
@@ -2081,6 +2329,7 @@ async def status(
         "sizing": await _sizing_preview(cfg, authed),
         "shardFunding": _shard_funding(cfg),
         "env": env,
+        "paperAccount": env == db.PAPER_ENV,
         "stats": stats,
         "byStrategy": by_strategy,
         "runners": runners_out,

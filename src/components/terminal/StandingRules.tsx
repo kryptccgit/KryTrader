@@ -6,6 +6,8 @@ import type {
 import { useToast } from '../../state/ToastProvider';
 import { cls } from '../../utils/format';
 import { Caveat, Cents, SidePill, Unknown } from './atoms';
+import { userMessage } from '../../utils/errors';
+
 
 const KINDS: { id: RuleKind; label: string; icon: React.ComponentType<{ className?: string }>; blurb: string }[] = [
   {
@@ -53,7 +55,7 @@ export function ArmRule({
       setThreshold('');
       onArmed();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     } finally {
       setBusy(false);
     }
@@ -150,7 +152,7 @@ export function RuleList({
       toast.push(res.message, res.ok ? 'success' : 'error');
       onChanged();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     } finally {
       setBusy(null);
     }

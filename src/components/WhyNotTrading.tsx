@@ -1,9 +1,11 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { TradingStatus } from '@shared/types';
 import { cls } from '../utils/format';
+import { publishActivity } from '../state/activity';
 
 export function WhyNotTrading() {
   const [st, setSt] = useState<TradingStatus | null>(null);
+  const halted = useRef<{ daily: boolean; c15: boolean } | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -11,7 +13,18 @@ export function WhyNotTrading() {
       try {
         const s = await window.krypt.trading.status();
         if (alive) setSt(s);
-      } catch {  }
+        publishActivity(() => {
+          if (!s) return null;
+          const gate = s.main.find((g) => g.id === 'dailyRisk');
+          const now = { daily: gate?.state === 'blocked', c15: !!s.c15?.takeProfitHalted };
+          const was = halted.current;
+          halted.current = now;
+          if (!was) return null;
+          if (now.daily && !was.daily) return { kind: 'halt', scope: 'daily', reason: gate?.reason || 'daily stop/take-profit' };
+          if (now.c15 && !was.c15) return { kind: 'halt', scope: 'c15TakeProfit', reason: '15m session take-profit reached' };
+          return null;
+        });
+      } catch {}
     };
     void pull();
     const t = setInterval(pull, 5000);
@@ -59,7 +72,9 @@ export function WhyNotTrading() {
           <p className="text-xs text-krypt-dim">
             {st.c15.live
               ? 'LIVE — entries armed.'
-              : `Monitor-only: ${!st.c15.authed ? 'not authenticated' : st.c15.env !== 'production' ? 'demo cannot live-trade 15m markets' : 'live switch is off'}.`}
+              : st.c15.env === 'paper'
+                ? 'Paper mode: every runner trades the paper simulation.'
+                : `Monitor-only: ${!st.c15.authed ? 'not authenticated' : 'live switch is off'}.`}
             {st.c15.takeProfitHalted && ' Session take-profit reached — no new entries.'}
           </p>
           {c15Blocks.length > 0 && (

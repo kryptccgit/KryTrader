@@ -4,7 +4,7 @@ import {
 import type {
   AccountSnapshot, AppState, BackendInfo, BotPosition, CredentialsState,
   CredentialsStatusAll,
-  LogEntry, ScannerStats, SignalRow, StrategyPreset, TraderConfig,
+  LogEntry, ScannerStats, SignalRow, TraderConfig,
 } from '@shared/types';
 
 interface AppStateApi {
@@ -17,7 +17,6 @@ interface AppStateApi {
   signals: SignalRow[];
   credentials: CredentialsState | null;
   credentialsAll: CredentialsStatusAll | null;
-  strategies: StrategyPreset[];
   appVersion: string;
   refresh: {
     state: () => Promise<void>;
@@ -56,7 +55,7 @@ const DEFAULT_BACKEND: BackendInfo = {
 function notify(title: string, body: string): void {
   try {
     new Notification(title, { body, silent: true });
-  } catch {  }
+  } catch {}
 }
 
 export function AppStateProvider({ children }: { children: ReactNode }) {
@@ -69,8 +68,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [credentials, setCredentials] = useState<CredentialsState | null>(null);
   const [credentialsAll, setCredentialsAll] = useState<CredentialsStatusAll | null>(null);
-  const [strategies, setStrategies] = useState<StrategyPreset[]>([]);
-  const [appVersion, setAppVersion] = useState('3.0.0');
+  const [appVersion, setAppVersion] = useState('');
 
   const positionsByIdRef = useRef<Map<number, BotPosition>>(new Map());
   const signalsByKeyRef = useRef<Map<string, SignalRow>>(new Map());
@@ -115,7 +113,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   const refreshPositions = async (): Promise<void> => {
     try {
-      const rows = await window.krypt.data.positions({ limit: 500 });
+      const rows = await window.krypt.data.positions({ limit: 500, env: 'all' });
       const map = new Map<number, BotPosition>();
       for (const r of rows) map.set(r.id, r);
       positionsByIdRef.current = map;
@@ -161,36 +159,40 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let mounted = true;
     const init = async () => {
-      const [s, b, a, c, ss, pos, sig, ls, ver, strat] = await Promise.all([
-        window.krypt.state.get(),
+      try {
+        const s = await window.krypt.state.get();
+        if (mounted) setState(s);
+      } catch {}
+      const [b, a, c, ss, pos, sig, ls, ver] = await Promise.allSettled([
         window.krypt.backend.info(),
         window.krypt.data.account(),
-        window.krypt.credentials.status().catch(() => null),
+        window.krypt.credentials.status(),
         window.krypt.data.scannerStats(),
-        window.krypt.data.positions({ limit: 500 }),
+        window.krypt.data.positions({ limit: 500, env: 'all' }),
         window.krypt.data.signals({ limit: 300 }),
         window.krypt.logs.tail(500),
         window.krypt.app.version(),
-        window.krypt.config.listStrategies(),
       ]);
       if (!mounted) return;
-      setState(s);
-      setBackend(b);
-      setAccount(a);
-      setCredentials(c);
+      if (b.status === 'fulfilled') setBackend(b.value);
+      if (a.status === 'fulfilled') setAccount(a.value);
+      if (c.status === 'fulfilled') setCredentials(c.value);
       void window.krypt.credentials.statusAll().then(setCredentialsAll).catch(() => null);
-      setScannerStats(ss);
-      const pmap = new Map<number, BotPosition>();
-      for (const r of pos) pmap.set(r.id, r);
-      positionsByIdRef.current = pmap;
-      flushPositions();
-      const smap = new Map<string, SignalRow>();
-      for (const r of sig) smap.set(`${r.source}:${r.id}`, r);
-      signalsByKeyRef.current = smap;
-      flushSignals();
-      setLogs(ls);
-      setAppVersion(ver);
-      setStrategies(strat);
+      if (ss.status === 'fulfilled') setScannerStats(ss.value);
+      if (pos.status === 'fulfilled') {
+        const pmap = new Map<number, BotPosition>();
+        for (const r of pos.value) pmap.set(r.id, r);
+        positionsByIdRef.current = pmap;
+        flushPositions();
+      }
+      if (sig.status === 'fulfilled') {
+        const smap = new Map<string, SignalRow>();
+        for (const r of sig.value) smap.set(`${r.source}:${r.id}`, r);
+        signalsByKeyRef.current = smap;
+        flushSignals();
+      }
+      if (ls.status === 'fulfilled') setLogs(ls.value);
+      if (ver.status === 'fulfilled') setAppVersion(ver.value);
     };
     void init();
 
@@ -260,6 +262,17 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
 
   const config = state?.config ?? null;
 
+  const accountMode = config?.accountMode;
+  const firstMode = useRef(true);
+  useEffect(() => {
+    if (accountMode === undefined) return;
+    if (firstMode.current) { firstMode.current = false; return; }
+    setAccount(null);
+    void refreshAccount();
+    void refreshPositions();
+    void refreshSignals();
+  }, [accountMode]);
+
   const api = useMemo<AppStateApi>(
     () => ({
       state,
@@ -271,7 +284,6 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
       signals,
       credentials,
       credentialsAll,
-      strategies,
       appVersion,
       refresh: {
         state: refreshState,
@@ -285,7 +297,7 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
     }),
     [
       state, config, backend, account, scannerStats, positions, signals,
-      credentials, credentialsAll, strategies, appVersion,
+      credentials, credentialsAll, appVersion,
     ],
   );
 

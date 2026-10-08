@@ -1,3 +1,4 @@
+"""Turbine strategy library import: archetype → directional rule vocabulary."""
 from __future__ import annotations
 
 import turbine_import as ti

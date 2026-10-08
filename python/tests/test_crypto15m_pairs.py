@@ -92,11 +92,14 @@ def _capture_orders(monkeypatch):
 
 
 
+
 def _hist(cents: float, n: int = 24) -> deque:
     return deque([cents] * n, maxlen=45)
 
 
 def _seesaw_hist(lo: float, hi: float, n: int = 24) -> deque:
+    """A realistic other-side history: the seesaw touches `lo` on this side's
+    peaks and `hi` on its dips."""
     vals = [hi if i % 2 == 0 else lo for i in range(n)]
     return deque(vals, maxlen=45)
 
@@ -175,6 +178,7 @@ def test_first_leg_needs_a_settled_window():
         ceiling_cents=95, dip_cents=2, first_leg_max_cents=60, mins_left=13,
     )
     assert ok is True
+
 
 
 
@@ -372,6 +376,7 @@ def test_hist_prunes_dead_windows():
 
 
 
+
 def test_first_leg_band_blocks_knife_catches():
     ok, why = ct._pair_leg_ok(
         33.0, _hist(37.0), _seesaw_hist(55.0, 62.0), other_cost_cents=None,
@@ -464,6 +469,7 @@ def test_first_leg_band_validation_swaps_inverted_bounds():
 
 
 
+
 def test_second_leg_never_placed_against_unfilled_first_leg(fresh_db, env_prod, cfg, monkeypatch):
     a = _asset(up_ask=0.29, down_ask=0.55)
     with db.get_db() as conn:
@@ -478,7 +484,7 @@ def test_second_leg_never_placed_against_unfilled_first_leg(fresh_db, env_prod, 
     _seed_hist(a["ticker"], yes=[33.0] * 24, no=[50.0] * 24)
     _stub_snapshot(monkeypatch, [a])
 
-    async def _order(_kid):
+    async def _order(_kid, **_kw):
         return {"order": {"fill_count_fp": "0", "remaining_count_fp": "5",
                           "status": "resting"}}
     monkeypatch.setattr(kalshi_api, "get_order", _order)
@@ -514,7 +520,7 @@ def test_pair_entry_ttl_cancels_stale_marketable_order(fresh_db, env_prod, cfg, 
         canceled.append(kid)
     monkeypatch.setattr(kalshi_api, "cancel_order", _cancel)
 
-    async def _order(_kid):
+    async def _order(_kid, **_kw):
         return {"order": {"fill_count_fp": "0", "remaining_count_fp": "5",
                           "status": "canceled"}}
     monkeypatch.setattr(kalshi_api, "get_order", _order)

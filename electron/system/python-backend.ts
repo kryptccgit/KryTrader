@@ -3,6 +3,7 @@ import { spawn, spawnSync, ChildProcessWithoutNullStreams } from 'node:child_pro
 import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import type { BackendInfo, BackendStatus, LogEntry } from '../../shared/types';
+import { encodeRpcError } from '../../shared/errors';
 
 
 let darwinBackendPrepared = false;
@@ -454,7 +455,13 @@ class PythonBackend {
       if (obj.ok) {
         p.resolve(obj.result);
       } else {
-        p.reject(new Error(obj.error || 'rpc failed'));
+        const e = obj.error;
+        const message = typeof e === 'string' ? e
+          : (e && typeof e === 'object' && typeof e.message === 'string') ? e.message
+            : typeof obj.message === 'string' ? obj.message : 'rpc failed';
+        const code = (e && typeof e === 'object' && typeof e.code === 'string') ? e.code
+          : typeof obj.code === 'string' ? obj.code : null;
+        p.reject(new Error(encodeRpcError(message, code)));
       }
       return;
     }

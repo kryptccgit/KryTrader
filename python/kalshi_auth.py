@@ -10,7 +10,7 @@ import threading
 import time
 from email.utils import parsedate_to_datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
@@ -150,6 +150,12 @@ def _named_secret_file(name: str) -> Path:
 
 
 def save_secret(name: str, value: str) -> None:
+    """Store an arbitrary credential with the same protection as the API keys:
+    DPAPI-encrypted on Windows, 0600 elsewhere, atomic write.
+
+    Used for the Discord and Telegram bot tokens. A bot token is a credential —
+    it belongs beside the others, not in settings.json where every profile
+    export and backup would carry it."""
     d = _credentials_dir()
     _restrict_dir(d)
     v = (value or "").strip()
@@ -182,6 +188,34 @@ def has_secret(name: str) -> bool:
     return _named_secret_file(name).exists()
 
 
+def list_secret_names(prefix: str) -> list[str]:
+    """Names of the stored secrets that start with `prefix` — the per-agent
+    MCP tokens (mcp_token_<id>), whose ids live in config, not here. Read by
+    logscrub (so every agent's token is redacted, not only Default's) and by
+    the token pruner (so a deleted agent's token is removed from disk)."""
+    d = _credentials_dir()
+    safe = "".join(c for c in prefix if c.isalnum() or c in "-_")
+    if not d.exists():
+        return []
+    out = []
+    for p in d.glob(f"secret.{safe}*.txt"):
+        name = p.name[len("secret."):-len(".txt")]
+        if name.startswith(safe):
+            out.append(name)
+    return sorted(out)
+
+
+PRODUCTION = "production"
+PAPER = "paper"
+_ENVS = (PRODUCTION, PAPER)
+
+
+class PaperModeError(RuntimeError):
+    """A signed Kalshi request was attempted while the app is in Paper mode.
+    Raised before any key is read, so a paper session can never reach the
+    user's real account by any path that signs."""
+
+
 def _env_api_key_file(env: str) -> Path:
     return _credentials_dir() / f"apikey.{env}.txt"
 
@@ -190,63 +224,32 @@ def _env_rsa_key_file(env: str) -> Path:
     return _credentials_dir() / f"rsakey.{env}.pem"
 
 
-def _maybe_migrate_legacy(env: str) -> None:
-    d = _credentials_dir()
-    legacy_api = d / "apikey.txt"
-    legacy_pem = d / "rsakey.pem"
-    if not (legacy_api.exists() or legacy_pem.exists()):
-        return
-    target_api = _env_api_key_file(env)
-    target_pem = _env_rsa_key_file(env)
-    if target_api.exists() or target_pem.exists():
-        return
-    try:
-        if legacy_api.exists():
-            _write_secret_bytes(target_api, _read_secret_bytes(legacy_api, upgrade=False))
-            legacy_api.unlink()
-        if legacy_pem.exists():
-            _write_secret_bytes(target_pem, _read_secret_bytes(legacy_pem, upgrade=False))
-            legacy_pem.unlink()
-        for nm in ("apikey.env", "rsakey.env"):
-            p = d / nm
-            if p.exists():
-                try: p.unlink()
-                except Exception: pass
-    except Exception:
-        pass
-
-
 def _api_key_file(env: Optional[str] = None) -> Path:
-    e = env or _current_env
-    _maybe_migrate_legacy(e)
-    return _env_api_key_file(e)
+    return _env_api_key_file(PRODUCTION)
 
 
 def _rsa_key_file(env: Optional[str] = None) -> Path:
-    e = env or _current_env
-    _maybe_migrate_legacy(e)
-    return _env_rsa_key_file(e)
+    return _env_rsa_key_file(PRODUCTION)
 
 
 _SERVER_BASES = {
-    "demo": "https://demo-api.kalshi.co",
-    "production": "https://api.elections.kalshi.com",
+    PRODUCTION: "https://api.elections.kalshi.com",
 }
 
-_cached_api_key: Optional[str] = None
-# Kalshi accepts RSA (signed RSA-PSS) or Ed25519 keys, with the same headers and
-# pre-sign text. Since 2026-10-01 the web app's "Create New API Key" dialog
-# hands out Ed25519 by default, so an RSA-only loader turned away every new
-# user who followed Kalshi's own flow. The on-disk name stays rsakey.<env>.pem
-# so existing installs keep their credentials.
-SigningKey = rsa.RSAPrivateKey | ed25519.Ed25519PrivateKey
+SigningKey = Union[rsa.RSAPrivateKey, ed25519.Ed25519PrivateKey]
 _SIGNING_KEY_TYPES = (rsa.RSAPrivateKey, ed25519.Ed25519PrivateKey)
 
+_cached_api_key: Optional[str] = None
 _cached_private_key: Optional[SigningKey] = None
 _server_offset_ms: int = 0
 
 
 def server_now() -> float:
+    """Kalshi-server epoch seconds: local clock corrected by the measured
+    signing offset. Every money-relevant time comparison (seconds-to-close
+    guards, entry windows, settlement-print attribution) must use THIS, not
+    time.time() — a consumer Windows box 20-30s slow turns "12s to close"
+    into 2s and recreates the T-2s entry bug straight through its fix."""
     import time as _time
     return _time.time() + _server_offset_ms / 1000.0
 _last_sync: float = 0.0
@@ -254,14 +257,15 @@ _RESYNC_INTERVAL_SEC = 300
 _sync_lock = threading.Lock()
 _sync_in_progress: bool = False
 
-_current_env: str = "production"
+DEFAULT_ENV = PAPER
+_current_env: str = DEFAULT_ENV
 
 ENV_LOCK = asyncio.Lock()
 
 
 def set_env(env: str) -> None:
     global _current_env, _last_sync
-    if env not in _SERVER_BASES:
+    if env not in _ENVS:
         raise ValueError(f"unknown env: {env}")
     if env != _current_env:
         _current_env = env
@@ -272,8 +276,12 @@ def get_env() -> str:
     return _current_env
 
 
+def is_paper(env: Optional[str] = None) -> bool:
+    return (env or _current_env) == PAPER
+
+
 def _server_time_url() -> str:
-    return f"{_SERVER_BASES[_current_env]}/trade-api/v2/exchange/status"
+    return f"{_SERVER_BASES[PRODUCTION]}/trade-api/v2/exchange/status"
 
 
 def reset_credential_cache() -> None:
@@ -282,14 +290,7 @@ def reset_credential_cache() -> None:
     _cached_private_key = None
 
 
-def _load_api_key() -> str:
-    global _cached_api_key
-    if _cached_api_key is not None:
-        return _cached_api_key
-    f = _api_key_file()
-    if not f.exists():
-        raise FileNotFoundError(f"Kalshi API key not configured ({f})")
-    text = _read_secret_bytes(f).decode("utf-8", "replace")
+def _parse_api_key_text(text: str) -> Optional[str]:
     for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -298,35 +299,108 @@ def _load_api_key() -> str:
             _, _, val = line.partition("=")
             val = val.strip().strip('"').strip("'")
             if val:
-                _cached_api_key = val
                 return val
         else:
-            _cached_api_key = line
             return line
-    raise ValueError(f"No API key parsed from {f}")
+    return None
+
+
+def _load_api_key() -> str:
+    global _cached_api_key
+    if _current_env == PAPER:
+        raise PaperModeError("Paper mode: nothing is signed with your Kalshi key")
+    if _cached_api_key is not None:
+        return _cached_api_key
+    f = _api_key_file()
+    if not f.exists():
+        raise FileNotFoundError(f"Kalshi API key not configured ({f})")
+    val = _parse_api_key_text(_read_secret_bytes(f).decode("utf-8", "replace"))
+    if not val:
+        raise ValueError(f"No API key parsed from {f}")
+    _cached_api_key = val
+    return val
+
+
+def saved_api_key_id() -> Optional[str]:
+    """The saved key id, read for the log scrubber ONLY. Reading a key to
+    redact it is not signing with it, so this works in Paper — where the
+    first key test now always happens, and where the backend boots before the
+    user's settings arrive. Never use it to sign."""
+    f = _api_key_file()
+    if not f.exists():
+        return None
+    try:
+        return _parse_api_key_text(_read_secret_bytes(f, upgrade=False).decode("utf-8", "replace"))
+    except Exception:
+        return None
+
+
+def _load_signing_key(pem_bytes: bytes) -> SigningKey:
+    key = serialization.load_pem_private_key(pem_bytes, password=None)
+    if not isinstance(key, _SIGNING_KEY_TYPES):
+        raise TypeError("Kalshi key file is not an RSA or Ed25519 private key")
+    return key
 
 
 def _load_private_key() -> SigningKey:
     global _cached_private_key
+    if _current_env == PAPER:
+        raise PaperModeError("Paper mode: nothing is signed with your Kalshi key")
     if _cached_private_key is not None:
         return _cached_private_key
     f = _rsa_key_file()
     if not f.exists():
         raise FileNotFoundError(f"Kalshi private key not configured ({f})")
-    pem_bytes = _read_secret_bytes(f)
-    key = serialization.load_pem_private_key(pem_bytes, password=None)
-    if not isinstance(key, _SIGNING_KEY_TYPES):
-        raise TypeError("Kalshi key file does not contain an RSA or Ed25519 private key")
+    key = _load_signing_key(_read_secret_bytes(f))
     _cached_private_key = key
     return key
 
 
+def load_env_credentials(env: str = PRODUCTION) -> tuple[str, SigningKey]:
+    """The saved (key id, private key), read straight from disk; the module
+    cache and the global env are left alone.
+
+    One caller: the key test the user clicks (kalshi_api.verify_saved_key).
+    It signs ONE balance read with the production key without flipping the
+    global env — which in Paper mode would briefly let every engine's ledger
+    writes and order routing see "production" while the test ran."""
+    if env != PRODUCTION:
+        raise ValueError(f"unknown env: {env}")
+    apk, pem = _api_key_file(env), _rsa_key_file(env)
+    if not (apk.exists() and pem.exists()):
+        raise FileNotFoundError("Kalshi credentials not set")
+    key_id = _parse_api_key_text(_read_secret_bytes(apk).decode("utf-8", "replace"))
+    if not key_id:
+        raise ValueError("No API key parsed")
+    return key_id, _load_signing_key(_read_secret_bytes(pem))
+
+
+def key_fingerprint(key: SigningKey) -> str:
+    """Eight hex characters naming a key pair without revealing it. RSA keeps
+    the historical formula (sha256 of the modulus as decimal) so a fingerprint
+    a user already noted down still matches."""
+    if isinstance(key, rsa.RSAPrivateKey):
+        n = key.public_key().public_numbers().n
+        return hashlib.sha256(str(n).encode()).hexdigest()[:8].upper()
+    raw = key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw)
+    return hashlib.sha256(raw).hexdigest()[:8].upper()
+
+
+def key_type(key: SigningKey) -> str:
+    return "rsa" if isinstance(key, rsa.RSAPrivateKey) else "ed25519"
+
+
 def credentials_present(env: Optional[str] = None) -> bool:
-    return _api_key_file(env).exists() and _rsa_key_file(env).exists()
+    """Whether the production key pair is saved. `env` may name production
+    (or be omitted); the paper scope has no credentials by definition."""
+    if env not in (None, PRODUCTION):
+        return False
+    return _api_key_file().exists() and _rsa_key_file().exists()
 
 
 def credentials_status(env: Optional[str] = None) -> dict:
-    e = env or _current_env
+    e = PRODUCTION
     apk = _api_key_file(e)
     rkf = _rsa_key_file(e)
     info = {
@@ -335,6 +409,7 @@ def credentials_status(env: Optional[str] = None) -> dict:
         "hasRsaKey": rkf.exists(),
         "apiKeyPreview": "",
         "fingerprint": "",
+        "keyType": None,
     }
     if apk.exists():
         try:
@@ -348,21 +423,9 @@ def credentials_status(env: Optional[str] = None) -> dict:
             pass
     if rkf.exists():
         try:
-            key = serialization.load_pem_private_key(
-                _read_secret_bytes(rkf), password=None
-            )
-            if isinstance(key, rsa.RSAPrivateKey):
-                # Kept as-is so a saved RSA key shows the fingerprint it always has.
-                pub = key.public_key().public_numbers().n
-                fp = hashlib.sha256(str(pub).encode()).hexdigest()[:8].upper()
-                info["fingerprint"] = fp
-                info["keyType"] = "rsa"
-            elif isinstance(key, ed25519.Ed25519PrivateKey):
-                raw = key.public_key().public_bytes(
-                    serialization.Encoding.Raw, serialization.PublicFormat.Raw
-                )
-                info["fingerprint"] = hashlib.sha256(raw).hexdigest()[:8].upper()
-                info["keyType"] = "ed25519"
+            key = _load_signing_key(_read_secret_bytes(rkf))
+            info["fingerprint"] = key_fingerprint(key)
+            info["keyType"] = key_type(key)
         except Exception:
             pass
     return info
@@ -371,13 +434,14 @@ def credentials_status(env: Optional[str] = None) -> dict:
 def credentials_status_all() -> dict:
     return {
         "current": _current_env,
-        "demo": credentials_status("demo"),
-        "production": credentials_status("production"),
+        "production": credentials_status(PRODUCTION),
     }
 
 
 def save_credentials(api_key: str, rsa_pem: str, env: Optional[str] = None) -> None:
-    e = env or _current_env
+    if env not in (None, PRODUCTION):
+        raise ValueError("Kalshi keys are saved for production only")
+    e = PRODUCTION
     d = _credentials_dir()
     _restrict_dir(d)
     api_key = api_key.strip()
@@ -387,43 +451,33 @@ def save_credentials(api_key: str, rsa_pem: str, env: Optional[str] = None) -> N
         key = serialization.load_pem_private_key(
             rsa_pem.encode("utf-8"), password=None
         )
+    except TypeError as ex:
+        raise ValueError(
+            "This private key is password-protected. Use the key file exactly "
+            "as Kalshi gave it to you.") from ex
     except Exception as ex:
-        raise ValueError(f"Private key did not parse: {ex}") from ex
+        raise ValueError(f"The private key did not parse: {ex}") from ex
     if not isinstance(key, _SIGNING_KEY_TYPES):
-        raise ValueError("Private key must be an RSA or Ed25519 key")
+        raise ValueError(
+            "That is not a key type Kalshi signs with. Kalshi API keys are "
+            "Ed25519 or RSA.")
     api_path = _env_api_key_file(e)
     pem_path = _env_rsa_key_file(e)
     _write_secret_bytes(api_path, (api_key + "\n").encode("utf-8"))
     _write_secret_bytes(pem_path, (rsa_pem.strip() + "\n").encode("utf-8"))
-    if e == _current_env:
-        reset_credential_cache()
+    reset_credential_cache()
 
 
 def clear_credentials(env: Optional[str] = None) -> None:
-    d = _credentials_dir()
-    e = env or _current_env
-    for p in (_env_api_key_file(e), _env_rsa_key_file(e)):
+    if env not in (None, PRODUCTION):
+        raise ValueError("Kalshi keys are saved for production only")
+    for p in (_env_api_key_file(PRODUCTION), _env_rsa_key_file(PRODUCTION)):
         if p.exists():
             try:
                 p.unlink()
             except Exception:
                 pass
-    for name in ("apikey.txt", "apikey.env", "rsakey.pem", "rsakey.env"):
-        p = d / name
-        if p.exists():
-            try:
-                p.unlink()
-            except Exception:
-                pass
-    if e == _current_env:
-        reset_credential_cache()
-
-
-def migrate_legacy_credentials(target_env: str) -> bool:
-    before = _env_api_key_file(target_env).exists()
-    _maybe_migrate_legacy(target_env)
-    after = _env_api_key_file(target_env).exists()
-    return after and not before
+    reset_credential_cache()
 
 
 def sync_server_time(force: bool = False) -> int:
@@ -470,23 +524,40 @@ def now_ms() -> int:
     return int(time.time() * 1000) + _server_offset_ms
 
 
-def _sign(message: bytes) -> str:
-    private_key = _load_private_key()
+def _sign_with(private_key: SigningKey, message: bytes) -> str:
     if isinstance(private_key, ed25519.Ed25519PrivateKey):
-        # Ed25519 signs the pre-sign text itself: no hash, no padding.
-        return base64.b64encode(private_key.sign(message)).decode("ascii")
-    signature = private_key.sign(
-        message,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=hashes.SHA256().digest_size,
-        ),
-        hashes.SHA256(),
-    )
+        signature = private_key.sign(message)
+    else:
+        signature = private_key.sign(
+            message,
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=hashes.SHA256().digest_size,
+            ),
+            hashes.SHA256(),
+        )
     return base64.b64encode(signature).decode("ascii")
 
 
+def _sign(message: bytes) -> str:
+    return _sign_with(_load_private_key(), message)
+
+
+def sign_headers_with(api_key: str, private_key: SigningKey,
+                      method: str, path: str) -> dict[str, str]:
+    """sign_headers for an explicit key pair (see load_env_credentials)."""
+    ts = str(now_ms())
+    message = (ts + method.upper() + path).encode("utf-8")
+    return {
+        "KALSHI-ACCESS-KEY": api_key,
+        "KALSHI-ACCESS-TIMESTAMP": ts,
+        "KALSHI-ACCESS-SIGNATURE": _sign_with(private_key, message),
+    }
+
+
 def sign_headers(method: str, path: str) -> dict[str, str]:
+    if _current_env == PAPER:
+        raise PaperModeError("Paper mode: nothing is signed with your Kalshi key")
     ts = str(now_ms())
     message = (ts + method.upper() + path).encode("utf-8")
     return {

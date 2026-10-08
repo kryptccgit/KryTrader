@@ -28,6 +28,7 @@ def _now_iso() -> str:
 
 
 
+
 WHALE_CFG = {
     "min_whale_usd": 2500,
     "min_entry_price_frac": 0.50,
@@ -84,6 +85,7 @@ def test_scan_whales_keeps_valid_no_side(fresh_db, monkeypatch):
 
 
 
+
 MOM_CFG = {
     "contrarian_only": False,
     "allowed_momentum_signal_types": ["price_move"],
@@ -122,6 +124,7 @@ def test_momentum_baseline_is_previous_scan_not_two_back(fresh_db, monkeypatch):
 
 
 
+
 def test_resolve_category_unmapped_falls_to_keyword_bucket(monkeypatch):
     async def _series(_st):
         return {"category": "Never Heard Of It"}
@@ -148,7 +151,14 @@ def test_resolve_category_exotics_is_first_class(monkeypatch):
 
 
 
+
 def test_a_block_trade_is_not_scored_as_a_whale(fresh_db, monkeypatch):
+    """Kalshi stamps every print with `is_block_trade` (present on 1000/1000 of
+    a live sample, 2026-08-25). A block is privately negotiated away from the
+    book and printed afterwards: it carries a taker_side and a large size, so
+    it clears every gate here — but nobody swept the public book, which is the
+    whole premise of the signal. Blocks are large BY CONSTRUCTION, so the bias
+    is systematic rather than occasional."""
     block = dict(_tape_trade("t-block", "no"), is_block_trade=True)
     _stub_network(monkeypatch, [block])
     n, rows = run_async(scanner.scan_whales(WHALE_CFG))
@@ -158,6 +168,7 @@ def test_a_block_trade_is_not_scored_as_a_whale(fresh_db, monkeypatch):
 
 
 def test_an_identical_ordinary_print_still_scores(fresh_db, monkeypatch):
+    """Control: same size, same price, same side — only the flag differs."""
     _stub_network(monkeypatch, [dict(_tape_trade("t-ord", "no"),
                                      is_block_trade=False)])
     n, _rows = run_async(scanner.scan_whales(WHALE_CFG))
@@ -165,6 +176,9 @@ def test_an_identical_ordinary_print_still_scores(fresh_db, monkeypatch):
 
 
 def test_the_websocket_tape_carries_the_block_flag():
+    """scan_whales PREFERS the websocket tape over REST, so a flag that only
+    survived the REST path would leave the primary path unfiltered — which is
+    the same as not filtering at all."""
     c = kalshi_ws._Client()
     c._on_trade({"msg": {"market_ticker": "X", "trade_id": "b",
                          "count_fp": "10", "yes_price_dollars": "0.5",

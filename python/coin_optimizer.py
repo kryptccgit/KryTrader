@@ -1,3 +1,17 @@
+"""Coin Optimizer: sweep strategies across hour-buckets for one coin, elect a
+per-hour winner, and assemble a best-24h schedule — with a walk-forward holdout.
+
+Method (honest + cheap): each strategy is replayed ONCE over the coin's recorded
+windows (replay.replay already enters one trade per window at the first
+qualifying tick, held to settlement, fee-adjusted). Every trade carries its UTC
+hour, so bucketing those trades by hour is identical to running each strategy
+per-bucket — but N replays instead of N×buckets.
+
+Overfit guard: winners are ELECTED on the TRAIN split (older data) and the
+assembled schedule is scored on a held-out TEST split (recent data) it never
+saw. A bucket elects nobody unless its best strategy clears `min_trades` on
+train — so 2 days of data correctly elects nothing.
+"""
 from __future__ import annotations
 
 import time
@@ -137,6 +151,9 @@ def optimize(coin: str, *, strategies: Optional[list[dict]] = None,
 
 
 def run_optimize(params: dict) -> dict:
+    """Picklable entrypoint for the service process pool (params in, dict out).
+    Resolves the optional strategy-name filter inside the worker; env is passed
+    explicitly (a spawned worker doesn't share the parent's runtime env)."""
     strategies = None
     names = params.get("strategyNames")
     if names:

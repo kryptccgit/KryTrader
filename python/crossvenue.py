@@ -1,3 +1,43 @@
+"""Pairing the same question across two venues.
+
+The feature is simple to describe — "show me this Kalshi market's price on
+Polymarket" — and the hard part is entirely in refusing to be confidently
+wrong. A mispaired market does not degrade gracefully: it renders as a large,
+inviting price difference between two markets that are not the same question,
+which is the single most dangerous number this app could print.
+
+That is not hypothetical. Measured against live data from both venues, a plain
+token-overlap matcher scored these as STRONG matches:
+
+    "Will Barack Obama be the Democratic nominee"  ->  "Will Michelle Obama win…"
+    "Will Mark Cuban be the Democratic nominee"    ->  "Will Mark Kelly win…"
+    "Will Jon Stewart be the Democratic nominee"   ->  "Will Jon Ossoff win…"
+    "Will John Fetterman be the Democratic nominee"->  "Will John Thune win…"
+
+…while REJECTING the true "Marco Rubio"/"Marco Rubio" pair, because the
+boilerplate ("will … be the democratic presidential nominee") swamps the one
+token that carries the meaning. Every one of those false pairs would have shown
+a double-digit "spread" between two different people.
+
+So the matcher is built around three rules:
+
+  1. **Rarity decides.** Tokens are weighted by inverse document frequency
+     across both corpora, so shared boilerplate contributes almost nothing and
+     a surname carries the match.
+  2. **Names are identity.** If each side names a proper noun the other does
+     not, they are different questions however much else agrees. `Barack` vs
+     `Michelle` is disqualifying; `nomination` vs `presidency` is not, because
+     it is two phrasings of one thing.
+  3. **Confidence is reported, not hidden.** Anything below the confident
+     threshold is offered as a candidate for the user to confirm, and no price
+     difference is computed until a pair is confident. Under it, the panel
+     shows the candidate and says why it is unsure.
+
+And even a perfect pairing is not an arbitrage: Kalshi settles under CFTC
+exchange rules against named sources, Polymarket settles via the UMA optimistic
+oracle. Two identically-worded markets can resolve differently. Nothing here
+returns a field called "edge" or "arb".
+"""
 from __future__ import annotations
 
 import logging
@@ -36,6 +76,10 @@ def tokens(text: str) -> list[str]:
 
 
 def proper_nouns(text: str) -> set[str]:
+    """Tokens that look like a NAME rather than merely a rare word.
+
+    This is what separates "Stewart vs Ossoff" (two people — disqualifying)
+    from "nomination vs presidency" (one question, two phrasings — fine)."""
     out: set[str] = set()
     for w in _PROPER.findall(text or ""):
         wl = w.lower().strip(".'-")
@@ -48,6 +92,13 @@ _NUMBER = re.compile(r"\$?\s?([0-9][0-9,]*(?:\.[0-9]+)?)")
 
 
 def numbers(text: str) -> set[float]:
+    """Strikes and thresholds, read from the RAW text.
+
+    Not from the tokens: the word splitter breaks "$150,000" on the comma into
+    "$150" and "000", so "$150,000" and "$200,000" both contained "000" and
+    looked like they shared a number. Two different Bitcoin strikes scored 0.93
+    and would have been shown as the same market — a caught-by-test near miss
+    of exactly the kind this module exists to prevent."""
     out: set[float] = set()
     for raw in _NUMBER.findall(text or ""):
         try:
@@ -55,6 +106,7 @@ def numbers(text: str) -> set[float]:
         except ValueError:
             continue
     return out
+
 
 
 _OFFICE_PATTERNS = [
@@ -78,6 +130,21 @@ _NAME_CONJUNCTION = re.compile(
 
 
 def conjoins_names(text: str) -> bool:
+    """Does this title join two capitalised names with "and"?
+
+    "Will Gavin Newsom AND JD Vance be the 2028 Democratic and Republican
+    nominees" is a COMBO market: it pays only if both legs land. Matched
+    against Polymarket's "Will Gavin Newsom win the 2028 Democratic
+    presidential nomination" it scored 0.78 — confident — on live data
+    (2026-08-25), because every rule here was symmetric and the Kalshi side
+    merely named someone extra.
+
+    That pair is worse than a random mismatch. P(A and B) <= P(A) by
+    construction, so a joint priced against its own single leg does not just
+    risk a wrong number — it guarantees a standing, one-directional "spread"
+    that is pure artifact, which is the most inviting shape a wrong pair can
+    take.
+    """
     return bool(_NAME_CONJUNCTION.search(text or ""))
 
 
@@ -90,11 +157,16 @@ def _first_match(text: str, patterns: list[tuple[str, str]]) -> Optional[str]:
 
 
 def office(text: str) -> Optional[str]:
+    """Which office a question is about. Ordered so `vice president` is caught
+    before the plain `president` substring it contains."""
     return _first_match(text, _OFFICE_PATTERNS)
 
 
 def stage(text: str) -> Optional[str]:
+    """Nomination or the general election — two different questions about the
+    same person in the same cycle, and routinely priced tens of cents apart."""
     return _first_match(text, _STAGE_PATTERNS)
+
 
 
 _DIRECTION_PATTERNS = [
@@ -107,12 +179,18 @@ _NEGATION = re.compile(
 
 
 def direction(text: str) -> Optional[str]:
+    """Which way a threshold question points, or None when it states neither.
+
+    Deliberately returns None when BOTH appear (e.g. a "between X and Y" range
+    names both edges): that is not evidence of a direction, and guessing one
+    would be worse than admitting we cannot tell."""
     t = (text or "").lower()
     hits = [name for name, pat in _DIRECTION_PATTERNS if re.search(pat, t)]
     return hits[0] if len(hits) == 1 else None
 
 
 def negated(text: str) -> bool:
+    """Whether the question asks for a thing NOT to happen."""
     return bool(_NEGATION.search((text or "").lower()))
 
 
@@ -135,6 +213,8 @@ def _parse_dt(v: Any) -> Optional[datetime]:
 
 
 def _discriminators(toks: list[str], idf: dict[str, float]) -> set[str]:
+    """The rarest tokens in a title — the ones that pick this market out of its
+    event rather than describing the event."""
     uniq = set(toks)
     if not uniq:
         return set()
@@ -144,6 +224,8 @@ def _discriminators(toks: list[str], idf: dict[str, float]) -> set[str]:
 
 
 def _phrase(items) -> str:
+    """A short, readable list. These strings are rendered verbatim in the UI,
+    so a Python list repr would put brackets and quotes on screen."""
     vals = [str(x) for x in sorted(items)][:3]
     if not vals:
         return ""
@@ -162,6 +244,8 @@ def score_pair(
     k_text: str, p_text: str, idf: dict[str, float],
     k_close: Any = None, p_close: Any = None,
 ) -> tuple[float, list[str]]:
+    """(confidence 0..1, reasons). The reasons are shown to the user verbatim —
+    a pairing the user cannot audit is a pairing they should not trade on."""
     kt, pt = tokens(k_text), tokens(p_text)
     ka, pa = set(kt), set(pt)
     if not ka or not pa:
@@ -247,6 +331,12 @@ def score_pair(
 def find_matches(
     kalshi_market: dict, poly_markets: list[dict], limit: int = 4,
 ) -> list[dict]:
+    """Rank Polymarket candidates for one Kalshi market.
+
+    Kalshi puts the outcome in `yesSubTitle` ("Marco Rubio") and the question in
+    the title ("Who will win…"), while Polymarket puts the whole thing in one
+    question string — so both Kalshi fields are used as the text to match.
+    """
     k_text = " ".join(filter(None, [
         kalshi_market.get("title") or "",
         kalshi_market.get("yesSubTitle") or "",
@@ -273,6 +363,13 @@ def find_matches(
 
 
 def compare(kalshi_market: dict, poly_market: dict) -> dict:
+    """The two venues' prices side by side.
+
+    `differenceCents` is a PRICE DIFFERENCE and nothing more. It is not an
+    edge, not an arb, and the field is named so that no caller can mistake it
+    for one — the two contracts settle under different rules, by different
+    mechanisms, and can disagree at expiry even when the English matches.
+    """
     k_bid, k_ask = kalshi_market.get("yesBid"), kalshi_market.get("yesAsk")
     p_bid, p_ask = poly_market.get("yesBid"), poly_market.get("yesAsk")
 

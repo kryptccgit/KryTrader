@@ -1,3 +1,8 @@
+"""Script-engine money-rail regressions from the v5.0.0 launch review:
+paper/live bucket separation, env-scoped attempt dedupe, the account-wide
+daily-risk gate, the manage-sell fire-sale guard, insert-before-POST on
+signal follows, lifecycle notification priming, and backtest/live parity
+of the ask-intent entry-cap refusal."""
 from __future__ import annotations
 
 import asyncio
@@ -47,7 +52,7 @@ def run_async(coro):
     return asyncio.run(coro)
 
 
-def _pos_row(sid="s1", ticker="KXBTC15M-T1", env="demo", dry_run=0):
+def _pos_row(sid="s1", ticker="KXBTC15M-T1", env="paper", dry_run=0):
     close = (datetime.now(timezone.utc) + timedelta(minutes=5)).strftime(
         "%Y-%m-%dT%H:%M:%SZ")
     return {
@@ -72,37 +77,41 @@ def _insert_resolved(conn, sid, ticker, env, dry_run, pnl):
 
 
 
+
 def test_daily_pnl_scoped_by_mode(fresh_db):
+    """Paper wins must never offset live losses in the daily-loss breaker."""
     with db.get_db() as conn:
-        _insert_resolved(conn, "s1", "T-PAPER", "demo", dry_run=1, pnl=40.0)
-        _insert_resolved(conn, "s1", "T-LIVE", "demo", dry_run=0, pnl=-30.0)
-        assert se._script_daily_pnl(conn, "s1", "demo", paper=False) == -30.0
-        assert se._script_daily_pnl(conn, "s1", "demo", paper=True) == 40.0
+        _insert_resolved(conn, "s1", "T-PAPER", "paper", dry_run=1, pnl=40.0)
+        _insert_resolved(conn, "s1", "T-LIVE", "paper", dry_run=0, pnl=-30.0)
+        assert se._script_daily_pnl(conn, "s1", "paper", paper=False) == -30.0
+        assert se._script_daily_pnl(conn, "s1", "paper", paper=True) == 40.0
 
 
 def test_open_count_scoped_by_mode(fresh_db):
     with db.get_db() as conn:
-        db.insert_crypto15m_position(conn, _pos_row("s1", "T-P", "demo", dry_run=1))
-        db.insert_crypto15m_position(conn, _pos_row("s1", "T-L", "demo", dry_run=0))
-        assert se._count_open_for_script(conn, "s1", "demo", paper=False) == 1
-        assert se._count_open_for_script(conn, "s1", "demo", paper=True) == 1
+        db.insert_crypto15m_position(conn, _pos_row("s1", "T-P", "paper", dry_run=1))
+        db.insert_crypto15m_position(conn, _pos_row("s1", "T-L", "paper", dry_run=0))
+        assert se._count_open_for_script(conn, "s1", "paper", paper=False) == 1
+        assert se._count_open_for_script(conn, "s1", "paper", paper=True) == 1
 
 
 def test_script_live_stats_excludes_paper(fresh_db):
     with db.get_db() as conn:
-        _insert_resolved(conn, "s1", "T-PAPER", "demo", dry_run=1, pnl=40.0)
-        _insert_resolved(conn, "s1", "T-LIVE", "demo", dry_run=0, pnl=-30.0)
-        stats = db.script_live_stats(conn, "demo")
+        _insert_resolved(conn, "s1", "T-PAPER", "paper", dry_run=1, pnl=40.0)
+        _insert_resolved(conn, "s1", "T-LIVE", "paper", dry_run=0, pnl=-30.0)
+        stats = db.script_live_stats(conn, "paper")
         assert stats["s1"]["pnlUsd"] == -30.0
         assert stats["s1"]["n"] == 1
 
 
 
+
 def test_already_attempted_scoped_by_env(fresh_db):
     with db.get_db() as conn:
-        db.insert_crypto15m_position(conn, _pos_row("s1", "T-X", "demo"))
-        assert se._already_attempted(conn, "s1", "T-X", "demo")
+        db.insert_crypto15m_position(conn, _pos_row("s1", "T-X", "paper"))
+        assert se._already_attempted(conn, "s1", "T-X", "paper")
         assert not se._already_attempted(conn, "s1", "T-X", "production")
+
 
 
 MANAGE_SELL = """\
@@ -117,7 +126,7 @@ def manage(pos, ctx):
 
 
 def _filled_live_pos(conn, sid="s1", ticker="KXBTC15M-T1"):
-    pid = db.insert_crypto15m_position(conn, _pos_row(sid, ticker, "demo"))
+    pid = db.insert_crypto15m_position(conn, _pos_row(sid, ticker, "paper"))
     conn.execute(
         "UPDATE crypto15m_positions SET filled_contracts=1, status='filled' "
         "WHERE id=?", (pid,))
@@ -125,6 +134,7 @@ def _filled_live_pos(conn, sid="s1", ticker="KXBTC15M-T1"):
 
 
 def _manage_env(monkeypatch, market):
+    """Stub the quote paths: WS quote returns `market`, REST fetch fails."""
     calls = []
 
     async def _fail_fetch(_t):
@@ -140,6 +150,9 @@ def _manage_env(monkeypatch, market):
 
 
 def test_manage_sell_requires_market_dict(fresh_db, cfg, monkeypatch):
+    """No reachable market quote → NO exit order, even with a snapshot bid.
+    (The old `market is None and bid_cents is None` guard let _place_exit run
+    with market=None, whose orderbook-failure fallback fire-sales at 0.1c.)"""
     with db.get_db() as conn:
         _filled_live_pos(conn)
     calls = _manage_env(monkeypatch, market=None)
@@ -147,7 +160,7 @@ def test_manage_sell_requires_market_dict(fresh_db, cfg, monkeypatch):
     s = {"id": "s1", "enabled": 1}
     assets = {"KXBTC15M-T1": {"ticker": "KXBTC15M-T1", "asset": "BTC",
                               "yesBid": 0.85, "yesAsk": 0.87, "minsLeft": 4.0}}
-    run_async(se._manage_pass(s, mod, cfg, "demo", assets, {}))
+    run_async(se._manage_pass(s, mod, cfg, "paper", assets, {}))
     assert calls == []
 
 
@@ -160,9 +173,10 @@ def test_manage_sell_places_exit_with_market(fresh_db, cfg, monkeypatch):
     s = {"id": "s1", "enabled": 1}
     assets = {"KXBTC15M-T1": {"ticker": "KXBTC15M-T1", "asset": "BTC",
                               "yesBid": 0.85, "yesAsk": 0.87, "minsLeft": 4.0}}
-    run_async(se._manage_pass(s, mod, cfg, "demo", assets, {}))
+    run_async(se._manage_pass(s, mod, cfg, "paper", assets, {}))
     assert len(calls) == 1
     assert calls[0][1] is market and calls[0][2] == "script_exit"
+
 
 
 BUYER = """\
@@ -204,7 +218,7 @@ def _run_tick_env(monkeypatch, *, blocked):
     monkeypatch.setattr(trader, "refresh_balance", _bal)
     monkeypatch.setattr(trader, "_is_blocked_by_daily_risk",
                         lambda _cfg, _env: (blocked, "day stop" if blocked else ""))
-    monkeypatch.setattr(se.kalshi_auth, "get_env", lambda: "demo")
+    monkeypatch.setattr(se.kalshi_auth, "get_env", lambda: "paper")
     row = {"id": "s1", "enabled": 1, "code": BUYER, "trusted": 0,
            "state_json": "{}", "name": "Buyer"}
     monkeypatch.setattr(db, "list_user_scripts", lambda conn: [row])
@@ -227,6 +241,7 @@ def test_entries_flow_when_not_risk_blocked(fresh_db, cfg, monkeypatch):
 
 
 
+
 def _sig():
     return {"id": 7, "ticker": "KXTEST-A", "taker_side": "yes",
             "event_ticker": "KXTEST", "title": "t", "category": "crypto"}
@@ -241,20 +256,23 @@ def _signal_env(monkeypatch, *, post, lookup):
                         lambda m, k: 0.50 if k == "yes_ask" else 0.45)
     monkeypatch.setattr(kalshi_api, "place_limit_order", post)
 
-    async def _lookup(coid, ticker):
+    async def _lookup(coid, ticker, pin_env=None):
         return lookup
 
     monkeypatch.setattr(crypto15m_trader, "_lookup_lost_order", _lookup)
 
 
 def test_signal_follow_books_row_before_post_error(fresh_db, cfg, monkeypatch):
+    """POST raises + coid lookup confirms absence → row exists as resolved
+    error (old code returned None with NO row — a delivered-but-timed-out
+    order would have been live money invisible to every rail)."""
     async def _post(**kw):
         raise RuntimeError("timeout")
 
     _signal_env(monkeypatch, post=_post, lookup=(None, True))
     s = {"id": "s1", "enabled": 1}
     row = run_async(se._place_signal_follow(
-        s, _sig(), "whale", {"action": "follow"}, cfg, "demo"))
+        s, _sig(), "whale", {"action": "follow"}, cfg, "paper"))
     assert row is not None and row["status"] == "error" and row["resolved"] == 1
 
 
@@ -265,7 +283,7 @@ def test_signal_follow_recovers_delivered_order(fresh_db, cfg, monkeypatch):
     _signal_env(monkeypatch, post=_post, lookup=({"order_id": "oX"}, True))
     s = {"id": "s1", "enabled": 1}
     row = run_async(se._place_signal_follow(
-        s, _sig(), "whale", {"action": "follow"}, cfg, "demo"))
+        s, _sig(), "whale", {"action": "follow"}, cfg, "paper"))
     assert row["kalshi_order_id"] == "oX"
     assert row["status"] == "submitted" and not row["resolved"]
 
@@ -277,9 +295,10 @@ def test_signal_follow_success_books_row(fresh_db, cfg, monkeypatch):
     _signal_env(monkeypatch, post=_post, lookup=(None, False))
     s = {"id": "s1", "enabled": 1}
     row = run_async(se._place_signal_follow(
-        s, _sig(), "whale", {"action": "follow"}, cfg, "demo"))
+        s, _sig(), "whale", {"action": "follow"}, cfg, "paper"))
     assert row["kalshi_order_id"] == "o2"
     assert row["script_id"] == "s1"
+
 
 
 COUNTER = """\
@@ -297,21 +316,22 @@ def on_settle(pos, state):
 
 
 def test_lifecycle_primes_without_refiring(fresh_db, monkeypatch):
-    monkeypatch.setattr(se.kalshi_auth, "get_env", lambda: "demo")
+    monkeypatch.setattr(se.kalshi_auth, "get_env", lambda: "paper")
     with db.get_db() as conn:
-        _insert_resolved(conn, "s1", "T-OLD", "demo", dry_run=0, pnl=1.0)
+        _insert_resolved(conn, "s1", "T-OLD", "paper", dry_run=0, pnl=1.0)
         _filled_live_pos(conn, "s1", "T-OPEN")
     mod = se.script_sandbox.CompiledScript("s1", COUNTER, trusted=False)
     se._compiled["s1"] = mod
     scripts = {"s1": {"id": "s1", "enabled": 1}}
-    run_async(se._notify_lifecycle(scripts, "demo"))
+    run_async(se._notify_lifecycle(scripts, "paper"))
     assert mod.state.get("fills") is None and mod.state.get("settles") is None
     with db.get_db() as conn:
-        _insert_resolved(conn, "s1", "T-NEW", "demo", dry_run=0, pnl=2.0)
-    run_async(se._notify_lifecycle(scripts, "demo"))
-    run_async(se._notify_lifecycle(scripts, "demo"))
+        _insert_resolved(conn, "s1", "T-NEW", "paper", dry_run=0, pnl=2.0)
+    run_async(se._notify_lifecycle(scripts, "paper"))
+    run_async(se._notify_lifecycle(scripts, "paper"))
     assert mod.state.get("settles") == 1
     assert mod.state.get("fills") == 1
+
 
 
 
@@ -328,11 +348,15 @@ def _bt_run(monkeypatch, ask, cfg):
         script_backtest.replay, "tick_to_asset",
         lambda t, c, close: {"asset": t.get("asset"), "minsLeft": 2.0,
                              "upAsk": t.get("yes_ask"), "downAsk": None})
-    return script_backtest.run(cfg, BUYER, trusted=False, env="demo",
+    return script_backtest.run(cfg, BUYER, trusted=False, env="paper",
                                since_days=7)
 
 
 def test_backtest_refuses_cap_boundary_ask_like_live(fresh_db, cfg, monkeypatch):
+    """Live submits ask intents at round(ask)+1 and refuses >cap — an ask of
+    96.8c under the default 97c cap is refused live, so the backtest must not
+    show it as a fill (it did: users backtested 97c-favorite scripts into
+    phantom profits)."""
     out = _bt_run(monkeypatch, ask=0.968, cfg=cfg)
     assert out["n"] == 0
     assert any("refused by the safety rails" in c for c in out["caveats"])

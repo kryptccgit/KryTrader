@@ -1,41 +1,37 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
-  AlertTriangle, Bot, CheckCircle2, Copy, Lock, RefreshCw, RotateCcw, ShieldAlert,
-  XCircle,
+  AlertTriangle, Bot, CheckCircle2, Lock, RefreshCw, RotateCcw, ShieldAlert,
+  ShieldCheck, XCircle,
 } from 'lucide-react';
 import type {
-  ForecastScore, ForecastScoreboard, McpActivity, McpClient, McpStatus,
+  ForecastScore, ForecastScoreboard, McpActivity, McpStatus,
   McpTradeMode,
 } from '@shared/market';
+import type { PageId } from '../App';
 import type { TraderConfig } from '@shared/types';
 import {
   Card, ConfirmDialog, Empty, NumberInput, Page, Section, StatCard, Switch,
 } from '../components/common';
 import { Caveat } from '../components/terminal/atoms';
 import { AutopilotPanel } from '../components/AutopilotPanel';
+import { ConnectionsPanel } from '../components/ConnectionsPanel';
+import { HttpApiCard } from '../components/HttpApiCard';
+import { AgentFlow } from '../components/AgentFlow';
+import { GoLivePanel } from '../components/GoLivePanel';
+import { GuideVideoButton } from '../components/GuideVideo';
+import { armedEngines } from '../utils/liveEngines';
+import { agentsLiveOnProduction, backToPaperPatch } from '../utils/goLive';
+import { hubAgentIdentity, tagLabel } from '../utils/agents';
+import { AgentsSection } from '../components/agents/AgentsSection';
+import { liveAgents } from '../utils/goLive';
+import { agentsOf } from '@shared/agents';
 import { useApp } from '../state/AppStateProvider';
 import { usePoll } from '../state/TerminalProvider';
 import { useToast } from '../state/ToastProvider';
 import { cls, fmtCents, fmtNum, fmtTimeShort, fmtUsd } from '../utils/format';
+import { publishActivity } from '../state/activity';
+import { userMessage } from '../utils/errors';
 
-const CLIENTS: { id: McpClient; name: string; where: string }[] = [
-  {
-    id: 'cursor', name: 'Cursor',
-    where: 'Cursor Settings → MCP → Add new MCP server, or merge into ~/.cursor/mcp.json.',
-  },
-  {
-    id: 'claude-code', name: 'Claude Code',
-    where: 'Paste the copied command into a terminal. It registers the server for your user account, in every project.',
-  },
-  {
-    id: 'claude-desktop', name: 'Claude Desktop',
-    where: 'Settings → Developer → Edit Config, merge into claude_desktop_config.json, then fully quit and restart Claude. (Microsoft Store installs read a different copy of that file, under %LOCALAPPDATA%\\Packages\\Claude_…)',
-  },
-  {
-    id: 'codex', name: 'Codex',
-    where: 'Append to ~/.codex/config.toml (once — a second copy is a parse error), then restart Codex.',
-  },
-];
 
 const PERMS: {
   key: keyof TraderConfig; label: string; description: string; danger?: string;
@@ -88,7 +84,7 @@ const VERDICT: Record<ForecastScore['verdict'], { text: string; tone: string }> 
   },
 };
 
-export function AiAgentsPage() {
+export function AiAgentsPage({ onNav }: { onNav?: (p: PageId) => void } = {}) {
   const { config, refresh } = useApp();
   const toast = useToast();
   const [armLive, setArmLive] = useState(false);
@@ -97,27 +93,31 @@ export function AiAgentsPage() {
   const [armPerm, setArmPerm] = useState<(typeof PERMS)[number] | null>(null);
   const [confirmNoApproval, setConfirmNoApproval] = useState(false);
   const [deciding, setDeciding] = useState<number | null>(null);
+  const [goLiveOpen, setGoLiveOpen] = useState(false);
 
   const decide = async (id: number, approve: boolean): Promise<void> => {
     setDeciding(id);
     try {
       const res = await window.krypt.terminal.mcpDecide({ id, approve });
+      publishActivity(() => (res.ok
+        ? { kind: 'agent', mode: 'live', message: res.message, approvalId: id, decision: approve ? 'approved' : 'rejected' }
+        : { kind: 'agent', mode: 'action', message: res.message, approvalId: null, decision: null }));
       if (res.ok) toast.success(res.message); else toast.warn(res.message);
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     } finally {
       setDeciding(null);
       status.reload();
       activity.reload();
     }
   };
-  const [busy, setBusy] = useState<string | null>(null);
 
-  const status = usePoll<McpStatus>(() => window.krypt.terminal.mcpStatus(), 5_000, []);
+  const acctMode = config?.accountMode ?? 'paper';
+  const status = usePoll<McpStatus>(() => window.krypt.terminal.mcpStatus(), 5_000, [acctMode]);
   const activity = usePoll<McpActivity>(
-    () => window.krypt.terminal.mcpActivity({ limit: 100 }), 10_000, []);
+    () => window.krypt.terminal.mcpActivity({ limit: 100 }), 10_000, [acctMode]);
   const board = usePoll<ForecastScoreboard>(
-    () => window.krypt.terminal.aiScoreboard(), 30_000, []);
+    () => window.krypt.terminal.aiScoreboard(), 30_000, [acctMode]);
 
   useEffect(() => window.krypt.terminal.onMcpOrder((d) => {
     toast.push(`AI agent — ${d.message}`,
@@ -132,36 +132,78 @@ export function AiAgentsPage() {
     status.reload();
   };
 
-  const copy = async (client: McpClient, name: string): Promise<void> => {
-    setBusy(client);
-    try {
-      await window.krypt.terminal.mcpCopyConfig({ client });
-      toast.success(`${name} config copied. It contains your agent token — treat it like a password.`);
-      status.reload();
-    } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(null);
-    }
-  };
-
   const s = status.data;
   const mode: McpTradeMode = (config?.mcpTradeMode ?? 'paper') as McpTradeMode;
-  const env = s?.env ?? config?.kalshiEnv ?? 'demo';
+  const env = s?.env ?? (config?.accountMode === 'live' ? 'production' : 'paper');
+  const envLabel = (e?: string | null): string => (
+    e === 'production' ? 'LIVE' : e === 'paper' ? 'PAPER' : e === 'demo' ? 'retired demo' : 'unknown');
+  const liveOnProd = agentsLiveOnProduction(config);
+  const agentArm = armedEngines(config).find((e) => e.id === 'agents') ?? null;
 
   return (
     <Page
       title="AI Agents"
-      subtitle="Let Cursor, Claude or Codex read Kalshi, forecast, and trade — on paper first, inside rails."
+      subtitle="Connect Claude Code, Cursor, Claude Desktop or Codex. Watch it research, let it trade on paper, and let the scoreboard say whether it beats the market."
       actions={
-        <button
-          onClick={() => { status.reload(); activity.reload(); board.reload(); }}
-          className="krypt-btn-default"
-        >
-          <RefreshCw className="h-4 w-4" /> Refresh
-        </button>
+        <div className="flex gap-2">
+          <GuideVideoButton />
+          <button
+            onClick={() => { status.reload(); activity.reload(); board.reload(); }}
+            className="krypt-btn-default"
+          >
+            <RefreshCw className="h-4 w-4" /> Refresh
+          </button>
+          <button
+            onClick={() => setGoLiveOpen(true)}
+            className="krypt-btn-danger"
+            data-qa="golive-open"
+          >
+            <ShieldCheck className="h-4 w-4" /> {liveOnProd ? 'Live setup' : 'Go live'}
+          </button>
+        </div>
       }
     >
+      {liveOnProd && (
+        <div
+          className="mb-4 flex flex-wrap items-center gap-3 rounded-xl border border-krypt-loss/60 bg-krypt-loss/15 px-4 py-3"
+          data-qa="live-bar"
+        >
+          <AlertTriangle className="h-5 w-5 shrink-0 text-krypt-loss" />
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-semibold text-white">LIVE: agents can spend real money</div>
+            <div className="text-[11px] text-white/70">
+              {agentArm
+                ? `${agentArm.label} · up to ${fmtUsd(config?.mcpDailySpendUsd ?? 100)}/day of real money (Live).`
+                : `Set to Live (real money): ${liveAgents(config).map((a) => a.name).join(', ')}. None of them can reach the app right now (the agent server and Autopilot are off); the first one you connect can spend.`}
+            </div>
+          </div>
+          <button
+            onClick={() => void patch(backToPaperPatch())}
+            className="krypt-btn-primary text-xs"
+            data-qa="live-bar-back-to-paper"
+          >
+            Back to paper
+          </button>
+        </div>
+      )}
+
+      <AgentFlow
+        board={board.data}
+        activity={activity.data}
+        mode={mode}
+        clientsSeen={s?.clients ?? []}
+        onAutopilot={() => onNav?.('settings')}
+        onHub={() => onNav?.('visualizer')}
+      />
+
+      <AgentsSection
+        config={config}
+        status={s}
+        board={board.data}
+        activity={activity.data}
+        patch={patch}
+      />
+
       <Card className="mb-4">
         <div className="flex gap-3">
           <ShieldAlert className="mt-0.5 h-5 w-5 shrink-0 text-krypt-warn" />
@@ -202,33 +244,53 @@ export function AiAgentsPage() {
             today&apos;s loss — before anything is sent. Unanswered orders expire after 10 minutes.
           </p>
           <div className="space-y-2">
-            {s.pending.map((o) => (
-              <div key={o.id} className="flex items-center gap-3 rounded-lg border border-krypt-border bg-krypt-surface2 px-3 py-2">
-                <span className="font-mono text-[11px] text-krypt-dim">#{o.id}</span>
-                <span className="font-mono text-xs text-white">
-                  {o.action.toUpperCase()} {o.count} {o.side.toUpperCase()} {o.ticker} @ {fmtCents(o.priceCents)}
-                </span>
-                <span className="text-[11px] text-krypt-muted">
-                  {fmtUsd(o.committedUsd)} · {o.client ?? 'agent'} · {fmtTimeShort(o.at)}
-                </span>
-                <div className="ml-auto flex gap-2">
-                  <button
-                    onClick={() => void decide(o.id, false)}
-                    disabled={deciding === o.id}
-                    className="krypt-btn-default text-xs"
+            {s.pending.map((o) => {
+              const otherEnv = !!o.env && o.env !== env;
+              return (
+                <div key={o.id} className="flex flex-wrap items-center gap-3 rounded-lg border border-krypt-border bg-krypt-surface2 px-3 py-2">
+                  <span className="font-mono text-[11px] text-krypt-dim">#{o.id}</span>
+                  <span
+                    className={cls(
+                      'rounded px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wider',
+                      o.env === 'production'
+                        ? 'bg-krypt-loss/15 text-krypt-loss'
+                        : 'bg-krypt-surface text-krypt-muted',
+                    )}
+                    title={o.env === 'production' ? 'Real money' : 'Paper — imaginary money'}
                   >
-                    Reject
-                  </button>
-                  <button
-                    onClick={() => void decide(o.id, true)}
-                    disabled={deciding === o.id}
-                    className="krypt-btn-danger text-xs"
-                  >
-                    Approve &amp; send
-                  </button>
+                    {envLabel(o.env)}
+                  </span>
+                  <span className="font-mono text-xs text-white">
+                    {o.action.toUpperCase()} {o.count} {o.side.toUpperCase()} {o.ticker} @ {fmtCents(o.priceCents)}
+                  </span>
+                  <span className="text-[11px] text-krypt-muted">
+                    {fmtUsd(o.committedUsd)} · <span className="text-white">{o.agentName ?? 'deleted agent'}</span>
+                    {o.client ? ` via ${o.client}` : ''} · {fmtTimeShort(o.at)}
+                  </span>
+                  {otherEnv && (
+                    <span className="text-[11px] text-krypt-warn">
+                      Queued in {envLabel(o.env)}; the app is now in {envLabel(env)}. It can only be rejected.
+                    </span>
+                  )}
+                  <div className="ml-auto flex gap-2">
+                    <button
+                      onClick={() => void decide(o.id, false)}
+                      disabled={deciding === o.id}
+                      className="krypt-btn-default text-xs"
+                    >
+                      Reject
+                    </button>
+                    <button
+                      onClick={() => void decide(o.id, true)}
+                      disabled={deciding !== null || otherEnv}
+                      className="krypt-btn-danger text-xs"
+                    >
+                      Approve &amp; send ({envLabel(o.env || env)})
+                    </button>
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </Card>
       )}
@@ -258,11 +320,12 @@ export function AiAgentsPage() {
           </div>
           <div className="mt-4 flex flex-wrap items-center gap-3 text-[11px] text-krypt-muted">
             <span>
-              Token: {s?.hasToken ? 'set (encrypted)' : 'created on first enable'}
+              Default agent&apos;s token: {s?.hasToken ? 'set (encrypted)' : 'created on first enable'}.
+              {' '}Each of your agents has its own (Connect on its card).
             </span>
             {s?.hasToken && (
               <button onClick={() => setConfirmRotate(true)} className="krypt-btn-ghost text-xs">
-                <RotateCcw className="h-3.5 w-3.5" /> Rotate token
+                <RotateCcw className="h-3.5 w-3.5" /> Rotate Default&apos;s token
               </button>
             )}
             <span className="ml-auto">
@@ -273,33 +336,16 @@ export function AiAgentsPage() {
         </Card>
       </Section>
 
-      <Section title="Connect a client" description="Copies a ready config to your clipboard. The app never shows the token on screen.">
-        <div className="grid gap-3 md:grid-cols-2">
-          {CLIENTS.map((c) => (
-            <Card key={c.id}>
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <div className="text-sm font-medium text-white">{c.name}</div>
-                  <p className="mt-1 text-[11px] leading-relaxed text-krypt-muted">{c.where}</p>
-                </div>
-                <button
-                  onClick={() => void copy(c.id, c.name)}
-                  disabled={!config?.mcpEnabled || busy === c.id}
-                  className="krypt-btn-default shrink-0"
-                  title={config?.mcpEnabled ? 'Copy config' : 'Enable the server first'}
-                >
-                  <Copy className="h-4 w-4" /> Copy
-                </button>
-              </div>
-            </Card>
-          ))}
-        </div>
-        <p className="mt-2 text-[11px] text-krypt-dim">
-          Then ask the agent something like: &ldquo;Use krypt-trader. Check get_status, look
-          through closing markets, read the rules, and record honest forecasts. Only trade
-          where your edge clears the minimum.&rdquo;
-        </p>
-      </Section>
+      <ConnectionsPanel onNav={onNav} />
+
+      <div className="mb-6">
+        <HttpApiCard config={config} status={s} patch={patch} />
+      </div>
+      <p className="-mt-3 mb-6 text-[11px] text-krypt-dim">
+        Once connected, ask the agent something like: &ldquo;Use krypt-trader. Check get_status, look
+        through closing markets, read the rules, and record honest forecasts. Only trade where your
+        edge clears the minimum.&rdquo;
+      </p>
 
       <Section title="Trading" description="What a connected agent may do with orders.">
         <Card>
@@ -325,15 +371,25 @@ export function AiAgentsPage() {
               </button>
             ))}
           </div>
+          <p className="mt-2 text-[11px] text-krypt-dim">
+            For real money, use <button type="button" onClick={() => setGoLiveOpen(true)} className="text-krypt-purple underline-offset-2 hover:underline">Go live</button>:
+            Kalshi key, your agent&apos;s record, caps, approvals and the account mode, checked on one screen.
+          </p>
           <p className="mt-2 text-[11px] text-krypt-muted">
             {mode === 'off' && 'Agents can read markets and record forecasts. No order tools are offered.'}
             {mode === 'paper' && 'Orders fill immediate-or-cancel against the real book, with imaginary money, and settle on the real outcome.'}
             {mode === 'live' && (
               <span className="text-krypt-loss">
-                Orders spend your real balance on the <span className="font-mono">{env}</span>{' '}
-                environment, through the same path as the desktop ticket.
+                Agents set to live ({liveAgents(config).map((a) => a.name).join(', ') || 'none yet — set one on its card'})
+                {env === 'production'
+                  ? ' spend your real balance, through the same path as the desktop ticket. Every other agent trades paper.'
+                  : ' would spend your real balance, but the app is in Paper, so every agent trades paper until you Go live.'}
               </span>
             )}
+          </p>
+          <p className="mt-1 text-[11px] text-krypt-dim">
+            This is the master switch for all of your agents. The caps below bind them all together;
+            each agent&apos;s own rules can only make them stricter for that agent.
           </p>
           {mode === 'live' && (
             <div className="mt-3">
@@ -368,13 +424,19 @@ export function AiAgentsPage() {
                 onChange={(v) => void patch({ mcpMinEdgeCents: v })} />
             </Rail>
             <Rail label="Daily loss stop"
-              hint={s?.lossToday ? `Down ${fmtUsd(s.lossToday.lossUsd)} today (realised + open losses). Buys stop at the limit; exits never do.` : 'Realised + open losses, per UTC day. Buys stop at the limit; exits never do.'}>
+              hint={s?.lossToday
+                ? `Down ${fmtUsd(s.lossToday.lossUsd)} today (realised + open losses`
+                  + (s.lossToday.unmarkedCostUsd ? `, incl. ${fmtUsd(s.lossToday.unmarkedCostUsd)} of positions with no bid, counted at cost` : '')
+                  + '). '
+                  + (s.lossToday.positionsUnreadable ? 'Your Live positions could not be read just now, so agent buys are paused until they can. ' : '')
+                  + 'Buys stop at the limit; exits never do.'
+                : 'Realised + open losses, per UTC day. Buys stop at the limit; exits never do.'}>
               <NumberInput prefix="$" value={config?.mcpDailyLossUsd ?? 50} min={1}
                 onChange={(v) => void patch({ mcpDailyLossUsd: v })} />
             </Rail>
-            <Rail label="Paper bankroll" hint="Starting cash for the paper book.">
-              <NumberInput prefix="$" value={config?.mcpPaperBankrollUsd ?? 1000} min={10}
-                onChange={(v) => void patch({ mcpPaperBankrollUsd: v })} />
+            <Rail label="Paper bankroll" hint="Starting cash for the one paper account the agents share with the rest of the app (also in Settings → Account).">
+              <NumberInput prefix="$" value={config?.paperBankrollUsd ?? 1000} min={10}
+                onChange={(v) => void patch({ paperBankrollUsd: v })} />
             </Rail>
           </div>
         </Card>
@@ -409,7 +471,7 @@ export function AiAgentsPage() {
             <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-krypt-dim" />
             <div>
               <span className="text-white">Never available to an agent, whatever is switched on:</span>{' '}
-              changing demo ↔ production; your API keys, bot tokens and webhooks; its own
+              switching Paper ↔ Live or refilling the paper bankroll; your API keys, bot tokens and webhooks; its own
               permissions and caps; trusted (un-sandboxed) scripts — an agent reads text other
               people wrote, and a prompt injection that reached &ldquo;run this as trusted&rdquo;
               would be code running next to your Kalshi key; the terminal&apos;s ticket caps; and
@@ -427,8 +489,18 @@ export function AiAgentsPage() {
         data={activity.data}
         error={activity.error}
         onReset={() => setConfirmReset(true)}
+        names={Object.fromEntries(agentsOf(config).map((a) => [a.id, a.name]))}
       />
 
+      {goLiveOpen && (
+        <GoLivePanel
+          board={board.data}
+          paper={activity.data?.paper ?? null}
+          paperByAgent={activity.data?.paperByAgent ?? null}
+          onClose={() => setGoLiveOpen(false)}
+          onNav={onNav}
+        />
+      )}
       <ConfirmDialog
         open={armLive}
         title="Let an AI agent spend real money?"
@@ -438,11 +510,23 @@ export function AiAgentsPage() {
         onConfirm={() => { setArmLive(false); void patch({ mcpTradeMode: 'live' }); }}
         body={
           <div className="space-y-2">
-            <p>
-              Connected agents will be able to place real orders on the{' '}
-              <span className="font-mono text-white">{env}</span> environment without asking
-              you per order — unless your MCP client asks you to approve each tool call.
-            </p>
+            {config?.mcpLiveApproval !== false ? (
+              <p>
+                Connected agents and Autopilot will be able to ask for real orders
+                {env === 'production' ? '' : ' once the app is Live (it is in Paper now)'}. Each live order
+                waits for your approval here (and on your phone, if remote alerts are on) before
+                it is sent, and is re-checked against the market at the moment you approve.
+                Unanswered orders expire after 10 minutes.
+              </p>
+            ) : (
+              <p>
+                Connected agents and Autopilot will be able to place real orders
+                {env === 'production' ? ' ' : ' once the app is Live (it is in Paper now) '}
+                <span className="text-krypt-loss">without asking you per order</span> — you
+                turned &ldquo;Ask me before each live order&rdquo; off. Only your MCP client&apos;s
+                own tool-call prompts, if it has any, stand between an agent and an order.
+              </p>
+            )}
             <p>
               Every buy still needs a forecast that clears your minimum edge after fees, and
               stays inside {fmtUsd(config?.mcpMaxOrderUsd ?? 25)} per order and{' '}
@@ -500,32 +584,32 @@ export function AiAgentsPage() {
       />
       <ConfirmDialog
         open={confirmReset}
-        title="Reset the paper book?"
+        title="Reset the paper account?"
         danger
         confirmLabel="Reset"
         onClose={() => setConfirmReset(false)}
         onConfirm={() => {
           setConfirmReset(false);
           void window.krypt.terminal.mcpPaperReset().then((r) => {
-            toast.success(`Paper book reset (${r.removed} fills removed). Forecasts are kept.`);
+            toast.success('Paper account reset to its starting balance. Forecasts are kept.');
             activity.reload();
           });
         }}
-        body={<p>All paper positions and fills are removed and cash returns to the bankroll. The forecast scoreboard is not touched.</p>}
+        body={<p>There is one paper account for the whole app: every paper position, order and fill — the agents&apos;, the bot&apos;s and your own — is removed and cash returns to the bankroll. Live and the forecast scoreboard are not touched.</p>}
       />
       <ConfirmDialog
         open={confirmRotate}
-        title="Rotate the agent token?"
+        title="Rotate the Default agent's token?"
         confirmLabel="Rotate"
         onClose={() => setConfirmRotate(false)}
         onConfirm={() => {
           setConfirmRotate(false);
-          void window.krypt.terminal.mcpRotateToken().then(() => {
-            toast.success('New token. Re-copy the config into every client you use.');
+          void window.krypt.terminal.mcpRotateToken({ agentId: 'default' }).then(() => {
+            toast.success('New token. Re-copy the Default config into every client that uses it.');
             status.reload();
           });
         }}
-        body={<p>Every client configured with the current token stops working until you copy the new config into it. Do this if a config file may have leaked.</p>}
+        body={<p>Every client configured as the Default agent stops working until you copy its new config into it. Your other agents keep their own tokens. Do this if a config file may have leaked.</p>}
       />
     </Page>
   );
@@ -574,6 +658,8 @@ function Rail({ label, hint, children }: { label: string; hint?: string; childre
 const brier = (v: number | null): string => (v === null ? '—' : v.toFixed(4));
 
 function Scoreboard({ board, error }: { board: ForecastScoreboard | null; error: string | null }) {
+  const { config } = useApp();
+  const agents = useMemo(() => agentsOf(config), [config]);
   const o = board?.overall;
   return (
     <Section
@@ -688,7 +774,9 @@ function Scoreboard({ board, error }: { board: ForecastScoreboard | null; error:
                       <div className="font-mono text-[11px] text-white/90">{r.ticker}</div>
                       {r.title && <div className="truncate text-[11px] text-krypt-dim">{r.title}</div>}
                     </td>
-                    <td className="krypt-td text-[11px] text-krypt-muted">{r.model ?? r.source}</td>
+                    <td className="krypt-td text-[11px] text-krypt-muted">
+                      {tagLabel(hubAgentIdentity(r, agents))}
+                    </td>
                     <td className="krypt-td text-right font-mono">{fmtCents(r.fairValueCents)}</td>
                     <td className="krypt-td text-right font-mono">{fmtCents(r.marketMidCents)}</td>
                     <td className="krypt-td text-right font-mono">
@@ -707,8 +795,8 @@ function Scoreboard({ board, error }: { board: ForecastScoreboard | null; error:
 }
 
 function PaperAndOrders({
-  data, error, onReset,
-}: { data: McpActivity | null; error: string | null; onReset: () => void }) {
+  data, error, onReset, names,
+}: { data: McpActivity | null; error: string | null; onReset: () => void; names: Record<string, string> }) {
   const paper = data?.paper;
   const unreal = paper?.positions.reduce<number | null>(
     (acc, p) => (acc === null || p.unrealizedUsd === null ? null : acc + p.unrealizedUsd), 0) ?? null;
@@ -751,10 +839,11 @@ function PaperAndOrders({
             </thead>
             <tbody>
               {paper.positions.map((p) => (
-                <tr key={`${p.ticker}-${p.side}`}>
+                <tr key={`${p.agentId ?? ''}-${p.ticker}-${p.side}`}>
                   <td className="krypt-td">
                     <div className="font-mono text-[11px] text-white/90">{p.ticker}</div>
                     {p.title && <div className="truncate text-[11px] text-krypt-dim">{p.title}</div>}
+                    {p.agentId && <div className="text-[10px] text-krypt-purple">{names[p.agentId] ?? 'deleted agent'}</div>}
                   </td>
                   <td className="krypt-td uppercase">{p.side}</td>
                   <td className="krypt-td text-right font-mono">{p.contracts}</td>
@@ -817,7 +906,10 @@ function PaperAndOrders({
                     <span className="font-mono text-[11px] text-white/90">
                       {o.action} {o.count} {o.side.toUpperCase()} {o.ticker} @ {fmtCents(o.priceCents)}
                     </span>
-                    {o.client && <div className="text-[10px] text-krypt-dim">{o.client}</div>}
+                    <div className="text-[10px] text-krypt-dim">
+                      <span className="text-krypt-purple">{o.agentName ?? (o.agentId ? 'deleted agent' : 'agent')}</span>
+                      {o.client ? ` via ${o.client}` : ''}
+                    </div>
                   </td>
                   <td className={cls('krypt-td text-[11px]', o.ok ? 'text-krypt-win' : o.status === 'pending' ? 'text-krypt-purple' : 'text-krypt-warn')}>
                     {o.status && o.status !== 'approved' && (

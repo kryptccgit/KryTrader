@@ -66,6 +66,14 @@ def _fmt_cents(v) -> str:
 
 
 def _describe_url(url: str) -> str:
+    """Enough of a URL to diagnose it, never enough to use it.
+
+    A rejected webhook still has to be identifiable in a log — "we refused
+    something" with no hint of what is not a usable message — so this reports
+    the scheme and host when they parse, and otherwise only how long the string
+    was. A path is NEVER included: for a Discord webhook the path IS the
+    credential, and a URL that failed the allow-list could be anything at all.
+    """
     try:
         p = urlparse((url or "").strip())
     except Exception:

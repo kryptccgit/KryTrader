@@ -1,7 +1,10 @@
 
 import type { TerminalApi } from './market';
+import type { McpAgent } from './agents';
 
-export type KalshiEnv = 'demo' | 'production';
+export type AccountMode = 'paper' | 'live';
+
+export type BookEnv = 'paper' | 'production' | 'demo';
 
 export type OrderStyle = 'limit_cross' | 'limit_mid' | 'market';
 
@@ -16,7 +19,10 @@ export interface RuleCondition {
 
 
 export interface TraderConfig {
-  kalshiEnv: KalshiEnv;
+  accountMode: AccountMode;
+  paperBankrollUsd: number;
+  shardAutoMove?: boolean;
+  shardAutoMoveMaxUsdDay?: number;
   enableTrading: boolean;
   autoUpgradeApiLevel?: boolean;
 
@@ -40,9 +46,6 @@ export interface TraderConfig {
   allowedWhaleCategories: string[] | null;
   allowedMomentumCategories: string[] | null;
   contrarianOnly: boolean;
-
-  gamblingMode: boolean;
-  gamblingTradeProbability: number;
 
   sizingMode: 'percent' | 'fixed';
   fixedTradeUsd: number;
@@ -165,7 +168,7 @@ export interface TraderConfig {
   remoteDiscordUserId?: string;
   remoteTelegramChatId?: string;
 
-  aiProvider?: 'anthropic' | 'openai';
+  aiProvider?: 'anthropic' | 'openai' | 'openrouter' | 'gemini' | 'ollama' | 'lmstudio';
   aiModel?: string;
   aiWebSearch?: boolean;
 
@@ -176,15 +179,17 @@ export interface TraderConfig {
   mcpDailySpendUsd?: number;
   mcpMaxPositions?: number;
   mcpMinEdgeCents?: number;
-  mcpPaperBankrollUsd?: number;
   mcpDailyLossUsd?: number;
   mcpLiveApproval?: boolean;
+  mcpHttpEnabled?: boolean;
   autopilotEnabled?: boolean;
   autopilotIntervalMin?: number;
   autopilotMaxRunsPerDay?: number;
   autopilotDailyTokenBudget?: number;
   autopilotMaxSteps?: number;
   autopilotMission?: string;
+  autopilotAgentId?: string;
+  mcpAgents?: McpAgent[];
   mcpAllowResearch?: boolean;
   mcpAllowScripts?: boolean;
   mcpAllowScriptRun?: boolean;
@@ -201,25 +206,44 @@ export interface TraderConfig {
 }
 
 export interface CredentialsState {
-  env?: 'demo' | 'production';
+  env?: 'production';
   hasApiKey: boolean;
-  /** Kept as `hasRsaKey` for IPC compatibility; true for an RSA or Ed25519 key. */
   hasRsaKey: boolean;
   apiKeyPreview: string;
   fingerprint: string;
-  keyType?: 'rsa' | 'ed25519';
+  keyType?: 'rsa' | 'ed25519' | null;
+}
+
+export interface CredentialDiagnosis {
+  code:
+    | 'key_not_found' | 'bad_key_id' | 'bad_signature' | 'clock_skew'
+    | 'forbidden' | 'rate_limited' | 'kalshi_down' | 'bad_key_file' | 'network'
+    | 'no_credentials' | 'unknown';
+  title: string;
+  fix: string;
+}
+
+export interface CredentialsTestResult extends ActionResult<{ env: 'production'; balanceUsd: number }> {
+  diagnosis?: CredentialDiagnosis;
 }
 
 export interface CredentialsStatusAll {
-  current: 'demo' | 'production';
-  demo: CredentialsState;
+  current: 'paper' | 'production';
   production: CredentialsState;
 }
 
 export interface CredentialsInput {
   apiKey: string;
   rsaPem: string;
-  env?: 'demo' | 'production';
+}
+
+export interface PaperStatus {
+  accountMode: AccountMode;
+  bankrollUsd: number;
+  nextBankrollUsd?: number;
+  cashUsd: number;
+  restingOrders: number;
+  hasKalshiKey: boolean;
 }
 
 
@@ -248,6 +272,8 @@ export interface AppState {
   acceptedDisclaimer: boolean;
   windowBounds: { x: number; y: number; width: number; height: number } | null;
   terminalWatchlist: string[];
+  trayHintShown?: boolean;
+  onboardingSeen?: number;
 }
 
 
@@ -273,8 +299,10 @@ export interface AccountSnapshot {
   totalUsd: number;
   apiTier?: string | null;
   balanceSyncing?: boolean;
+  balanceKnown?: boolean;
   startBankrollUsd: number;
-  bankrollSource?: 'user' | 'auto' | 'live';
+  bankrollSource?: 'user' | 'auto' | 'live' | 'paper';
+  accountMode?: AccountMode;
   roiPct: number;
   realizedPnlUsd: number;
   todayPnlUsd?: number;
@@ -293,7 +321,7 @@ export interface AccountSnapshot {
   openCount: number;
   resolvedCount: number;
   totalOpened: number;
-  byEnv: { demo: AccountByEnv; production: AccountByEnv };
+  byEnv: { paper: AccountByEnv; production: AccountByEnv; demo?: AccountByEnv };
   sessionPnlUsd?: number;
   sessionRoiPct?: number;
   sessionBaselineUsd?: number;
@@ -305,7 +333,7 @@ export interface AccountSnapshot {
 
 export interface BotRun {
   id: number;
-  kalshiEnv: KalshiEnv;
+  kalshiEnv: BookEnv;
   startedAt: string;
   endedAt: string | null;
   startCashUsd: number;
@@ -370,7 +398,7 @@ export interface BotPosition {
     | 'error'
     | 'dry_run';
   confidence: number;
-  edgePts: number;
+  edgePts: number | null;
   signalPriceCents: number;
   resolved: boolean;
   outcomeCorrect: number | null;
@@ -379,7 +407,7 @@ export interface BotPosition {
   markPriceCents: number | null;
   livePnlUsd: number | null;
   balanceBeforeUsd: number | null;
-  kalshiEnv: KalshiEnv;
+  kalshiEnv: BookEnv;
   createdAt: string;
   lastUpdated: string;
   resolvedAt: string | null;
@@ -426,25 +454,6 @@ export interface ActionResult<T = void> {
   ok: boolean;
   message?: string;
   data?: T;
-}
-
-
-export interface StrategyPreset {
-  id: string;
-  name: string;
-  tagline: string;
-  description: string;
-  riskLabel: 'safe' | 'balanced' | 'aggressive' | 'experimental';
-  badge?: 'recommended' | 'new' | 'soon' | null;
-  comingSoon?: boolean;
-  secret?: boolean;
-  backtest?: {
-    netCents: number;
-    t: number;
-    n: number;
-    approx?: boolean;
-  } | null;
-  config: TraderConfig;
 }
 
 
@@ -545,7 +554,7 @@ export interface Crypto15mPosition {
   resolved: boolean;
   dryRun: boolean;
   closeTime: string;
-  kalshiEnv: KalshiEnv;
+  kalshiEnv: BookEnv;
   createdAt: string;
   resolvedAt: string | null;
   error: string | null;
@@ -636,6 +645,7 @@ export interface Crypto15mRunnerStatus {
   mode: Crypto15mRunnerMode;
   enabled: boolean;
   coins: string[];
+  realOrders?: boolean;
   n: number;
   wins: number;
   losses: number;
@@ -670,6 +680,7 @@ export interface Crypto15mBacktest {
   trades: { ticker: string; asset: string; side: string; costCents: number; minsLeft: number | null; won: boolean; pnlUsd: number; at: string }[];
   caveats: string[];
 }
+
 
 export interface UserScriptStats {
   n: number;
@@ -824,6 +835,7 @@ export interface Crypto15mStatus {
   modelCalibration?: { ok: boolean; n: number; rate: number | null; lb: number | null };
   enabled: boolean;
   live: boolean;
+  liveRunners?: number;
   liveArmed: boolean;
   liveSupported: boolean;
   authed: boolean;
@@ -845,7 +857,8 @@ export interface Crypto15mStatus {
     shards: { index: number; name: string; cashUsd: number }[];
     transferUrl: string;
   };
-  env: KalshiEnv;
+  env: BookEnv;
+  paperAccount?: boolean;
   stats: Crypto15mStats;
   open: Crypto15mPosition[];
   recent: Crypto15mPosition[];
@@ -856,11 +869,13 @@ export interface KryptApi {
   app: {
     version: () => Promise<string>;
     openExternal: (url: string) => Promise<void>;
-    showItemInFolder: (filePath: string) => Promise<void>;
+    openUserDataFolder: () => Promise<void>;
     getUserDataPath: () => Promise<string>;
+    quit: () => Promise<ActionResult>;
     getReferralUrl: () => Promise<string>;
     factoryReset: () => Promise<ActionResult<{ deleted: Record<string, number> }>>;
     onDataReset: (cb: (payload: unknown) => void) => () => void;
+    onNavigate?: (cb: (page: string) => void) => () => void;
   };
   state: {
     get: () => Promise<AppState>;
@@ -869,14 +884,12 @@ export interface KryptApi {
     setStartWithWindows: (v: boolean) => Promise<ActionResult>;
     setEnableDiscordRpc: (v: boolean) => Promise<ActionResult>;
     acceptDisclaimer: () => Promise<ActionResult>;
+    markOnboardingSeen: () => Promise<ActionResult>;
   };
   config: {
     get: () => Promise<TraderConfig>;
     update: (patch: Partial<TraderConfig>) => Promise<TraderConfig>;
-    replace: (config: TraderConfig) => Promise<TraderConfig>;
     reset: () => Promise<TraderConfig>;
-    listStrategies: () => Promise<StrategyPreset[]>;
-    applyStrategy: (id: string) => Promise<TraderConfig>;
   };
   profiles: {
     list: () => Promise<Profile[]>;
@@ -893,9 +906,13 @@ export interface KryptApi {
     status: () => Promise<CredentialsState>;
     statusAll: () => Promise<CredentialsStatusAll>;
     save: (input: CredentialsInput) => Promise<ActionResult>;
-    test: (env?: KalshiEnv) => Promise<ActionResult<{ env: KalshiEnv; balanceUsd: number }>>;
-    clear: (env?: KalshiEnv) => Promise<ActionResult>;
+    test: () => Promise<CredentialsTestResult>;
+    clear: () => Promise<ActionResult>;
     onChanged: (cb: (payload: unknown) => void) => () => void;
+  };
+  paper: {
+    status: () => Promise<PaperStatus | null>;
+    reset: () => Promise<ActionResult>;
   };
   backend: {
     info: () => Promise<BackendInfo>;
@@ -923,12 +940,12 @@ export interface KryptApi {
     flatten: () => Promise<ActionResult<{ closed: number }>>;
   };
   data: {
-    account: () => Promise<AccountSnapshot>;
+    account: () => Promise<AccountSnapshot | null>;
     pnlSeries: (sinceHours?: number) => Promise<PnlPoint[]>;
     positions: (filter?: PositionFilter) => Promise<BotPosition[]>;
     signals: (filter?: SignalFilter) => Promise<SignalRow[]>;
     scannerStats: () => Promise<ScannerStats>;
-    botRuns: (env?: KalshiEnv | null, limit?: number) => Promise<BotRunsResponse>;
+    botRuns: (env?: BookEnv | null, limit?: number) => Promise<BotRunsResponse>;
     onAccount: (cb: (snap: AccountSnapshot) => void) => () => void;
     onPosition: (cb: (pos: BotPosition) => void) => () => void;
     onSignal: (cb: (sig: SignalRow) => void) => () => void;
@@ -984,6 +1001,8 @@ export interface KryptApi {
     close: () => void;
     isMaximized: () => Promise<boolean>;
     onMaximizeChange: (cb: (max: boolean) => void) => () => void;
+    isVisible: () => Promise<boolean>;
+    onVisibility: (cb: (visible: boolean) => void) => () => void;
   };
 }
 
@@ -992,6 +1011,7 @@ export interface PositionFilter {
   resolved?: boolean | null;
   signalSource?: SignalSource | null;
   limit?: number;
+  env?: BookEnv | 'all' | null;
 }
 
 export interface SignalFilter {

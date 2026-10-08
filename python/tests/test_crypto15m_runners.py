@@ -1,3 +1,10 @@
+"""Multi-Run: parallel per-coin runners + paper (dry-run) simulation.
+
+Covers the runner-resolution engine (coin ownership, legacy default), the
+config validation of the runner list, and the paper lifecycle (entry rests →
+fills against a live quote → stop-loss / settlement books P&L) — all without a
+single real order.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -22,15 +29,15 @@ def fresh_db(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def env_demo(monkeypatch):
-    monkeypatch.setattr(trader, "get_env", lambda: "demo")
-    return "demo"
+def env_paper(monkeypatch):
+    monkeypatch.setattr(trader, "get_env", lambda: "paper")
+    return "paper"
 
 
 @pytest.fixture
 def cfg():
     c = merge_with_defaults({})
-    c["kalshi_env"] = "demo"
+    c["kalshi_env"] = "paper"
     c["crypto15m_enabled"] = True
     c["crypto15m_entry_style"] = "taker"
     return c
@@ -73,6 +80,7 @@ def _no_real_orders(monkeypatch):
 def runner(rid, coins, mode="paper", enabled=True, config=None):
     return {"id": rid, "name": rid, "coins": coins, "mode": mode,
             "enabled": enabled, "config": config or {}}
+
 
 
 def test_resolve_default_runner_when_none(cfg):
@@ -146,6 +154,7 @@ def test_runner_cfg_overrides_layer_over_base(cfg):
     assert r["cfg"]["crypto15m_enabled"] is True
 
 
+
 def test_validate_runners_sanitizes_and_dedups():
     c = merge_with_defaults({"crypto15m_runners": [
         {"id": "x", "name": "X", "coins": ["btc", "nope"], "mode": "weird", "enabled": True,
@@ -166,6 +175,10 @@ def test_validate_empty_runners_is_none():
 
 
 def test_runner_order_size_override_pins_fixed_under_balance_pct_base():
+    """The reported bug: base sizes by %-of-balance, a runner is set to '1
+    contract', and without pinning the mode the runner inherited balance_pct and
+    over-bought (bought 10/117 instead of 1). order_size is a fixed-mode-only
+    knob, so setting it must pin the runner to fixed."""
     c = merge_with_defaults({
         "crypto15m_sizing_mode": "balance_pct",
         "crypto15m_balance_pct": 0.20,
@@ -185,6 +198,8 @@ def test_runner_order_size_override_pins_fixed_under_balance_pct_base():
 
 
 def test_runner_balance_pct_override_pins_that_mode():
+    """Symmetric: a runner that sets only a per-bet % (a balance_pct-only knob)
+    under a fixed base pins itself to balance_pct."""
     c = merge_with_defaults({
         "crypto15m_sizing_mode": "fixed",
         "crypto15m_runners": [
@@ -196,6 +211,9 @@ def test_runner_balance_pct_override_pins_that_mode():
 
 
 def test_runner_numeric_overrides_are_range_clamped_like_base():
+    """A runner/optimizer-slot override must not bypass the base clamps — the
+    sizing path trusts these numbers directly, so an unclamped order_size would
+    place an arbitrarily large real order."""
     c = merge_with_defaults({"crypto15m_runners": [
         {"id": "r1", "coins": ["BTC"], "mode": "live", "enabled": True,
          "config": {"crypto15m_order_size": 100000,
@@ -208,7 +226,10 @@ def test_runner_numeric_overrides_are_range_clamped_like_base():
     assert override["crypto15m_max_concurrent"] == 50
 
 
-def test_mgmt_snapshot_survives_runner_config_drift(fresh_db, env_demo):
+def test_mgmt_snapshot_survives_runner_config_drift(fresh_db, env_paper):
+    """A position opened with a strict stop-loss / take-profit must keep those
+    rules even after its runner is deleted (so _runner_cfg_for hands back the
+    base cfg with the stop-loss OFF)."""
     open_cfg = merge_with_defaults({
         "crypto15m_stop_loss_pct": 0.15,
         "crypto15m_take_profit_cents": 70,
@@ -219,7 +240,7 @@ def test_mgmt_snapshot_survives_runner_config_drift(fresh_db, env_demo):
             "asset": "BTC", "series": "KXBTC15M", "ticker": "KXBTC15M-T1",
             "side": "up", "direction": "yes", "target_contracts": 1,
             "entry_limit_cents": 90, "client_order_id": "c1",
-            "status": "filled", "kalshi_env": env_demo, "mgmt_config": snap,
+            "status": "filled", "kalshi_env": env_paper, "mgmt_config": snap,
         })
         pos = db.fetch_crypto15m_by_id(conn, pid)
 
@@ -238,6 +259,9 @@ def test_mgmt_snapshot_absent_falls_through_to_live_cfg():
 
 
 def test_runner_cannot_override_account_exposure_cap():
+    """crypto15m_max_total_pct guards the ONE shared bankroll — a per-runner
+    override made the account ceiling whatever the loosest runner said (0 =
+    cap fully disabled). Runner overrides of it are stripped; base wins."""
     c = merge_with_defaults({
         "crypto15m_max_total_pct": 0.10,
         "crypto15m_runners": [
@@ -253,19 +277,23 @@ def test_runner_cannot_override_account_exposure_cap():
     assert rcfg["crypto15m_max_total_pct"] == 0.10
 
 
-def test_exposure_cap_blocks_live_entry_when_balance_unreadable(fresh_db, env_demo):
+def test_exposure_cap_blocks_live_entry_when_balance_unreadable(fresh_db, env_paper):
+    """Fail-safe: cap armed but bankroll unreadable (balance 0) → the cap math
+    can't run, so LIVE entries are blocked rather than silently uncapped.
+    Paper entries still open (simulated money; unauthed users have no balance)."""
     cfg = merge_with_defaults({})
     cfg["crypto15m_enabled"] = True
     cfg["crypto15m_entry_style"] = "taker"
     assert cfg["crypto15m_max_total_pct"] > 0
     a = signal_asset("BTC")
-    live = run_async(ct._open_entry(a, cfg, "demo", 0.0, paper=False))
+    live = run_async(ct._open_entry(a, cfg, "paper", 0.0, paper=False))
     assert live is None
-    paper = run_async(ct._open_entry(a, cfg, "demo", 0.0, paper=True))
+    paper = run_async(ct._open_entry(a, cfg, "paper", 0.0, paper=True))
     assert paper is not None and paper["dry_run"] == 1
 
 
 def test_runner_explicit_sizing_mode_is_respected():
+    """An explicit per-runner mode wins — the safety net never overrides it."""
     c = merge_with_defaults({
         "crypto15m_runners": [
             {"id": "r1", "coins": ["BTC"], "mode": "live", "enabled": True,
@@ -276,11 +304,12 @@ def test_runner_explicit_sizing_mode_is_respected():
     assert c["crypto15m_runners"][0]["config"]["crypto15m_sizing_mode"] == "balance_pct"
 
 
+
 def _insert_pos(conn, **over):
     row = dict(asset="BTC", series="KXBTC15M", ticker="KXBTC15M-X", side="up",
                direction="yes", target_contracts=1, filled_contracts=1,
                entry_limit_cents=87, avg_entry_cents=87, cost_usd=0.87,
-               status="filled", kalshi_env="demo", dry_run=0,
+               status="filled", kalshi_env="paper", dry_run=0,
                client_order_id="x1")
     row.update(over)
     return db.insert_crypto15m_position(conn, row)
@@ -290,7 +319,9 @@ def _iso_min_ago(mins):
     return (datetime.now(timezone.utc) - timedelta(minutes=mins)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def test_sweep_settles_other_envs_closed_position(fresh_db, env_demo, monkeypatch):
+def test_sweep_settles_other_envs_closed_position(fresh_db, env_paper, monkeypatch):
+    """A CLOSED position in PRODUCTION while the app is in PAPER must still be
+    settled — otherwise an env switch strands it (never booked, slot leaked)."""
     with db.get_db() as conn:
         pid = _insert_pos(conn, kalshi_env="production", ticker="KXBTC15M-P",
                           close_time=_iso_min_ago(2), client_order_id="p1")
@@ -300,14 +331,18 @@ def test_sweep_settles_other_envs_closed_position(fresh_db, env_demo, monkeypatc
                 "yes_bid_dollars": 1.0, "yes_ask_dollars": 1.0}
     monkeypatch.setattr(kalshi_api, "fetch_market", _settled)
 
-    run_async(ct._sweep_other_envs_and_reap("demo"))
+    run_async(ct._sweep_other_envs_and_reap("paper"))
     with db.get_db() as conn:
         row = db.fetch_crypto15m_by_id(conn, pid)
     assert row["resolved"] == 1 and row["status"] == "settled"
     assert row["pnl_usd"] > 0
 
 
-def test_sweep_settles_other_envs_exiting_row_with_env_pinned_order_calls(fresh_db, env_demo, monkeypatch):
+def test_sweep_settles_other_envs_exiting_row_with_env_pinned_order_calls(fresh_db, env_paper, monkeypatch):
+    """Regression: the cross-env sweep settles an EXITING row from the other
+    env by pinning the exit-order cancel/re-read to the ROW's env. Signed with
+    the active env those calls 404 forever and the row was eventually reaped
+    to 'error' despite being cleanly settleable."""
     with db.get_db() as conn:
         pid = _insert_pos(conn, kalshi_env="production", ticker="KXBTC15M-XE",
                           status="exiting", close_time=_iso_min_ago(2),
@@ -323,6 +358,7 @@ def test_sweep_settles_other_envs_exiting_row_with_env_pinned_order_calls(fresh_
 
     async def _cancel(_kid, *, ticker=None, pin_env=None):
         pins["cancel"] = pin_env
+        pins["cancel_ticker"] = ticker
 
     async def _get(_kid, *, pin_env=None):
         pins["get"] = pin_env
@@ -332,8 +368,9 @@ def test_sweep_settles_other_envs_exiting_row_with_env_pinned_order_calls(fresh_
     monkeypatch.setattr(kalshi_api, "cancel_order", _cancel)
     monkeypatch.setattr(kalshi_api, "get_order", _get)
 
-    run_async(ct._sweep_other_envs_and_reap("demo"))
+    run_async(ct._sweep_other_envs_and_reap("paper"))
     assert pins["cancel"] == "production"
+    assert pins["cancel_ticker"]
     assert pins["get"] == "production"
     with db.get_db() as conn:
         row = db.fetch_crypto15m_by_id(conn, pid)
@@ -341,7 +378,9 @@ def test_sweep_settles_other_envs_exiting_row_with_env_pinned_order_calls(fresh_
     assert row["pnl_usd"] > 0
 
 
-def test_sweep_reaps_stuck_filled_as_error_without_guessing_pnl(fresh_db, env_demo, monkeypatch):
+def test_sweep_reaps_stuck_filled_as_error_without_guessing_pnl(fresh_db, env_paper, monkeypatch):
+    """A filled row >1h past close that can't be settled is reaped to 'error'
+    (frees the slot); PnL is left NULL for manual review, never guessed."""
     with db.get_db() as conn:
         pid = _insert_pos(conn, close_time=_iso_min_ago(75), client_order_id="s1")
 
@@ -349,24 +388,25 @@ def test_sweep_reaps_stuck_filled_as_error_without_guessing_pnl(fresh_db, env_de
         return {"status": "open", "result": ""}
     monkeypatch.setattr(kalshi_api, "fetch_market", _unsettleable)
 
-    run_async(ct._sweep_other_envs_and_reap("demo"))
+    run_async(ct._sweep_other_envs_and_reap("paper"))
     with db.get_db() as conn:
         row = db.fetch_crypto15m_by_id(conn, pid)
     assert row["resolved"] == 1 and row["status"] == "error"
     assert row["pnl_usd"] is None
 
 
-def test_sweep_reaps_stuck_unfilled_as_canceled(fresh_db, env_demo, monkeypatch):
+def test_sweep_reaps_stuck_unfilled_as_canceled(fresh_db, env_paper, monkeypatch):
     with db.get_db() as conn:
         pid = _insert_pos(conn, status="submitted", filled_contracts=0, dry_run=1,
                           close_time=_iso_min_ago(75), client_order_id="u1")
-    run_async(ct._sweep_other_envs_and_reap("demo"))
+    run_async(ct._sweep_other_envs_and_reap("paper"))
     with db.get_db() as conn:
         row = db.fetch_crypto15m_by_id(conn, pid)
     assert row["resolved"] == 1 and row["status"] == "canceled"
 
 
-def test_sweep_leaves_not_yet_closed_positions_alone(fresh_db, env_demo, monkeypatch):
+def test_sweep_leaves_not_yet_closed_positions_alone(fresh_db, env_paper, monkeypatch):
+    """A position whose window hasn't closed is neither settled nor reaped."""
     with db.get_db() as conn:
         pid = _insert_pos(conn, kalshi_env="production", ticker="KXBTC15M-F",
                           close_time=(datetime.now(timezone.utc) + timedelta(minutes=5))
@@ -376,26 +416,27 @@ def test_sweep_leaves_not_yet_closed_positions_alone(fresh_db, env_demo, monkeyp
         raise AssertionError("must not fetch/settle a still-open window")
     monkeypatch.setattr(kalshi_api, "fetch_market", _boom)
 
-    run_async(ct._sweep_other_envs_and_reap("demo"))
+    run_async(ct._sweep_other_envs_and_reap("paper"))
     with db.get_db() as conn:
         row = db.fetch_crypto15m_by_id(conn, pid)
     assert row["resolved"] == 0 and row["status"] == "filled"
 
 
-def test_paper_runner_opens_dry_run_row(fresh_db, env_demo, cfg, monkeypatch):
+
+def test_paper_runner_opens_dry_run_row(fresh_db, env_paper, cfg, monkeypatch):
     _no_real_orders(monkeypatch)
     cfg["crypto15m_runners"] = [runner("r1", ["BTC"])]
     monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset("BTC")]))
     run_async(ct.run_tick(cfg, authed=False))
     with db.get_db() as conn:
-        rows = db.get_open_crypto15m(conn, "demo")
+        rows = db.get_open_crypto15m(conn, "paper")
     assert len(rows) == 1
     assert rows[0]["dry_run"] == 1
     assert rows[0]["runner_id"] == "r1"
     assert rows[0]["status"] == "submitted"
 
 
-def test_paper_fill_then_settlement_books_pnl(fresh_db, env_demo, cfg, monkeypatch):
+def test_paper_fill_then_settlement_books_pnl(fresh_db, env_paper, cfg, monkeypatch):
     _no_real_orders(monkeypatch)
     cfg["crypto15m_runners"] = [runner("r1", ["BTC"])]
     monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset("BTC")]))
@@ -407,7 +448,7 @@ def test_paper_fill_then_settlement_books_pnl(fresh_db, env_demo, cfg, monkeypat
     monkeypatch.setattr(kalshi_api, "fetch_market", _quote)
     run_async(ct.run_tick(cfg, authed=False))
     with db.get_db() as conn:
-        row = db.get_open_crypto15m(conn, "demo")[0]
+        row = db.get_open_crypto15m(conn, "paper")[0]
     assert row["status"] == "filled"
     assert row["filled_contracts"] == 1
     assert row["cost_usd"] > 0
@@ -430,13 +471,13 @@ def test_paper_fill_then_settlement_books_pnl(fresh_db, env_demo, cfg, monkeypat
     assert settled["pnl_usd"] > 0
 
 
-def test_paper_stop_loss_exits_on_price_drop(fresh_db, env_demo, cfg, monkeypatch):
+def test_paper_stop_loss_exits_on_price_drop(fresh_db, env_paper, cfg, monkeypatch):
     _no_real_orders(monkeypatch)
     cfg["crypto15m_runners"] = [runner("r1", ["BTC"], config={"crypto15m_stop_loss_pct": 0.20})]
     monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset("BTC")]))
     run_async(ct.run_tick(cfg, authed=False))
     with db.get_db() as conn:
-        rid = db.get_open_crypto15m(conn, "demo")[0]["id"]
+        rid = db.get_open_crypto15m(conn, "paper")[0]["id"]
 
     async def _fill(_ticker):
         return {"yes_bid_dollars": 0.85, "yes_ask_dollars": 0.87}
@@ -454,7 +495,7 @@ def test_paper_stop_loss_exits_on_price_drop(fresh_db, env_demo, cfg, monkeypatc
     assert row["pnl_usd"] < 0
 
 
-def test_two_paper_runners_trade_different_coins_in_parallel(fresh_db, env_demo, cfg, monkeypatch):
+def test_two_paper_runners_trade_different_coins_in_parallel(fresh_db, env_paper, cfg, monkeypatch):
     _no_real_orders(monkeypatch)
     cfg["crypto15m_runners"] = [
         runner("btc", ["BTC"], config={"crypto15m_take_profit_cents": 95}),
@@ -464,41 +505,113 @@ def test_two_paper_runners_trade_different_coins_in_parallel(fresh_db, env_demo,
                         _stub_snapshot([signal_asset("BTC"), signal_asset("ETH")]))
     run_async(ct.run_tick(cfg, authed=False))
     with db.get_db() as conn:
-        rows = {r["asset"]: r for r in db.get_open_crypto15m(conn, "demo")}
+        rows = {r["asset"]: r for r in db.get_open_crypto15m(conn, "paper")}
     assert set(rows) == {"BTC", "ETH"}
     assert rows["BTC"]["runner_id"] == "btc"
     assert rows["ETH"]["runner_id"] == "eth"
 
 
-def test_runner_stats_split_paper_and_live(fresh_db, env_demo, cfg):
+def test_runner_stats_split_paper_and_live(fresh_db, env_paper, cfg):
     with db.get_db() as conn:
         for i, pnl in enumerate((1.5, -0.5)):
             pid = db.insert_crypto15m_position(conn, {
                 "asset": "BTC", "series": "KXBTC15M", "ticker": f"T{i}",
                 "side": "up", "direction": "yes", "target_contracts": 1,
                 "entry_limit_cents": 80, "client_order_id": f"c{i}",
-                "status": "settled", "kalshi_env": "demo", "dry_run": True,
+                "status": "settled", "kalshi_env": "paper", "dry_run": True,
                 "runner_id": "r1",
             })
             db.update_crypto15m_position(conn, pid, resolved=1, filled_contracts=1,
                                          pnl_usd=pnl)
-        stats = db.crypto15m_runner_stats(conn, "demo")
+        stats = db.crypto15m_runner_stats(conn, "paper")
     paper = [s for s in stats if s["runner_id"] == "r1" and s["mode"] == "paper"]
     assert len(paper) == 1
     assert paper[0]["n"] == 2 and paper[0]["wins"] == 1
 
 
-def test_history_excludes_paper_unless_requested(fresh_db, env_demo):
+def test_history_excludes_paper_unless_requested(fresh_db, env_paper):
     with db.get_db() as conn:
         for i, dry in enumerate((True, False)):
             pid = db.insert_crypto15m_position(conn, {
                 "asset": "BTC", "series": "KXBTC15M", "ticker": f"T{i}",
                 "side": "up", "direction": "yes", "target_contracts": 1,
                 "entry_limit_cents": 80, "client_order_id": f"c{i}",
-                "status": "settled", "kalshi_env": "demo", "dry_run": dry,
+                "status": "settled", "kalshi_env": "paper", "dry_run": dry,
             })
             db.update_crypto15m_position(conn, pid, resolved=1, filled_contracts=1, pnl_usd=0.1)
-        real_only = db.recent_crypto15m_resolved(conn, "demo")
-        with_paper = db.recent_crypto15m_resolved(conn, "demo", include_paper=True)
+        real_only = db.recent_crypto15m_resolved(conn, "paper")
+        with_paper = db.recent_crypto15m_resolved(conn, "paper", include_paper=True)
     assert len(real_only) == 1 and all(not r["dry_run"] for r in real_only)
     assert len(with_paper) == 2
+
+
+
+@pytest.fixture
+def env_prod(monkeypatch):
+    monkeypatch.setattr(trader, "get_env", lambda: "production")
+    return "production"
+
+
+def _capture_orders(monkeypatch):
+    calls = []
+
+    async def _place(**kw):
+        calls.append(kw)
+        return {"order": {"order_id": f"ord-{len(calls)}", "status": "resting"}}
+    monkeypatch.setattr(kalshi_api, "place_limit_order", _place)
+    return calls
+
+
+def _prod(cfg, live):
+    cfg["kalshi_env"] = "production"
+    cfg["crypto15m_live"] = live
+    cfg["start_bankroll_usd"] = 1000.0
+    return cfg
+
+
+def test_master_off_means_no_live_runner_order(fresh_db, env_prod, cfg, monkeypatch):
+    _prod(cfg, live=False)
+    cfg["crypto15m_runners"] = [runner("r1", ["BTC"], mode="live")]
+    monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset("BTC")]))
+    calls = _capture_orders(monkeypatch)
+    run_async(ct.run_tick(cfg, authed=True))
+    assert calls == []
+    with db.get_db() as conn:
+        assert db.get_open_crypto15m(conn, "production") == []
+    assert "LIVE" in ct._block_reasons.get("BTC", "")
+
+    st = run_async(ct.status(cfg, authed=True))
+    assert st["live"] is False and st["liveRunners"] == 0
+    assert [r["realOrders"] for r in st["runners"]] == [False]
+
+
+def test_a_runner_cannot_arm_itself_through_its_own_config(fresh_db, env_prod, cfg, monkeypatch):
+    _prod(cfg, live=False)
+    cfg["crypto15m_runners"] = [runner("r1", ["BTC"], mode="live",
+                                       config={"crypto15m_live": True})]
+    monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset("BTC")]))
+    calls = _capture_orders(monkeypatch)
+    run_async(ct.run_tick(cfg, authed=True))
+    assert calls == []
+
+
+def test_master_on_lets_a_live_runner_trade_and_says_so(fresh_db, env_prod, cfg, monkeypatch):
+    _prod(cfg, live=True)
+    cfg["crypto15m_runners"] = [runner("r1", ["BTC"], mode="live"),
+                                runner("p1", ["ETH"], mode="paper")]
+    monkeypatch.setattr(crypto15m, "snapshot",
+                        _stub_snapshot([signal_asset("BTC"), signal_asset("ETH")]))
+    calls = _capture_orders(monkeypatch)
+    run_async(ct.run_tick(cfg, authed=True))
+    assert [c["ticker"] for c in calls] == ["KXBTC15M-T1"]
+
+    st = run_async(ct.status(cfg, authed=True))
+    assert st["live"] is True and st["liveRunners"] == 1
+    assert {r["id"]: r["realOrders"] for r in st["runners"]} == {"r1": True, "p1": False}
+
+
+def test_armed_with_only_paper_runners_is_not_live(fresh_db, env_prod, cfg, monkeypatch):
+    _prod(cfg, live=True)
+    cfg["crypto15m_runners"] = [runner("p1", ["BTC"], mode="paper")]
+    st = run_async(ct.status(cfg, authed=True))
+    assert st["liveArmed"] is True and st["live"] is False and st["liveRunners"] == 0

@@ -2,7 +2,7 @@ import { filterAgentConfigPatch } from './system/sanitize';
 import { app, BrowserWindow, Menu, Notification, screen, session, shell } from 'electron';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { appendLog, broadcastState, registerIpc } from './ipc';
+import { appendLog, broadcastState, onStateBroadcast, registerIpc } from './ipc';
 import { setStartWithWindows } from './system/autostart';
 import { startDiscordRpc, stopDiscordRpc } from './system/discord';
 import { pythonBackend } from './system/python-backend';
@@ -10,6 +10,7 @@ import { runVersionMaintenance, sleepSync, takeOverOtherInstances } from './syst
 import { getReferralUrl } from './system/referrals';
 import * as store from './system/settings-store';
 import { destroyTray, installTray, rebuild as rebuildTray } from './system/tray';
+import { TRAY_HINT, trayTradingAction } from './system/tray-logic';
 
 process.env.DIST_ELECTRON = __dirname;
 process.env.DIST = join(__dirname, '..', 'dist');
@@ -130,10 +131,19 @@ function createMainWindow(): BrowserWindow {
   mainWindow.on('show', focusContents);
   mainWindow.on('focus', focusContents);
 
+  const sendVisibility = (visible: boolean) => (): void => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('window:visibility', visible);
+  };
+  mainWindow.on('minimize', sendVisibility(false));
+  mainWindow.on('hide', sendVisibility(false));
+  mainWindow.on('restore', sendVisibility(true));
+  mainWindow.on('show', sendVisibility(true));
+
   mainWindow.on('close', (e) => {
     if (!quitting) {
       e.preventDefault();
       mainWindow?.hide();
+      showTrayHintOnce();
     }
   });
 
@@ -205,15 +215,7 @@ async function bootstrap(): Promise<void> {
         w.webContents.send('backend:info', info);
       }
     }
-    rebuildTray({
-      openWindow: () => createMainWindow(),
-      toggleTrading: toggleTradingFromTray,
-      isTrading: () => store.get().config.enableTrading,
-      quit: () => {
-        quitting = true;
-        app.quit();
-      },
-    });
+    rebuildTray(trayHandlers());
   });
 
   pythonBackend.onEvent((name, data) => {
@@ -232,7 +234,7 @@ async function bootstrap(): Promise<void> {
           broadcastState(next);
           void pythonBackend
             .request('setConfig', { config: next.config })
-            .catch(() => {  });
+            .catch(() => {});
         }
       } catch {
       }
@@ -246,7 +248,7 @@ async function bootstrap(): Promise<void> {
           broadcastState(next);
           void pythonBackend
             .request('setConfig', { config: next.config })
-            .catch(() => {  });
+            .catch(() => {});
         }
       } catch {
       }
@@ -259,7 +261,7 @@ async function bootstrap(): Promise<void> {
           broadcastState(next);
           void pythonBackend
             .request('setConfig', { config: next.config })
-            .catch(() => {  });
+            .catch(() => {});
         }
       } catch {
       }
@@ -284,6 +286,8 @@ async function bootstrap(): Promise<void> {
         w.webContents.send('terminal:rule', data);
       } else if (name === 'mcp:order') {
         w.webContents.send('mcp:order', data);
+      } else if (name === 'mcp:toolCall') {
+        w.webContents.send('mcp:toolCall', data);
       } else if (name === 'backend:authChanged' || name === 'backend:reconciled' || name === 'backend:ready' || name === 'backend:shutdown') {
       }
     }
@@ -311,15 +315,8 @@ async function bootstrap(): Promise<void> {
 
   void startDiscordRpc();
 
-  installTray({
-    openWindow: () => createMainWindow(),
-    toggleTrading: toggleTradingFromTray,
-    isTrading: () => store.get().config.enableTrading,
-    quit: () => {
-      quitting = true;
-      app.quit();
-    },
-  });
+  installTray(trayHandlers());
+  onStateBroadcast(() => rebuildTray(trayHandlers()));
 
   if (app.isPackaged) {
     setStartWithWindows(state.startWithWindows);
@@ -340,8 +337,39 @@ async function bootstrap(): Promise<void> {
   }
 }
 
+function trayHandlers() {
+  return {
+    openWindow: () => { createMainWindow(); },
+    toggleTrading: toggleTradingFromTray,
+    isTrading: () => store.get().config.enableTrading,
+    isLive: () => store.get().config.accountMode === 'live',
+    quit: () => {
+      quitting = true;
+      app.quit();
+    },
+  };
+}
+
+function showTrayHintOnce(): void {
+  try {
+    const cur = store.get();
+    if (cur.trayHintShown) return;
+    store.save({ ...cur, trayHintShown: true });
+    if (Notification.isSupported()) {
+      new Notification({ title: TRAY_HINT.title, body: TRAY_HINT.body }).show();
+    }
+  } catch {}
+}
+
 async function toggleTradingFromTray(): Promise<void> {
   const cur = store.get();
+  if (trayTradingAction(cur.config.enableTrading, cur.config.accountMode === 'live') === 'open') {
+    const w = createMainWindow();
+    const go = (): void => { if (!w.isDestroyed()) w.webContents.send('app:navigate', 'dashboard'); };
+    if (w.webContents.isLoading()) w.webContents.once('did-finish-load', go);
+    else go();
+    return;
+  }
   const next = store.patchConfig({ enableTrading: !cur.config.enableTrading });
   broadcastState(next);
   if (pythonBackend.isRunning()) {
@@ -361,15 +389,7 @@ async function toggleTradingFromTray(): Promise<void> {
       }
     }
   }
-  rebuildTray({
-    openWindow: () => createMainWindow(),
-    toggleTrading: toggleTradingFromTray,
-    isTrading: () => store.get().config.enableTrading,
-    quit: () => {
-      quitting = true;
-      app.quit();
-    },
-  });
+  rebuildTray(trayHandlers());
 }
 
 app.on('activate', () => {

@@ -1,3 +1,15 @@
+"""LIVE check for the remote transports. Run by hand.
+
+Unit tests pin our logic with the network stubbed; this pins the transports'
+real behaviour — that the endpoints exist, that a bad token is REJECTED rather
+than silently hanging (a bot that looks like it is connecting forever is the
+worst failure mode here), and that the RPC surface works over the actual wire.
+
+With no tokens configured it still runs: the reachability and bad-token checks
+are the point, and they need no credentials.
+
+    python/.venv/Scripts/python.exe python/live_remote_check.py
+"""
 from __future__ import annotations
 
 import asyncio
@@ -57,6 +69,7 @@ async def transports() -> None:
 
 
 def rpc_surface() -> None:
+    """Drive the real backend over stdio and exercise the remote RPCs."""
     print("\n=== backend RPC surface ===")
     userdata = Path(os.environ.get("TEMP", ".")) / "krypt-remote-check"
     env = dict(os.environ)

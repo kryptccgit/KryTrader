@@ -6,25 +6,48 @@ import type {
   ActionResult,
   AppState,
   BotPosition,
+  CredentialDiagnosis,
   CredentialsInput,
   CredentialsState,
+  CredentialsTestResult,
   PositionFilter,
   Profile,
   ProfileKind,
   RuleCondition,
   SignalFilter,
-  StrategyPreset,
   TraderConfig,
 } from '../shared/types';
 import { setStartWithWindows } from './system/autostart';
 import { pythonBackend } from './system/python-backend';
 import { getReferralUrl } from './system/referrals';
 import * as store from './system/settings-store';
-import { findStrategy, listStrategies } from './system/strategies';
+import { migrateConfig } from './system/legacy-settings';
 import {
-  CANDLE_INTERVALS, cleanFilters, cleanTicker, cleanTicket, clampInt,
-  DISCOVER_COLUMNS, nextWatchlist,
+  CANDLE_INTERVALS, cleanAiKeyProvider, cleanAiProvider, cleanApiKey, cleanFilters,
+  cleanAgentIdArg, cleanConfigPatch,
+  cleanHealthArgs, cleanTicker, cleanTicket, clampInt, DISCOVER_COLUMNS, isPersonalKey,
+  nextWatchlist, omitForShare, blankWebhooks, profileExportJson,
+  MAIN_EXCLUDE, isCrypto15mKey, cleanPositionFilter, cleanSignalFilter, cleanBotRunsArgs,
+  cleanSinceHours, cleanBacktestArgs, cleanC15HistoryArgs, cleanScriptId, cleanScriptCode,
+  cleanScriptSave, cleanScriptBacktestArgs, cleanTurbineLibraryArgs, cleanOptimizeArgs,
+  cleanMarketUrlArgs, removedAgentIds,
 } from './system/sanitize';
+import {
+  codexConfigDir, existingClaudeDesktopDirs, installClaudeDesktop, installCodex, type PathEnv,
+} from './system/agent-config';
+import { checkKalshiKeys } from '../shared/kalshiKeys';
+import { encodeRpcError } from '../shared/errors';
+import { ONBOARDING_REVISION } from '../shared/onboarding';
+
+function backendDownText(what: string): string {
+  return `The trading engine isn't running, so the app can't ${what} right now. `
+    + 'Press Restart in the top bar. If it keeps stopping, Logs → Copy diagnostics shows why.';
+}
+
+const NOT_RUNNING = "The trading engine isn't running. Press Restart in the top bar, then try again.";
+
+let configKeySet: Set<string> | null = null;
+const configKeys = (): Set<string> => (configKeySet ??= new Set(Object.keys(store.DEFAULT_CONFIG)));
 
 
 const ok = <T>(data?: T, message?: string): ActionResult<T> => ({
@@ -34,15 +57,9 @@ const ok = <T>(data?: T, message?: string): ActionResult<T> => ({
 });
 const err = (message: string): ActionResult => ({ ok: false, message });
 
-const MAIN_EXCLUDE = new Set([
-  'kalshiEnv', 'enableTrading',
-  'eventWebhookUrl', 'statsWebhookUrl', 'whaleWebhookUrl', 'momentumWebhookUrl',
-]);
 const CRYPTO_ARM_EXCLUDE = new Set(['crypto15mEnabled', 'crypto15mLive', 'crypto15mRunners']);
 
-const PRESET_ONLY = new Set(['allowedWhaleCategories', 'allowedMomentumCategories']);
-
-const isCrypto15mKey = (k: string): boolean => k.startsWith('crypto15m');
+const HIDDEN_SOURCE_FILTERS = new Set(['allowedWhaleCategories', 'allowedMomentumCategories']);
 
 function profileSlice(config: TraderConfig, kind: ProfileKind): Partial<TraderConfig> {
   const out: Record<string, unknown> = {};
@@ -50,35 +67,11 @@ function profileSlice(config: TraderConfig, kind: ProfileKind): Partial<TraderCo
     const crypto = isCrypto15mKey(k);
     if (kind === 'crypto15m') {
       if (crypto && !CRYPTO_ARM_EXCLUDE.has(k)) out[k] = v;
-    } else if (!crypto && !MAIN_EXCLUDE.has(k) && !PRESET_ONLY.has(k)) {
+    } else if (!crypto && !MAIN_EXCLUDE.has(k) && !HIDDEN_SOURCE_FILTERS.has(k) && !isPersonalKey(k)) {
       out[k] = v;
     }
   }
   return out as Partial<TraderConfig>;
-}
-
-const STRATEGY_PRESERVE: string[] = [
-  ...MAIN_EXCLUDE,
-  'enableDiscord', 'statsPushInterval', 'statsChartWindowHours',
-  'startBankrollUsd', 'stopLossOnDay', 'stopLossOnDayPct', 'takeProfitOnDay',
-  'tradingHoursEnabled', 'tradingHoursStart', 'tradingHoursEnd',
-  'tradingDays', 'tradingTimezoneOffsetMin',
-  'tradeScanInterval', 'positionPollInterval', 'balancePollInterval',
-  'resolutionCheckInterval', 'whaleScanInterval', 'momentumScanInterval',
-  'marketRefreshInterval',
-];
-
-function applyStrategyPreset(s: StrategyPreset): AppState {
-  const curCfg = store.get().config;
-  const preserved: Record<string, unknown> = {};
-  for (const k of STRATEGY_PRESERVE) preserved[k] = (curCfg as unknown as Record<string, unknown>)[k];
-  return store.replaceConfig({
-    ...s.config,
-    ...profileSlice(curCfg, 'crypto15m'),
-    crypto15mEnabled: curCfg.crypto15mEnabled,
-    crypto15mLive: curCfg.crypto15mLive,
-    ...preserved,
-  } as TraderConfig);
 }
 
 function sanitizeImportedConfig(raw: unknown): Partial<TraderConfig> {
@@ -158,7 +151,15 @@ function clearActiveMarkersForPatch(patch: Partial<TraderConfig>): void {
   if (changed) store.save(next);
 }
 
+const stateListeners: ((s: AppState) => void)[] = [];
+export function onStateBroadcast(cb: (s: AppState) => void): void {
+  stateListeners.push(cb);
+}
+
 function broadcastState(state: AppState): void {
+  for (const cb of stateListeners) {
+    try { cb(state); } catch {}
+  }
   for (const win of BrowserWindow.getAllWindows()) {
     if (!win.isDestroyed()) {
       win.webContents.send('state:changed', state);
@@ -172,11 +173,14 @@ function genId(): string {
 
 type PushResult = 'ok' | 'not_running' | 'failed';
 
-async function pushConfigToBackend(): Promise<PushResult> {
+async function pushConfigToBackend(opts: { pruneAgentTokens?: boolean } = {}): Promise<PushResult> {
   if (!pythonBackend.isRunning()) return 'not_running';
   const state = store.get();
   try {
-    await pythonBackend.request('setConfig', { config: state.config });
+    await pythonBackend.request('setConfig', {
+      config: state.config,
+      ...(opts.pruneAgentTokens === true ? { pruneAgentTokens: true } : {}),
+    });
     return 'ok';
   } catch (e) {
     return 'failed';
@@ -190,8 +194,12 @@ export function registerIpc(): void {
       await shell.openExternal(url);
     }
   });
-  ipcMain.handle('app:showItemInFolder', async (_e, p: string) => {
-    shell.showItemInFolder(p);
+  ipcMain.handle('app:openUserDataFolder', async () => {
+    await shell.openPath(app.getPath('userData'));
+  });
+  ipcMain.handle('app:quit', () => {
+    setImmediate(() => app.quit());
+    return ok();
   });
   ipcMain.handle('app:getUserDataPath', () => app.getPath('userData'));
   ipcMain.handle('app:getReferralUrl', () => getReferralUrl());
@@ -216,42 +224,33 @@ export function registerIpc(): void {
     broadcastState(next);
     return ok();
   });
+  ipcMain.handle('state:markOnboardingSeen', () => {
+    const cur = store.get();
+    if ((cur.onboardingSeen ?? 0) >= ONBOARDING_REVISION) return ok();
+    const next = store.save({ ...cur, onboardingSeen: ONBOARDING_REVISION });
+    broadcastState(next);
+    return ok();
+  });
 
   ipcMain.handle('config:get', () => store.get().config);
-  ipcMain.handle('config:update', async (_e, patch: Partial<TraderConfig>) => {
+  ipcMain.handle('config:update', async (_e, raw: Partial<TraderConfig>) => {
+    const patch = cleanConfigPatch(raw as Record<string, unknown>) as Partial<TraderConfig>;
+    const before = store.get().config.mcpAgents;
     store.patchConfig(patch);
     clearActiveMarkersForPatch(patch);
     const next = store.get();
     broadcastState(next);
-    await pushConfigToBackend();
-    return next.config;
-  });
-  ipcMain.handle('config:replace', async (_e, cfg: TraderConfig) => {
-    store.replaceConfig(cfg);
-    const next = store.save({
-      ...store.get(), activeProfileId: null, activeCrypto15mProfileId: null,
+    await pushConfigToBackend({
+      pruneAgentTokens: 'mcpAgents' in patch && removedAgentIds(before, next.config.mcpAgents).length > 0,
     });
-    broadcastState(next);
-    await pushConfigToBackend();
     return next.config;
   });
   ipcMain.handle('config:reset', async () => {
-    const next = store.resetConfig();
+    const next = store.resetBotSettings();
     broadcastState(next);
     await pushConfigToBackend();
     return next.config;
   });
-  ipcMain.handle('config:listStrategies', () => listStrategies());
-  ipcMain.handle('config:applyStrategy', async (_e, id: string) => {
-    const s = findStrategy(id);
-    if (!s || s.comingSoon) return store.get().config;
-    const next = applyStrategyPreset(s);
-    const stateNext = store.save({ ...store.get(), activeProfileId: id });
-    broadcastState(stateNext);
-    await pushConfigToBackend();
-    return next.config;
-  });
-
   ipcMain.handle('profiles:list', () => store.get().customProfiles);
   ipcMain.handle('profiles:save', (_e, name: string, description?: string, kind?: ProfileKind) => {
     if (!name?.trim()) return err('Profile name required');
@@ -265,7 +264,7 @@ export function registerIpc(): void {
       kind: pkind,
       createdAt: now,
       updatedAt: now,
-      config: { ...cur.config },
+      config: blankWebhooks({ ...cur.config }),
     };
     const next = store.save({
       ...cur,
@@ -280,18 +279,7 @@ export function registerIpc(): void {
   ipcMain.handle('profiles:apply', async (_e, id: string) => {
     const cur = store.get();
     const p = cur.customProfiles.find((x) => x.id === id);
-    if (!p) {
-      const s = findStrategy(id);
-      if (s?.comingSoon) return err(`"${s.name}" is coming soon`);
-      if (s) {
-        const next = applyStrategyPreset(s);
-        const stateNext = store.save({ ...store.get(), activeProfileId: id });
-        broadcastState(stateNext);
-        await pushConfigToBackend();
-        return ok(next.config, `Applied "${s.name}"`);
-      }
-      return err('Profile not found');
-    }
+    if (!p) return err('Profile not found');
     const pkind = profileKindOf(p);
     const slice = profileSlice(p.config, pkind);
     if (pkind === 'main') {
@@ -327,7 +315,7 @@ export function registerIpc(): void {
     const updated = [...cur.customProfiles];
     updated[idx] = {
       ...updated[idx],
-      config: { ...cur.config },
+      config: blankWebhooks({ ...cur.config }),
       updatedAt: new Date().toISOString(),
     };
     const next = store.save({ ...cur, customProfiles: updated });
@@ -368,12 +356,7 @@ export function registerIpc(): void {
     const cur = store.get();
     const p = cur.customProfiles.find((x) => x.id === id);
     if (!p) return err('Profile not found');
-    const json = JSON.stringify(
-      { kryptTraderProfile: 1, profile: p },
-      null,
-      2,
-    );
-    return ok(json);
+    return ok(profileExportJson(p));
   });
   ipcMain.handle('profiles:import', (_e, json: string) => {
     try {
@@ -391,7 +374,8 @@ export function registerIpc(): void {
         kind: p.kind === 'crypto15m' ? 'crypto15m' : 'main',
         createdAt: now,
         updatedAt: now,
-        config: { ...store.DEFAULT_CONFIG, ...sanitizeImportedConfig(p.config) },
+        config: { ...store.DEFAULT_CONFIG, ...omitForShare(sanitizeImportedConfig(
+          migrateConfig(p.config, store.DEFAULT_CONFIG))) },
       };
       const next = store.save({ ...cur, customProfiles: [...cur.customProfiles, dup] });
       broadcastState(next);
@@ -402,8 +386,7 @@ export function registerIpc(): void {
   });
 
   const emptyAllCreds = () => ({
-    current: 'demo' as const,
-    demo: { env: 'demo' as const, hasApiKey: false, hasRsaKey: false, apiKeyPreview: '', fingerprint: '' },
+    current: 'paper' as const,
     production: { env: 'production' as const, hasApiKey: false, hasRsaKey: false, apiKeyPreview: '', fingerprint: '' },
   });
   ipcMain.handle('credentials:status', async () => {
@@ -416,9 +399,7 @@ export function registerIpc(): void {
       } satisfies CredentialsState;
     }
     const all = await pythonBackend.request('credentialStatus', {}) as any;
-    if (all && all.current && all[all.current]) {
-      return all[all.current] as CredentialsState;
-    }
+    if (all && all.production) return all.production as CredentialsState;
     return all as CredentialsState;
   });
   ipcMain.handle('credentials:statusAll', async () => {
@@ -426,27 +407,35 @@ export function registerIpc(): void {
     return await pythonBackend.request('credentialStatus', {});
   });
   ipcMain.handle('credentials:save', async (_e, input: CredentialsInput) => {
-    if (!pythonBackend.isRunning()) return err('Backend not running');
+    if (!pythonBackend.isRunning()) return err(NOT_RUNNING);
+    const raw = (input ?? {}) as Partial<CredentialsInput>;
+    const chk = checkKalshiKeys({ keyId: raw.apiKey, pem: raw.rsaPem });
+    if (!chk.ok) return err(chk.issues.map((i) => i.message).join(' '));
     try {
-      await pythonBackend.request('setCredentials', input);
+      await pythonBackend.request('setCredentials', { apiKey: chk.keyId, rsaPem: chk.pem });
       return ok();
     } catch (e: any) {
       return err(`${e?.message || e}`);
     }
   });
-  ipcMain.handle('credentials:test', async (_e, env?: string) => {
-    if (!pythonBackend.isRunning()) return err('Backend not running');
+  ipcMain.handle('credentials:test', async (): Promise<CredentialsTestResult> => {
+    if (!pythonBackend.isRunning()) return { ok: false, message: NOT_RUNNING };
     try {
-      const data = await pythonBackend.request('testCredentials', env ? { env } : {});
-      return ok(data, 'Connected to Kalshi');
+      const r = await pythonBackend.request('verifyCredentials', {}) as any;
+      if (r?.ok) return ok({ env: 'production' as const, balanceUsd: r.balanceUsd }, 'Connected to Kalshi');
+      const diagnosis: CredentialDiagnosis = {
+        code: r?.code ?? 'unknown', title: String(r?.title ?? 'Test failed'),
+        fix: String(r?.fix ?? ''),
+      };
+      return { ok: false, message: `${diagnosis.title} ${diagnosis.fix}`.trim(), diagnosis };
     } catch (e: any) {
-      return err(`${e?.message || e}`);
+      return { ok: false, message: `${e?.message || e}` };
     }
   });
-  ipcMain.handle('credentials:clear', async (_e, env?: string) => {
-    if (!pythonBackend.isRunning()) return err('Backend not running');
+  ipcMain.handle('credentials:clear', async () => {
+    if (!pythonBackend.isRunning()) return err(NOT_RUNNING);
     try {
-      await pythonBackend.request('clearCredentials', env ? { env } : {});
+      await pythonBackend.request('clearCredentials', {});
       return ok();
     } catch (e: any) {
       return err(`${e?.message || e}`);
@@ -467,7 +456,7 @@ export function registerIpc(): void {
     return ok();
   });
   ipcMain.handle('backend:runOnce', async (_e, action: string) => {
-    if (!pythonBackend.isRunning()) return err('Backend not running');
+    if (!pythonBackend.isRunning()) return err(NOT_RUNNING);
     try {
       const data = await pythonBackend.request('runOnce', { action });
       return ok(data, (data as any)?.summary || 'Done');
@@ -491,7 +480,7 @@ export function registerIpc(): void {
     return ok();
   });
   ipcMain.handle('trading:cancelAllOpen', async () => {
-    if (!pythonBackend.isRunning()) return err('Backend not running');
+    if (!pythonBackend.isRunning()) return err(NOT_RUNNING);
     try {
       const data = await pythonBackend.request('cancelAllOpen', {});
       return ok(data, `Canceled ${data.canceled} order(s)`);
@@ -500,7 +489,7 @@ export function registerIpc(): void {
     }
   });
   ipcMain.handle('trading:flatten', async () => {
-    if (!pythonBackend.isRunning()) return err('Backend not running');
+    if (!pythonBackend.isRunning()) return err(NOT_RUNNING);
     try {
       const data = await pythonBackend.request('flatten', {});
       return ok(data, `Flattened ${data.closed} order(s)`);
@@ -510,7 +499,7 @@ export function registerIpc(): void {
   });
 
   ipcMain.handle('app:factoryReset', async () => {
-    if (!pythonBackend.isRunning()) return err('Backend not running');
+    if (!pythonBackend.isRunning()) return err(NOT_RUNNING);
     try {
       const data = await pythonBackend.request('factoryReset', {}) as any;
       const total = Object.values(data?.deleted || {}).reduce(
@@ -523,32 +512,20 @@ export function registerIpc(): void {
   });
 
   ipcMain.handle('data:account', async () => {
-    if (!pythonBackend.isRunning()) {
-      return {
-        cashUsd: 0, portfolioUsd: 0, totalUsd: 0,
-        startBankrollUsd: store.get().config.startBankrollUsd,
-        roiPct: 0, realizedPnlUsd: 0, unrealizedPnlUsd: 0,
-        openCostUsd: 0, feesUsd: 0, wins: 0, losses: 0, winRate: 0,
-        pendingCount: 0, openCount: 0, resolvedCount: 0, totalOpened: 0,
-        byEnv: {
-          demo: { wins: 0, losses: 0, realizedPnl: 0 },
-          production: { wins: 0, losses: 0, realizedPnl: 0 },
-        },
-      };
-    }
+    if (!pythonBackend.isRunning()) return null;
     return await pythonBackend.request('account', {});
   });
   ipcMain.handle('data:pnlSeries', async (_e, sinceHours?: number) => {
     if (!pythonBackend.isRunning()) return [];
-    return await pythonBackend.request('pnlSeries', { sinceHours });
+    return await pythonBackend.request('pnlSeries', { sinceHours: cleanSinceHours(sinceHours) });
   });
   ipcMain.handle('data:positions', async (_e, filter?: PositionFilter) => {
     if (!pythonBackend.isRunning()) return [];
-    return await pythonBackend.request('positions', filter || {});
+    return await pythonBackend.request('positions', cleanPositionFilter(filter));
   });
   ipcMain.handle('data:signals', async (_e, filter?: SignalFilter) => {
     if (!pythonBackend.isRunning()) return [];
-    return await pythonBackend.request('signals', filter || {});
+    return await pythonBackend.request('signals', cleanSignalFilter(filter));
   });
   ipcMain.handle('data:scannerStats', async () => {
     if (!pythonBackend.isRunning()) {
@@ -567,10 +544,7 @@ export function registerIpc(): void {
     if (!pythonBackend.isRunning()) {
       return { runs: [], activeRunId: 0, activeRun: null };
     }
-    const params: Record<string, unknown> = {};
-    if (env) params.env = env;
-    if (limit) params.limit = limit;
-    return await pythonBackend.request('botRuns', params);
+    return await pythonBackend.request('botRuns', cleanBotRunsArgs(env, limit));
   });
 
   ipcMain.handle('crypto15m:snapshot', async () => {
@@ -604,7 +578,8 @@ export function registerIpc(): void {
         enabled: false, live: false, liveArmed: false, authed: false,
         orderSize: cfg.crypto15mOrderSize ?? 1,
         maxConcurrent: cfg.crypto15mMaxConcurrent ?? 3,
-        env: 'demo',
+        env: cfg.accountMode === 'live' ? 'production' : 'paper',
+        paperAccount: cfg.accountMode !== 'live',
         sizing: {
           mode: 'fixed', balancePct: 0.02, maxLossPct: 0, balanceUsd: 0,
           estPriceCents: 0, estContracts: 1, estCostUsd: 0, note: '',
@@ -615,50 +590,69 @@ export function registerIpc(): void {
     }
     return await pythonBackend.request('crypto15mStatus', {});
   });
-  ipcMain.handle('crypto15m:backtest', async (_e, args?: { sinceDays?: number }) => {
+  ipcMain.handle('crypto15m:backtest', async (_e, args?: unknown) => {
     if (!pythonBackend.isRunning()) return null;
-    return await pythonBackend.request('c15Backtest', args || {});
+    return await pythonBackend.request('c15Backtest', cleanBacktestArgs(args, configKeys()));
   });
-  ipcMain.handle('main:backtest', async (_e, args?: { sinceDays?: number; config?: Record<string, unknown> }) => {
+  ipcMain.handle('main:backtest', async (_e, args?: unknown) => {
     if (!pythonBackend.isRunning()) return null;
-    return await pythonBackend.request('mainBacktest', args || {});
+    return await pythonBackend.request('mainBacktest', cleanBacktestArgs(args, configKeys()));
   });
-  ipcMain.handle('crypto15m:history', async (_e, args?: { limit?: number; includePaper?: boolean }) => {
+  ipcMain.handle('crypto15m:history', async (_e, args?: unknown) => {
     if (!pythonBackend.isRunning()) return null;
-    return await pythonBackend.request('c15History', args || {});
+    return await pythonBackend.request('c15History', cleanC15HistoryArgs(args));
   });
 
   ipcMain.handle('scripts:list', async () => {
     if (!pythonBackend.isRunning()) return { scripts: [] };
     return await pythonBackend.request('scriptsList', {});
   });
-  ipcMain.handle('scripts:save', async (_e, s: Record<string, unknown>) => {
-    return await pythonBackend.request('scriptSave', s || {});
+  ipcMain.handle('scripts:save', async (_e, s: unknown) => {
+    if (!pythonBackend.isRunning()) backendDown('save this script');
+    const clean = cleanScriptSave(s);
+    if (!clean) throw new Error('That script could not be saved: it is too long, or its id is not one this app made.');
+    return await pythonBackend.request('scriptSave', clean);
   });
-  ipcMain.handle('scripts:delete', async (_e, id: string) => {
-    return await pythonBackend.request('scriptDelete', { id });
+  ipcMain.handle('scripts:delete', async (_e, id: unknown) => {
+    if (!pythonBackend.isRunning()) backendDown('delete this script');
+    const sid = cleanScriptId(id);
+    if (!sid) throw new Error('No such script.');
+    return await pythonBackend.request('scriptDelete', { id: sid });
   });
-  ipcMain.handle('scripts:setEnabled', async (_e, id: string, enabled: boolean) => {
-    return await pythonBackend.request('scriptSetEnabled', { id, enabled });
+  ipcMain.handle('scripts:setEnabled', async (_e, id: unknown, enabled: unknown) => {
+    if (!pythonBackend.isRunning()) backendDown('switch this script');
+    const sid = cleanScriptId(id);
+    if (!sid) throw new Error('No such script.');
+    return await pythonBackend.request('scriptSetEnabled', { id: sid, enabled: enabled === true });
   });
-  ipcMain.handle('scripts:setTrusted', async (_e, id: string, trusted: boolean) => {
-    return await pythonBackend.request('scriptSetTrusted', { id, trusted });
+  ipcMain.handle('scripts:setTrusted', async (_e, id: unknown, trusted: unknown) => {
+    if (!pythonBackend.isRunning()) backendDown('change this script');
+    const sid = cleanScriptId(id);
+    if (!sid) throw new Error('No such script.');
+    return await pythonBackend.request('scriptSetTrusted', { id: sid, trusted: trusted === true });
   });
-  ipcMain.handle('scripts:validate', async (_e, code: string, trusted?: boolean) => {
-    return await pythonBackend.request('scriptValidate', { code, trusted: !!trusted });
+  ipcMain.handle('scripts:validate', async (_e, code: unknown, trusted?: unknown) => {
+    if (!pythonBackend.isRunning()) backendDown('check this script');
+    const c = cleanScriptCode(code);
+    if (c === null) throw new Error('That script is too long to check.');
+    return await pythonBackend.request('scriptValidate', { code: c, trusted: trusted === true });
   });
-  ipcMain.handle('scripts:backtest', async (_e, args?: Record<string, unknown>) => {
+  ipcMain.handle('scripts:backtest', async (_e, args?: unknown) => {
     if (!pythonBackend.isRunning()) return null;
-    return await pythonBackend.request('scriptBacktest', args || {}, 120_000);
+    const clean = cleanScriptBacktestArgs(args, configKeys());
+    if (!clean) throw new Error('No such script to backtest.');
+    return await pythonBackend.request('scriptBacktest', clean, 120_000);
   });
   ipcMain.handle('scripts:contextPack', async () => {
+    if (!pythonBackend.isRunning()) backendDown('build the AI context pack');
     return await pythonBackend.request('scriptContextPack', {}, 60_000);
   });
   ipcMain.handle('scripts:docs', async () => {
+    if (!pythonBackend.isRunning()) backendDown('show the script guide');
     return await pythonBackend.request('scriptApiDocs', {}, 60_000);
   });
   ipcMain.handle('scripts:exportPack', async (e) => {
-    if (!pythonBackend.isRunning()) return err('Engine not running');
+    if (!pythonBackend.isRunning()) return err(NOT_RUNNING);
     const r = (await pythonBackend.request('scriptContextPack', {})) as { text?: string } | null;
     if (!r?.text) return err('Context pack generation failed');
     const win = BrowserWindow.fromWebContents(e.sender) ?? undefined;
@@ -673,14 +667,16 @@ export function registerIpc(): void {
     return ok(res.filePath);
   });
 
-  ipcMain.handle('turbine:library', async (_e, args?: { rerun?: boolean; days?: number }) => {
+  ipcMain.handle('turbine:library', async (_e, args?: unknown) => {
     if (!pythonBackend.isRunning()) return null;
-    return await pythonBackend.request('turbineLibrary', args || {});
+    return await pythonBackend.request('turbineLibrary', cleanTurbineLibraryArgs(args));
   });
 
-  ipcMain.handle('turbine:optimize', async (_e, args: Record<string, unknown>) => {
+  ipcMain.handle('turbine:optimize', async (_e, args: unknown) => {
     if (!pythonBackend.isRunning()) return null;
-    return await pythonBackend.request('coinOptimize', args || {}, 120_000);
+    const clean = cleanOptimizeArgs(args);
+    if (!clean) throw new Error('Pick a coin to optimize.');
+    return await pythonBackend.request('coinOptimize', clean, 120_000);
   });
   ipcMain.handle('backtest:export', async () => {
     if (!pythonBackend.isRunning()) return null;
@@ -714,9 +710,11 @@ export function registerIpc(): void {
   });
   ipcMain.handle(
     'kalshi:marketUrl',
-    async (_e, args?: { eventTicker?: string; ticker?: string; env?: string }) => {
+    async (_e, args?: unknown) => {
       if (!pythonBackend.isRunning()) return { url: '' };
-      return await pythonBackend.request('kalshiMarketUrl', args || {});
+      const clean = cleanMarketUrlArgs(args);
+      if (!clean) return { url: '' };
+      return await pythonBackend.request('kalshiMarketUrl', clean);
     },
   );
 
@@ -758,14 +756,27 @@ export function registerIpc(): void {
   ipcMain.handle('window:isMaximized', (e) => {
     return BrowserWindow.fromWebContents(e.sender)?.isMaximized() ?? false;
   });
+  ipcMain.handle('window:isVisible', (e) => {
+    const w = BrowserWindow.fromWebContents(e.sender);
+    return !!w && w.isVisible() && !w.isMinimized();
+  });
 }
 
+
+
 const backendDown = (what: string): never => {
-  throw new Error(
-    `The trading backend is not running, so ${what} cannot be read. ` +
-    'Start it from the Logs page, or check API Keys.',
-  );
+  throw new Error(encodeRpcError(backendDownText(what), 'backend_down'));
 };
+
+function agentPathEnv(): PathEnv {
+  return {
+    platform: process.platform,
+    home: os.homedir(),
+    appData: process.env.APPDATA,
+    localAppData: process.env.LOCALAPPDATA,
+    codexHome: process.env.CODEX_HOME,
+  };
+}
 
 function readWatchlist(): string[] {
   return store.get().terminalWatchlist ?? [];
@@ -775,7 +786,7 @@ function registerTerminalIpc(): void {
   ipcMain.handle('terminal:discover', async (_e, args?: {
     column?: string; limit?: number; refresh?: boolean; filters?: unknown;
   }) => {
-    if (!pythonBackend.isRunning()) backendDown('markets');
+    if (!pythonBackend.isRunning()) backendDown('load markets');
     const column = DISCOVER_COLUMNS.has(String(args?.column))
       ? String(args?.column) : 'trending';
     return await pythonBackend.request('terminalDiscover', {
@@ -788,7 +799,7 @@ function registerTerminalIpc(): void {
   });
 
   ipcMain.handle('terminal:search', async (_e, args?: { query?: string; limit?: number }) => {
-    if (!pythonBackend.isRunning()) backendDown('markets');
+    if (!pythonBackend.isRunning()) backendDown('load markets');
     return await pythonBackend.request('terminalSearch', {
       query: String(args?.query ?? '').slice(0, 200),
       limit: clampInt(args?.limit, 1, 250, 60),
@@ -796,14 +807,14 @@ function registerTerminalIpc(): void {
   });
 
   ipcMain.handle('terminal:market', async (_e, args?: { ticker?: string }) => {
-    if (!pythonBackend.isRunning()) backendDown('this market');
+    if (!pythonBackend.isRunning()) backendDown('open this market');
     const ticker = cleanTicker(args?.ticker);
     if (!ticker) throw new Error('That is not a Kalshi ticker.');
     return await pythonBackend.request('terminalMarket', { ticker }, 45_000);
   });
 
   ipcMain.handle('terminal:book', async (_e, args?: { ticker?: string }) => {
-    if (!pythonBackend.isRunning()) backendDown('the order book');
+    if (!pythonBackend.isRunning()) backendDown('load the order book');
     const ticker = cleanTicker(args?.ticker);
     if (!ticker) throw new Error('That is not a Kalshi ticker.');
     return await pythonBackend.request('terminalBook', { ticker }, 20_000);
@@ -812,7 +823,7 @@ function registerTerminalIpc(): void {
   ipcMain.handle('terminal:candles', async (_e, args?: {
     ticker?: string; intervalMin?: number; lookbackMin?: number;
   }) => {
-    if (!pythonBackend.isRunning()) backendDown('price history');
+    if (!pythonBackend.isRunning()) backendDown('load price history');
     const ticker = cleanTicker(args?.ticker);
     if (!ticker) throw new Error('That is not a Kalshi ticker.');
     const intervalMin = CANDLE_INTERVALS.has(Number(args?.intervalMin))
@@ -825,7 +836,7 @@ function registerTerminalIpc(): void {
   });
 
   ipcMain.handle('terminal:tape', async (_e, args?: { ticker?: string; limit?: number }) => {
-    if (!pythonBackend.isRunning()) backendDown('the trade tape');
+    if (!pythonBackend.isRunning()) backendDown('load recent trades');
     const ticker = cleanTicker(args?.ticker);
     if (!ticker) throw new Error('That is not a Kalshi ticker.');
     return await pythonBackend.request('terminalTape', {
@@ -834,31 +845,31 @@ function registerTerminalIpc(): void {
   });
 
   ipcMain.handle('terminal:portfolio', async () => {
-    if (!pythonBackend.isRunning()) backendDown('your positions');
+    if (!pythonBackend.isRunning()) backendDown('show your positions');
     return await pythonBackend.request('terminalPortfolio', {}, 30_000);
   });
 
   ipcMain.handle('terminal:orders', async () => {
-    if (!pythonBackend.isRunning()) backendDown('your resting orders');
+    if (!pythonBackend.isRunning()) backendDown('show your open orders');
     return await pythonBackend.request('terminalOrders', {}, 30_000);
   });
 
   ipcMain.handle('terminal:history', async (_e, args?: { limit?: number }) => {
-    if (!pythonBackend.isRunning()) backendDown('your trade history');
+    if (!pythonBackend.isRunning()) backendDown('show your trade history');
     return await pythonBackend.request('terminalHistory', {
       limit: clampInt(args?.limit, 1, 2000, 300),
     }, 30_000);
   });
 
   ipcMain.handle('terminal:rules', async (_e, args?: { limit?: number }) => {
-    if (!pythonBackend.isRunning()) backendDown('your standing instructions');
+    if (!pythonBackend.isRunning()) backendDown('show your standing instructions');
     return await pythonBackend.request('terminalRules', {
       limit: clampInt(args?.limit, 1, 1000, 300),
     }, 20_000);
   });
 
   ipcMain.handle('terminal:armRule', async (_e, req?: any) => {
-    if (!pythonBackend.isRunning()) backendDown('standing instructions');
+    if (!pythonBackend.isRunning()) backendDown('change standing instructions');
     const ticker = cleanTicker(req?.ticker);
     if (!ticker) throw new Error('That is not a Kalshi ticker.');
     const kind = ['stop', 'take', 'alert'].includes(String(req?.kind))
@@ -883,7 +894,7 @@ function registerTerminalIpc(): void {
   });
 
   ipcMain.handle('terminal:cancelRule', async (_e, args?: { id?: number }) => {
-    if (!pythonBackend.isRunning()) backendDown('standing instructions');
+    if (!pythonBackend.isRunning()) backendDown('change standing instructions');
     return await pythonBackend.request('terminalRuleCancel', {
       id: clampInt(args?.id, 1, 1e12, 0),
     }, 20_000);
@@ -892,7 +903,7 @@ function registerTerminalIpc(): void {
   ipcMain.handle('terminal:micro', async (_e, args?: {
     ticker?: string; probeCents?: number;
   }) => {
-    if (!pythonBackend.isRunning()) backendDown('the microstructure recorder');
+    if (!pythonBackend.isRunning()) backendDown('read the market feed');
     const ticker = cleanTicker(args?.ticker);
     if (!ticker) throw new Error('That is not a Kalshi ticker.');
     const probe = Number(args?.probeCents);
@@ -903,21 +914,21 @@ function registerTerminalIpc(): void {
   });
 
   ipcMain.handle('terminal:crossVenue', async (_e, args?: { ticker?: string }) => {
-    if (!pythonBackend.isRunning()) backendDown('the other venue');
+    if (!pythonBackend.isRunning()) backendDown('check the other venue');
     const ticker = cleanTicker(args?.ticker);
     if (!ticker) throw new Error('That is not a Kalshi ticker.');
     return await pythonBackend.request('crossVenue', { ticker }, 45_000);
   });
 
   ipcMain.handle('remote:status', async () => {
-    if (!pythonBackend.isRunning()) backendDown('the remote bots');
+    if (!pythonBackend.isRunning()) backendDown('reach the phone bots');
     return await pythonBackend.request('remoteStatus', {}, 20_000);
   });
 
   ipcMain.handle('remote:setToken', async (_e, args?: {
     which?: string; token?: string;
   }) => {
-    if (!pythonBackend.isRunning()) backendDown('the remote bots');
+    if (!pythonBackend.isRunning()) backendDown('reach the phone bots');
     const which = args?.which === 'telegram' ? 'telegram' : 'discord';
     const res = await pythonBackend.request('remoteSetToken', {
       which, token: String(args?.token ?? '').trim().slice(0, 400),
@@ -930,12 +941,12 @@ function registerTerminalIpc(): void {
   });
 
   ipcMain.handle('remote:pairCode', async () => {
-    if (!pythonBackend.isRunning()) backendDown('the remote bots');
+    if (!pythonBackend.isRunning()) backendDown('reach the phone bots');
     return await pythonBackend.request('remotePairCode', {}, 20_000);
   });
 
   ipcMain.handle('remote:unpair', async (_e, args?: { which?: string }) => {
-    if (!pythonBackend.isRunning()) backendDown('the remote bots');
+    if (!pythonBackend.isRunning()) backendDown('reach the phone bots');
     const which = args?.which === 'telegram' ? 'telegram' : 'discord';
     const res = await pythonBackend.request('remoteUnpair', { which }, 20_000);
     const patch = which === 'telegram'
@@ -947,96 +958,187 @@ function registerTerminalIpc(): void {
   });
 
   ipcMain.handle('remote:test', async () => {
-    if (!pythonBackend.isRunning()) backendDown('the remote bots');
+    if (!pythonBackend.isRunning()) backendDown('reach the phone bots');
     return await pythonBackend.request('remoteTest', {}, 30_000);
   });
 
   ipcMain.handle('ai:status', async () => {
-    if (!pythonBackend.isRunning()) backendDown('AI analysis');
+    if (!pythonBackend.isRunning()) backendDown('run AI analysis');
     return await pythonBackend.request('aiStatus', {}, 20_000);
   });
 
   ipcMain.handle('ai:setKey', async (_e, args?: { provider?: string; key?: string }) => {
-    if (!pythonBackend.isRunning()) backendDown('AI analysis');
-    const provider = args?.provider === 'openai' ? 'openai' : 'anthropic';
-    const res = await pythonBackend.request('aiSetKey', {
-      provider, key: String(args?.key ?? '').trim().slice(0, 400),
-    }, 20_000);
+    if (!pythonBackend.isRunning()) backendDown('run AI analysis');
+    const provider = cleanAiKeyProvider(args?.provider);
+    if (!provider) throw new Error('That AI provider does not take a key.');
+    const key = cleanApiKey(args?.key);
+    if (key === null) throw new Error('That does not look like an API key — nothing was saved.');
+    const res = await pythonBackend.request('aiSetKey', { provider, key }, 20_000);
     appendLog({
       ts: new Date().toISOString(), level: 'INFO', source: 'app',
-      msg: `${provider} API key ${args?.key ? 'saved' : 'cleared'}`,
+      msg: `${provider} API key ${key ? 'saved' : 'cleared'}`,
     });
     return res;
   });
 
+  ipcMain.handle('ai:checkProvider', async (_e, args?: { provider?: string }) => {
+    if (!pythonBackend.isRunning()) backendDown('run AI analysis');
+    const provider = cleanAiProvider(args?.provider);
+    if (!provider) throw new Error('Unknown AI provider.');
+    return await pythonBackend.request('aiCheckProvider', { provider }, 30_000);
+  });
+
   ipcMain.handle('ai:analyze', async (_e, args?: { ticker?: string }) => {
-    if (!pythonBackend.isRunning()) backendDown('AI analysis');
+    if (!pythonBackend.isRunning()) backendDown('run AI analysis');
     const ticker = cleanTicker(args?.ticker);
     if (!ticker) throw new Error('That is not a Kalshi ticker.');
     return await pythonBackend.request('aiAnalyze', { ticker }, 260_000);
   });
 
   ipcMain.handle('terminal:hosts', async () => {
-    if (!pythonBackend.isRunning()) backendDown('the network report');
+    if (!pythonBackend.isRunning()) backendDown('show the network report');
     return await pythonBackend.request('terminalHosts', {}, 20_000);
   });
 
   ipcMain.handle('ai:scoreboard', async () => {
-    if (!pythonBackend.isRunning()) backendDown('the forecast scoreboard');
+    if (!pythonBackend.isRunning()) backendDown('show the forecast scoreboard');
     return await pythonBackend.request('aiScoreboard', {}, 20_000);
   });
 
   ipcMain.handle('mcp:status', async () => {
-    if (!pythonBackend.isRunning()) backendDown('AI agents');
+    if (!pythonBackend.isRunning()) backendDown('reach your AI agents');
     return await pythonBackend.request('mcpStatus', {}, 20_000);
   });
-  ipcMain.handle('mcp:rotateToken', async () => {
-    if (!pythonBackend.isRunning()) backendDown('AI agents');
-    return await pythonBackend.request('mcpRotateToken', {}, 20_000);
+  ipcMain.handle('mcp:seen', async () => {
+    if (!pythonBackend.isRunning()) backendDown('reach your AI agents');
+    return await pythonBackend.request('mcpSeen', {}, 10_000);
   });
-  ipcMain.handle('mcp:copyConfig', async (_e, args?: { client?: string }) => {
-    if (!pythonBackend.isRunning()) backendDown('AI agents');
+  ipcMain.handle('mcp:rotateToken', async (_e, args?: { agentId?: string }) => {
+    if (!pythonBackend.isRunning()) backendDown('reach your AI agents');
+    const agentId = cleanAgentIdArg(args?.agentId);
+    if (!agentId) throw new Error('Unknown agent.');
+    return await pythonBackend.request('mcpRotateToken', { agentId }, 20_000);
+  });
+  ipcMain.handle('mcp:copyConfig', async (_e, args?: { client?: string; agentId?: string }) => {
+    if (!pythonBackend.isRunning()) backendDown('reach your AI agents');
     const allowed = ['cursor', 'claude-code', 'claude-desktop', 'codex'];
     const client = allowed.includes(String(args?.client)) ? String(args?.client) : null;
     if (!client) throw new Error('Unknown MCP client.');
+    const agentId = cleanAgentIdArg(args?.agentId);
+    if (!agentId) throw new Error('Unknown agent.');
     const res = await pythonBackend.request<{ text: string }>(
-      'mcpClientConfig', { client }, 20_000);
+      'mcpClientConfig', { client, agentId }, 20_000);
     clipboard.writeText(res.text);
     return { ok: true };
   });
+  ipcMain.handle('mcp:installConfig', async (_e, args?: { client?: string; agentId?: string }) => {
+    if (!pythonBackend.isRunning()) backendDown('add the agent to that app');
+    const client = args?.client === 'claude-desktop' || args?.client === 'codex' ? args.client : null;
+    if (!client) throw new Error('That app can\'t be set up in one click. Use Copy config instead.');
+    const agentId = cleanAgentIdArg(args?.agentId);
+    if (!agentId) throw new Error('Unknown agent.');
+    const res = await pythonBackend.request<{ text: string }>(
+      'mcpClientConfig', { client, agentId }, 20_000);
+    const out = client === 'claude-desktop'
+      ? installClaudeDesktop(agentPathEnv(), res.text)
+      : installCodex(agentPathEnv(), res.text);
+    appendLog({
+      ts: new Date().toISOString(), level: out.ok ? 'INFO' : 'WARN', source: 'main',
+      msg: `${client} config ${out.ok ? `written: ${out.files.join(', ')}` : 'not written'}`
+        + (out.backups.length ? ` (backup: ${out.backups.join(', ')})` : ''),
+    });
+    return { ok: out.ok, message: out.message, files: out.files, backups: out.backups };
+  });
+  ipcMain.handle('mcp:openConfigFolder', async (_e, args?: { client?: string }) => {
+    const env = agentPathEnv();
+    let dir: string | null = null;
+    if (args?.client === 'claude-desktop') dir = existingClaudeDesktopDirs(env)[0] ?? null;
+    else if (args?.client === 'codex') dir = codexConfigDir(env);
+    if (!dir || !existsSync(dir)) {
+      return { ok: false, message: args?.client === 'codex'
+        ? 'Codex hasn\'t created its settings folder yet. Run Codex once, or use Add to Codex.'
+        : 'Claude Desktop\'s settings folder isn\'t there yet. Open Claude Desktop once first.' };
+    }
+    const fail = await shell.openPath(dir);
+    return fail ? { ok: false, message: fail } : { ok: true };
+  });
+  ipcMain.handle('agents:closePaper', async (_e, args?: { agentId?: string }) => {
+    if (!pythonBackend.isRunning()) backendDown('close its paper positions');
+    const agentId = cleanAgentIdArg(args?.agentId);
+    if (!agentId) throw new Error('Unknown agent.');
+    try {
+      return await pythonBackend.request('mcp_agent_close_paper', { agentId }, 30_000);
+    } catch (e) {
+      if (!/unknown method/i.test(String((e as Error)?.message))) throw e;
+      throw new Error(encodeRpcError(
+        'This version of the trading engine can\'t close an agent\'s paper positions yet. '
+        + 'Close them from My Book instead.', 'unsupported'));
+    }
+  });
+  ipcMain.handle('mcp:copyHttpSnippet', async (_e, args?: { agentId?: string }) => {
+    if (!pythonBackend.isRunning()) backendDown('reach your AI agents');
+    const agentId = cleanAgentIdArg(args?.agentId);
+    if (!agentId) throw new Error('Unknown agent.');
+    const res = await pythonBackend.request<{ text: string }>('mcpHttpSnippet', { agentId }, 20_000);
+    clipboard.writeText(res.text);
+    return { ok: true };
+  });
+  ipcMain.handle('health:check', async (_e, args?: unknown) => {
+    if (!pythonBackend.isRunning()) backendDown('run the connection checks');
+    const { deep } = cleanHealthArgs(args);
+    return await pythonBackend.request('healthCheck', { deep }, deep ? 90_000 : 20_000);
+  });
   ipcMain.handle('mcp:activity', async (_e, args?: { limit?: number }) => {
-    if (!pythonBackend.isRunning()) backendDown('AI agents');
+    if (!pythonBackend.isRunning()) backendDown('reach your AI agents');
     const limit = Math.min(500, Math.max(1, Math.floor(Number(args?.limit) || 100)));
     return await pythonBackend.request('mcpActivity', { limit }, 30_000);
   });
   ipcMain.handle('autopilot:status', async () => {
-    if (!pythonBackend.isRunning()) backendDown('Autopilot');
+    if (!pythonBackend.isRunning()) backendDown('reach Autopilot');
     return await pythonBackend.request('autopilotStatus', {}, 20_000);
   });
   ipcMain.handle('autopilot:runNow', async () => {
-    if (!pythonBackend.isRunning()) backendDown('Autopilot');
+    if (!pythonBackend.isRunning()) backendDown('reach Autopilot');
     return await pythonBackend.request('autopilotRunNow', {}, 20_000);
   });
   ipcMain.handle('mcp:decide', async (_e, args?: { id?: number; approve?: boolean }) => {
-    if (!pythonBackend.isRunning()) backendDown('AI agents');
+    if (!pythonBackend.isRunning()) backendDown('reach your AI agents');
     const id = Math.floor(Number(args?.id));
     if (!Number.isFinite(id) || id <= 0) throw new Error('No such agent order.');
     return await pythonBackend.request('mcpDecide', { id, approve: args?.approve === true }, 60_000);
   });
   ipcMain.handle('mcp:paperReset', async () => {
-    if (!pythonBackend.isRunning()) backendDown('AI agents');
+    if (!pythonBackend.isRunning()) backendDown('reach your AI agents');
     return await pythonBackend.request('mcpPaperReset', {}, 20_000);
+  });
+
+  ipcMain.handle('paper:status', async () => {
+    if (!pythonBackend.isRunning()) return null;
+    try {
+      return await pythonBackend.request('paperStatus', {});
+    } catch {
+      return null;
+    }
+  });
+  ipcMain.handle('paper:reset', async () => {
+    if (!pythonBackend.isRunning()) return err(NOT_RUNNING);
+    try {
+      const r = await pythonBackend.request('paperReset', {}, 30_000) as any;
+      return ok(r, 'Paper account reset to its starting balance.');
+    } catch (e: any) {
+      return err(`${e?.message || e}`);
+    }
   });
 
   const ticket = cleanTicket;
 
   ipcMain.handle('terminal:preview', async (_e, req?: unknown) => {
-    if (!pythonBackend.isRunning()) backendDown('this order');
+    if (!pythonBackend.isRunning()) backendDown('price this order');
     return await pythonBackend.request('terminalPreview', ticket(req), 20_000);
   });
 
   ipcMain.handle('terminal:submit', async (_e, req?: unknown) => {
-    if (!pythonBackend.isRunning()) backendDown('this order');
+    if (!pythonBackend.isRunning()) backendDown('send this order');
     const t = ticket(req);
     if (!t.ticker) throw new Error('That is not a Kalshi ticker.');
     const res = await pythonBackend.request<any>('terminalSubmit', t, 45_000);
@@ -1051,7 +1153,7 @@ function registerTerminalIpc(): void {
   });
 
   ipcMain.handle('shard:transfer', async (_e, args?: unknown) => {
-    if (!pythonBackend.isRunning()) backendDown('this transfer');
+    if (!pythonBackend.isRunning()) backendDown('move this money');
     const a = (args ?? {}) as Record<string, unknown>;
     const payload = {
       amountUsd: Number(a.amountUsd),
@@ -1072,7 +1174,7 @@ function registerTerminalIpc(): void {
     return res;
   });
   ipcMain.handle('terminal:cancel', async (_e, args?: { orderId?: string }) => {
-    if (!pythonBackend.isRunning()) backendDown('this order');
+    if (!pythonBackend.isRunning()) backendDown('cancel this order');
     const orderId = String(args?.orderId ?? '').trim().slice(0, 128);
     if (!orderId) throw new Error('No order id.');
     return await pythonBackend.request('terminalCancel', { orderId }, 20_000);
@@ -1091,7 +1193,7 @@ function registerTerminalIpc(): void {
 }
 
 const DIAGNOSTIC_CONFIG_KEYS = [
-  'kalshiEnv', 'enableTrading',
+  'accountMode', 'enableTrading',
   'tradeWhales', 'tradeMomentum', 'tradeConvergence',
   'minEdgePtsWhale', 'minEdgePtsMomentum', 'minConfidenceWhale',
   'minConfidenceMomentum', 'sizingMode', 'fixedTradeUsd', 'baseSizeFraction',
@@ -1105,7 +1207,7 @@ const DIAGNOSTIC_CONFIG_KEYS = [
   'mcpEnabled', 'mcpPort', 'mcpTradeMode', 'mcpMaxOrderUsd',
   'mcpDailySpendUsd', 'mcpMaxPositions', 'mcpMinEdgeCents',
   'mcpAllowResearch', 'mcpAllowScripts', 'mcpAllowScriptRun', 'mcpAllowConfig',
-  'mcpAllowLiveSwitches', 'mcpDailyLossUsd', 'mcpLiveApproval',
+  'mcpAllowLiveSwitches', 'mcpDailyLossUsd', 'mcpLiveApproval', 'mcpHttpEnabled',
   'autopilotEnabled', 'autopilotIntervalMin', 'autopilotMaxRunsPerDay',
   'autopilotDailyTokenBudget', 'autopilotMaxSteps',
   'perpsFarmEnabled',
@@ -1146,6 +1248,10 @@ function buildDiagnostics(logLines: number): string {
   }
   config['remoteDiscordUserId'] = cfg.remoteDiscordUserId ? '(set)' : '(unset)';
   config['remoteTelegramChatId'] = cfg.remoteTelegramChatId ? '(paired)' : '(unpaired)';
+  const agents = Array.isArray(cfg.mcpAgents) ? cfg.mcpAgents as { mode?: string; enabled?: boolean }[] : [];
+  config['mcpAgents'] = `${agents.length} (${agents.filter((a) => a.mode === 'live').length} set to live, `
+    + `${agents.filter((a) => a.enabled === false).length} off)`;
+  config['autopilotAgentId'] = cfg.autopilotAgentId === 'default' ? 'default' : '(a named agent)';
   for (const k of ['eventWebhookUrl', 'statsWebhookUrl', 'whaleWebhookUrl',
                    'momentumWebhookUrl']) {
     config[k] = cfg[k] ? '(set)' : '(unset)';

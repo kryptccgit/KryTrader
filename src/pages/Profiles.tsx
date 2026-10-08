@@ -8,6 +8,8 @@ import { useToast } from '../state/ToastProvider';
 import { Empty, NameDialog, Page } from '../components/common';
 import { cls, fmtDateTime } from '../utils/format';
 import type { Profile } from '@shared/types';
+import { publishActivity } from '../state/activity';
+import { userMessage } from '../utils/errors';
 
 export function ProfilesPage() {
   const { state, refresh } = useApp();
@@ -61,6 +63,9 @@ export function ProfilesPage() {
 
   const apply = async (id: string): Promise<void> => {
     const r = await window.krypt.profiles.apply(id);
+    publishActivity(() => (r.ok
+      ? { kind: 'preset', what: 'profile', name: profiles.find((p) => p.id === id)?.name ?? 'a profile', ok: true }
+      : null));
     if (r.ok) {
       toast.success(r.message || 'Applied');
       await refresh.state();
@@ -94,6 +99,7 @@ export function ProfilesPage() {
       const r = await window.krypt.profiles.import(text);
       if (r.ok && r.data) {
         const applied = await window.krypt.profiles.apply(r.data.id);
+        publishActivity(() => (applied?.ok ? { kind: 'preset', what: 'profile', name: r.data!.name, ok: true } : null));
         toast.success(applied?.ok ? `Imported & applied "${r.data.name}"` : (r.message || 'Imported'));
         await refresh.state();
       } else if (r.ok) {
@@ -101,7 +107,7 @@ export function ProfilesPage() {
         await refresh.state();
       } else toast.error(r.message || 'Import failed');
     } catch (err: any) {
-      toast.error(err?.message || 'Read failed');
+      toast.error(userMessage(err, 'Read failed'));
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
@@ -259,7 +265,6 @@ function ProfileCard({
           </>
         ) : (
           <>
-            <Mini label="env" value={p.config.kalshiEnv} />
             <Mini label="cap" value={`$${p.config.hardMaxPositionUsd}`} />
             <Mini label="open" value={`${p.config.maxOpenPositions}`} />
           </>

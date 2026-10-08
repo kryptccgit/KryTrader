@@ -1,11 +1,14 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Ban, RefreshCw } from 'lucide-react';
-import type { BotPosition } from '@shared/types';
+import type { BookEnv, BotPosition } from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import { Empty, Page } from '../components/common';
+import { GlassSegmented } from '../components/glass/GlassSegmented';
 import { TickerLink } from '../components/KalshiTicker';
 import { cls, fmtCents, fmtRelative, fmtUsd } from '../utils/format';
+import { BOOK_LABEL, bookEnvOf } from '../utils/account';
+import { userMessage } from '../utils/errors';
 
 const STATUS_COLORS: Record<string, string> = {
   submitted: 'bg-krypt-warn/15 text-krypt-warn border-krypt-warn/30',
@@ -20,11 +23,52 @@ const STATUS_COLORS: Record<string, string> = {
 
 type Tab = 'open' | 'pending' | 'won' | 'lost' | 'errors' | 'all';
 
+export const BOOK_BADGE: Record<BookEnv, { text: string; title: string; cls: string }> = {
+  paper: {
+    text: 'PAPER', title: 'Paper: imaginary money on real Kalshi prices.',
+    cls: 'border-krypt-purple/40 bg-krypt-purple/10 text-krypt-purple',
+  },
+  production: {
+    text: 'LIVE', title: 'Live: real money on your Kalshi account.',
+    cls: 'border-krypt-loss/40 bg-krypt-loss/10 text-krypt-loss',
+  },
+  demo: {
+    text: 'DEMO (retired)', title: "Kalshi's demo exchange, which the app no longer uses. History only.",
+    cls: 'border-krypt-border bg-krypt-surface2 text-krypt-muted',
+  },
+};
+
+export function rowsOfBook<T extends { kalshiEnv: BookEnv }>(rows: T[], book: BookEnv | 'all'): T[] {
+  return book === 'all' ? rows : rows.filter((r) => r.kalshiEnv === book);
+}
+
 export function PositionsPage() {
-  const { positions, refresh, config } = useApp();
+  const { positions: allBooks, refresh, config } = useApp();
   const toast = useToast();
   const [tab, setTab] = useState<Tab>('open');
-  const [src, setSrc] = useState<'all' | 'whale' | 'momentum' | 'manual'>('all');
+  const [bookPick, setBookPick] = useState<BookEnv | 'all' | null>(null);
+  const book: BookEnv | 'all' = bookPick ?? bookEnvOf(config);
+  const hasRetired = allBooks.some((p) => p.kalshiEnv === 'demo');
+  const books: (BookEnv | 'all')[] = hasRetired
+    ? ['paper', 'production', 'demo', 'all'] : ['paper', 'production', 'all'];
+  const [own, setOwn] = useState<{ book: BookEnv | 'all'; rows: BotPosition[] } | null>(null);
+  const loadOwn = useCallback(async (): Promise<void> => {
+    try {
+      const rows = await window.krypt.data.positions({ limit: 500, env: book });
+      setOwn({ book, rows });
+    } catch {}
+  }, [book]);
+  useEffect(() => {
+    setOwn(null);
+    void loadOwn();
+    const i = window.setInterval(() => void loadOwn(), 12_000);
+    return () => window.clearInterval(i);
+  }, [loadOwn]);
+  const positions = useMemo(
+    () => rowsOfBook(own && own.book === book ? own.rows : allBooks, book),
+    [own, book, allBooks],
+  );
+  const [src, setSrc] = useState<'all' | 'whale' | 'momentum' | 'manual' | 'external'>('all');
   const [busy, setBusy] = useState<string | null>(null);
 
   const filtered = useMemo(() => {
@@ -64,13 +108,15 @@ export function PositionsPage() {
     () => positions.filter(
       (p) => !p.resolved
         && (p.status === 'filled' || p.status === 'partial' || p.status === 'submitted')
-        && (p.signalSource === 'external' || (config != null && p.kalshiEnv !== config.kalshiEnv)),
+        && (p.signalSource === 'external' || (config != null && p.kalshiEnv !== bookEnvOf(config))),
     ).length,
     [positions, config],
   );
 
   const cancelAll = async (): Promise<void> => {
-    if (!window.confirm('Cancel ALL open orders on Kalshi?')) return;
+    if (!window.confirm(config?.accountMode === 'live'
+      ? 'Cancel ALL open (unfilled) orders on your real Kalshi account?'
+      : 'Cancel ALL open (unfilled) paper orders?')) return;
     setBusy('cancel');
     try {
       const r = await window.krypt.trading.cancelAllOpen();
@@ -86,10 +132,10 @@ export function PositionsPage() {
     try {
       await window.krypt.backend.runOnce('pollOrders');
       await window.krypt.backend.runOnce('reconcilePositions');
-      await Promise.all([refresh.positions(), refresh.account()]);
-      toast.success('Synced open & pending with Kalshi');
-    } catch {
-      toast.error('Sync failed');
+      await Promise.all([refresh.positions(), refresh.account(), loadOwn()]);
+      toast.success('Synced open & pending orders');
+    } catch (e) {
+      toast.error(`Sync failed: ${userMessage(e)}`);
     } finally {
       setBusy(null);
     }
@@ -98,7 +144,7 @@ export function PositionsPage() {
   return (
     <Page
       title="Positions"
-      subtitle="Live + recent positions. Tap Cancel All to flatten any working orders on Kalshi."
+      subtitle="The bot's open and recent positions, one book at a time. Cancel All withdraws every order that hasn't filled yet."
       actions={
         <div className="flex items-center gap-2">
           <button onClick={refreshNow} disabled={!!busy} className="krypt-btn-default" title="Sync open & pending orders with Kalshi">
@@ -110,6 +156,30 @@ export function PositionsPage() {
         </div>
       }
     >
+      <div className="mb-3 flex flex-wrap items-center gap-2 text-xs" data-testid="positions-book">
+        <span className="text-krypt-muted">Book:</span>
+        {books.map((b) => (
+          <button
+            key={b}
+            type="button"
+            onClick={() => setBookPick(b)}
+            data-testid={`positions-book-${b}`}
+            className={cls(
+              'rounded-md border px-2.5 py-1 transition-colors',
+              book === b
+                ? b === 'production' ? 'border-krypt-loss/50 bg-krypt-loss/10 text-white'
+                  : 'border-krypt-purple/50 bg-krypt-purple/10 text-white'
+                : 'border-krypt-border text-krypt-muted hover:text-white',
+            )}
+          >
+            {b === 'all' ? 'All books' : BOOK_LABEL[b]}
+          </button>
+        ))}
+        {book === 'all' && (
+          <span className="text-krypt-dim">Paper and Live together — each row says which.</span>
+        )}
+      </div>
+
       <div className="mb-4 flex flex-wrap items-center gap-2">
         <Tabs value={tab} onChange={setTab}
           options={[
@@ -124,9 +194,11 @@ export function PositionsPage() {
         <div className="ml-auto flex gap-1">
           <Tabs value={src} onChange={setSrc}
             options={[
-              { value: 'all', label: 'Both' },
+              { value: 'all', label: 'All' },
               { value: 'whale', label: 'Whales' },
               { value: 'momentum', label: 'Momentum' },
+              { value: 'manual', label: 'Manual' },
+              { value: 'external', label: 'Imported' },
             ]}
           />
         </div>
@@ -134,7 +206,7 @@ export function PositionsPage() {
 
       {nonBotOpen > 0 && (
         <p className="-mt-2 mb-3 text-[11px] text-krypt-dim">
-          Open/Pending include {nonBotOpen} external or other-environment position{nonBotOpen === 1 ? '' : 's'} the
+          Open/Pending include {nonBotOpen} imported or other-book position{nonBotOpen === 1 ? '' : 's'} the
           bot doesn&apos;t count against its max-open cap.
         </p>
       )}
@@ -150,6 +222,7 @@ export function PositionsPage() {
             <thead>
               <tr>
                 <th>When</th>
+                <th>Book</th>
                 <th>Source</th>
                 <th>Ticker</th>
                 <th>Title</th>
@@ -179,24 +252,7 @@ function Tabs<T extends string>({
   onChange: (v: T) => void;
   options: { value: T; label: string }[];
 }) {
-  return (
-    <div className="inline-flex rounded-md border border-krypt-border bg-krypt-surface2 p-0.5">
-      {options.map((o) => (
-        <button
-          key={o.value}
-          onClick={() => onChange(o.value)}
-          className={cls(
-            'rounded-[6px] px-3 py-1.5 text-xs font-medium transition-colors',
-            value === o.value
-              ? 'bg-white/10 text-white'
-              : 'text-krypt-muted hover:text-white',
-          )}
-        >
-          {o.label}
-        </button>
-      ))}
-    </div>
-  );
+  return <GlassSegmented value={value} onChange={onChange} options={options} />;
 }
 
 function PositionRow({ p }: { p: BotPosition }) {
@@ -205,6 +261,18 @@ function PositionRow({ p }: { p: BotPosition }) {
   return (
     <tr>
       <td className="text-xs text-krypt-muted">{fmtRelative(p.createdAt)}</td>
+      <td>
+        <span
+          data-testid="position-book"
+          title={(BOOK_BADGE[p.kalshiEnv] ?? BOOK_BADGE.demo).title}
+          className={cls(
+            'inline-flex whitespace-nowrap rounded-md border px-1.5 py-0.5 text-[10px] font-semibold uppercase',
+            (BOOK_BADGE[p.kalshiEnv] ?? BOOK_BADGE.demo).cls,
+          )}
+        >
+          {(BOOK_BADGE[p.kalshiEnv] ?? BOOK_BADGE.demo).text}
+        </span>
+      </td>
       <td>
         <span
           className={cls(
@@ -218,7 +286,7 @@ function PositionRow({ p }: { p: BotPosition }) {
                   : 'bg-krypt-pink/15 text-krypt-pink',
           )}
         >
-          {p.signalSource}
+          {p.signalSource === 'external' ? 'imported' : p.signalSource}
         </span>
       </td>
       <td><TickerLink ticker={p.ticker} eventTicker={p.eventTicker} env={p.kalshiEnv} /></td>
@@ -254,7 +322,7 @@ function PositionRow({ p }: { p: BotPosition }) {
       </td>
       <td>
         {!p.resolved ? (
-          <span className="text-[10px] uppercase tracking-wider text-krypt-dim">live</span>
+          <span className="text-[10px] uppercase tracking-wider text-krypt-dim">open</span>
         ) : p.outcomeCorrect === 1 ? (
           <span className="krypt-pill border-krypt-win/40 bg-krypt-win/10 text-krypt-win">won</span>
         ) : p.outcomeCorrect === 0 ? (
@@ -264,8 +332,9 @@ function PositionRow({ p }: { p: BotPosition }) {
         )}
       </td>
       <td className="font-mono text-xs text-krypt-purple">
-        {p.signalSource === 'external'
-          ? <span className="text-krypt-dim" title="Imported from Kalshi — no entry signal">—</span>
+        {p.edgePts === null || p.edgePts === undefined
+          ? <span className="text-krypt-dim" title={p.signalSource === 'external'
+            ? 'Imported from Kalshi — no entry signal' : 'No signal behind this trade, so no edge was claimed'}>—</span>
           : `+${p.edgePts.toFixed(1)}`}
       </td>
       <td
@@ -286,7 +355,7 @@ function PositionRow({ p }: { p: BotPosition }) {
           >
             {fmtUsd(pnl, { sign: true })}
             {!realized && (
-              <span className="ml-1 text-[9px] uppercase tracking-wide text-krypt-dim">live</span>
+              <span className="ml-1 text-[9px] uppercase tracking-wide text-krypt-dim" title="Not settled yet: this moves with the price.">open</span>
             )}
           </span>
         )}

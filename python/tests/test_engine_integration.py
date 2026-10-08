@@ -22,15 +22,15 @@ def fresh_db(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def env_demo(monkeypatch):
-    monkeypatch.setattr(trader, "get_env", lambda: "demo")
-    return "demo"
+def env_paper(monkeypatch):
+    monkeypatch.setattr(trader, "get_env", lambda: "paper")
+    return "paper"
 
 
 @pytest.fixture
 def cfg():
     c = merge_with_defaults({})
-    c["kalshi_env"] = "demo"
+    c["kalshi_env"] = "paper"
     return c
 
 
@@ -56,7 +56,7 @@ def seed_position(**over) -> int:
         "client_order_id": over.get("client_order_id", f"co-{n}"),
         "kalshi_order_id": over.get("kalshi_order_id"),
         "status": over.get("status", "filled"),
-        "kalshi_env": over.get("kalshi_env", "demo"),
+        "kalshi_env": over.get("kalshi_env", "paper"),
     }
     with db.get_db() as conn:
         pid = db.insert_bot_position(conn, row)
@@ -94,7 +94,7 @@ async def _stub_empty_book(_ticker):
 
 
 
-def test_execute_skips_when_max_open_positions_hit(fresh_db, env_demo, cfg):
+def test_execute_skips_when_max_open_positions_hit(fresh_db, env_paper, cfg):
     cfg["max_open_positions"] = 1
     seed_position(status="filled")
     result = run_async(
@@ -104,7 +104,7 @@ def test_execute_skips_when_max_open_positions_hit(fresh_db, env_demo, cfg):
     assert count_rows() == 1
 
 
-def test_execute_skips_when_daily_cap_hit(fresh_db, env_demo, cfg):
+def test_execute_skips_when_daily_cap_hit(fresh_db, env_paper, cfg):
     cfg["max_open_positions"] = 100
     cfg["unlimited_daily_new_positions"] = False
     cfg["max_daily_new_positions"] = 2
@@ -117,37 +117,37 @@ def test_execute_skips_when_daily_cap_hit(fresh_db, env_demo, cfg):
     assert count_rows() == 2
 
 
-def test_daily_cap_counts_only_real_positions(fresh_db, env_demo):
+def test_daily_cap_counts_only_real_positions(fresh_db, env_paper):
     for st in ("submitted", "partial", "filled"):
         seed_position(status=st)
     for st in ("canceled", "error", "gone", "expired", "dry_run"):
         seed_position(status=st)
         seed_position(status=st)
     with db.get_db() as conn:
-        assert db.count_new_positions_today(conn, "demo") == 3
+        assert db.count_new_positions_today(conn, "paper") == 3
 
 
-def test_daily_cap_excludes_external_and_prior_days(fresh_db, env_demo):
+def test_daily_cap_excludes_external_and_prior_days(fresh_db, env_paper):
     seed_position(status="filled")
     seed_position(status="filled", signal_source="external")
     seed_position(status="filled", created_at_offset_sec=-90000)
     with db.get_db() as conn:
-        assert db.count_new_positions_today(conn, "demo") == 1
+        assert db.count_new_positions_today(conn, "paper") == 1
 
 
-def test_daily_cap_not_saturated_by_dead_rows(fresh_db, env_demo, cfg):
+def test_daily_cap_not_saturated_by_dead_rows(fresh_db, env_paper, cfg):
     cfg["max_open_positions"] = 100
     cfg["unlimited_daily_new_positions"] = False
     cfg["max_daily_new_positions"] = 2
     for st in ("canceled", "error", "gone", "canceled", "error"):
         seed_position(status=st)
     with db.get_db() as conn:
-        today = db.count_new_positions_today(conn, "demo")
+        today = db.count_new_positions_today(conn, "paper")
     assert today == 0
     assert today < cfg["max_daily_new_positions"]
 
 
-def test_execute_skips_second_position_in_same_event(fresh_db, env_demo, cfg):
+def test_execute_skips_second_position_in_same_event(fresh_db, env_paper, cfg):
     cfg["max_positions_per_event"] = 1
     seed_position(status="filled", event_ticker="EVT-A", ticker="A-1")
     result = run_async(
@@ -159,7 +159,7 @@ def test_execute_skips_second_position_in_same_event(fresh_db, env_demo, cfg):
     assert result is None
 
 
-def test_execute_skips_duplicate_market_and_side(fresh_db, env_demo, cfg):
+def test_execute_skips_duplicate_market_and_side(fresh_db, env_paper, cfg):
     seed_position(status="filled", ticker="DUP", direction="yes")
     result = run_async(
         trader.execute_signal(
@@ -169,7 +169,7 @@ def test_execute_skips_duplicate_market_and_side(fresh_db, env_demo, cfg):
     assert result is None
 
 
-def test_execute_skips_when_exposure_leaves_under_one_dollar(fresh_db, env_demo, cfg):
+def test_execute_skips_when_exposure_leaves_under_one_dollar(fresh_db, env_paper, cfg):
     seed_position(status="filled", ticker="EXP-SEED", cost_usd=749.50)
     result = run_async(
         trader.execute_signal(
@@ -182,7 +182,7 @@ def test_execute_skips_when_exposure_leaves_under_one_dollar(fresh_db, env_demo,
 
 
 
-def test_execute_skips_when_trading_disabled(fresh_db, env_demo, cfg, monkeypatch):
+def test_execute_skips_when_trading_disabled(fresh_db, env_paper, cfg, monkeypatch):
     cfg["enable_trading"] = False
     monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
 
@@ -198,7 +198,7 @@ def test_execute_skips_when_trading_disabled(fresh_db, env_demo, cfg, monkeypatc
     assert count_rows() == 0
 
 
-def test_execute_real_order_records_kalshi_order_id(fresh_db, env_demo, cfg, monkeypatch):
+def test_execute_real_order_records_kalshi_order_id(fresh_db, env_paper, cfg, monkeypatch):
     cfg["enable_trading"] = True
     monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
 
@@ -222,7 +222,7 @@ def test_execute_real_order_records_kalshi_order_id(fresh_db, env_demo, cfg, mon
     assert calls[0]["action"] == "buy"
 
 
-def test_execute_api_error_is_persisted_as_error_row(fresh_db, env_demo, cfg, monkeypatch):
+def test_execute_api_error_is_persisted_as_error_row(fresh_db, env_paper, cfg, monkeypatch):
     cfg["enable_trading"] = True
     monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
 
@@ -239,7 +239,7 @@ def test_execute_api_error_is_persisted_as_error_row(fresh_db, env_demo, cfg, mo
     assert row["kalshi_order_id"] is None
 
 
-def test_execute_skips_when_live_cross_exceeds_entry_cap(fresh_db, env_demo, cfg, monkeypatch):
+def test_execute_skips_when_live_cross_exceeds_entry_cap(fresh_db, env_paper, cfg, monkeypatch):
     cfg["enable_trading"] = True
 
     async def _moved_book(_ticker):
@@ -261,7 +261,7 @@ def test_execute_skips_when_live_cross_exceeds_entry_cap(fresh_db, env_demo, cfg
 
 
 
-def test_poll_marks_order_filled_from_order_endpoint(fresh_db, env_demo, cfg, monkeypatch):
+def test_poll_marks_order_filled_from_order_endpoint(fresh_db, env_paper, cfg, monkeypatch):
     trader._poll_failures.clear()
     pid = seed_position(status="submitted", kalshi_order_id="OID-9",
                         target_contracts=5, cost_usd=0.0)
@@ -269,7 +269,7 @@ def test_poll_marks_order_filled_from_order_endpoint(fresh_db, env_demo, cfg, mo
     async def _no_positions(*_a, **_k):
         return []
 
-    async def _get_order(_oid):
+    async def _get_order(_oid, **_kw):
         return {"order": {
             "status": "executed", "taker_fill_count": 5, "maker_fill_count": 0,
             "taker_fill_cost": 300, "maker_fill_cost": 0,
@@ -288,7 +288,7 @@ def test_poll_marks_order_filled_from_order_endpoint(fresh_db, env_demo, cfg, mo
     assert row["avg_fill_price_cents"] == pytest.approx(60.0)
 
 
-def test_poll_canceled_partial_collapses_target_and_exposure(fresh_db, env_demo, cfg, monkeypatch):
+def test_poll_canceled_partial_collapses_target_and_exposure(fresh_db, env_paper, cfg, monkeypatch):
     trader._poll_failures.clear()
     pid = seed_position(status="submitted", kalshi_order_id="OID-CP",
                         target_contracts=5, limit_price_cents=50)
@@ -296,7 +296,7 @@ def test_poll_canceled_partial_collapses_target_and_exposure(fresh_db, env_demo,
     async def _no_positions(*_a, **_k):
         return []
 
-    async def _canceled_partial(_oid):
+    async def _canceled_partial(_oid, **_kw):
         return {"order": {
             "status": "canceled", "taker_fill_count": 2, "maker_fill_count": 0,
             "taker_fill_cost": 100, "maker_fill_cost": 0,
@@ -312,11 +312,11 @@ def test_poll_canceled_partial_collapses_target_and_exposure(fresh_db, env_demo,
     assert row["filled_contracts"] == 2
     assert row["target_contracts"] == 2
     with db.get_db() as conn:
-        exposure = db.current_total_exposure_usd(conn, "demo")
+        exposure = db.current_total_exposure_usd(conn, "paper")
     assert exposure == pytest.approx(1.0)
 
 
-def test_poll_resting_partial_keeps_full_committed_exposure(fresh_db, env_demo, cfg, monkeypatch):
+def test_poll_resting_partial_keeps_full_committed_exposure(fresh_db, env_paper, cfg, monkeypatch):
     trader._poll_failures.clear()
     pid = seed_position(status="submitted", kalshi_order_id="OID-RP",
                         target_contracts=5, limit_price_cents=50)
@@ -324,7 +324,7 @@ def test_poll_resting_partial_keeps_full_committed_exposure(fresh_db, env_demo, 
     async def _no_positions(*_a, **_k):
         return []
 
-    async def _resting_partial(_oid):
+    async def _resting_partial(_oid, **_kw):
         return {"order": {
             "status": "resting", "taker_fill_count": 2, "maker_fill_count": 0,
             "taker_fill_cost": 100, "maker_fill_cost": 0,
@@ -339,11 +339,11 @@ def test_poll_resting_partial_keeps_full_committed_exposure(fresh_db, env_demo, 
     assert row["status"] == "partial"
     assert row["target_contracts"] == 5
     with db.get_db() as conn:
-        exposure = db.current_total_exposure_usd(conn, "demo")
+        exposure = db.current_total_exposure_usd(conn, "paper")
     assert exposure == pytest.approx(2.5)
 
 
-def test_poll_retires_order_to_gone_only_after_threshold(fresh_db, env_demo, cfg, monkeypatch):
+def test_poll_retires_order_to_gone_only_after_threshold(fresh_db, env_paper, cfg, monkeypatch):
     trader._poll_failures.clear()
     pid = seed_position(status="submitted", kalshi_order_id="OID-10",
                         target_contracts=5)
@@ -351,7 +351,7 @@ def test_poll_retires_order_to_gone_only_after_threshold(fresh_db, env_demo, cfg
     async def _no_positions(*_a, **_k):
         return []
 
-    async def _get_order_404(_oid):
+    async def _get_order_404(_oid, **_kw):
         raise KalshiAPIError(404, "not found")
 
     monkeypatch.setattr(trader, "get_positions", _no_positions)
@@ -365,7 +365,7 @@ def test_poll_retires_order_to_gone_only_after_threshold(fresh_db, env_demo, cfg
     assert fetch(pid)["status"] == "gone"
 
 
-def test_poll_auto_cancels_stale_resting_order(fresh_db, env_demo, cfg, monkeypatch):
+def test_poll_auto_cancels_stale_resting_order(fresh_db, env_paper, cfg, monkeypatch):
     trader._poll_failures.clear()
     cfg["order_expiration_sec"] = 90
     pid = seed_position(status="submitted", kalshi_order_id="OID-11",
@@ -374,7 +374,7 @@ def test_poll_auto_cancels_stale_resting_order(fresh_db, env_demo, cfg, monkeypa
     async def _no_positions(*_a, **_k):
         return []
 
-    async def _resting(_oid):
+    async def _resting(_oid, **_kw):
         return {"order": {
             "status": "resting", "taker_fill_count": 0, "maker_fill_count": 0,
             "taker_fill_cost": 0, "maker_fill_cost": 0,
@@ -404,7 +404,7 @@ def _settled_market(result: str):
     return _fetch
 
 
-def test_resolve_winning_yes_position(fresh_db, env_demo, cfg, monkeypatch):
+def test_resolve_winning_yes_position(fresh_db, env_paper, cfg, monkeypatch):
     pid = seed_position(status="filled", ticker="RES-WIN", direction="yes",
                         filled_contracts=10, cost_usd=6.0)
     monkeypatch.setattr(trader, "fetch_market", _settled_market("yes"))
@@ -418,7 +418,7 @@ def test_resolve_winning_yes_position(fresh_db, env_demo, cfg, monkeypatch):
     assert row["pnl_usd"] == pytest.approx(4.0)
 
 
-def test_resolve_losing_no_position(fresh_db, env_demo, cfg, monkeypatch):
+def test_resolve_losing_no_position(fresh_db, env_paper, cfg, monkeypatch):
     pid = seed_position(status="filled", ticker="RES-LOSS", direction="no",
                         filled_contracts=10, cost_usd=4.0)
     monkeypatch.setattr(trader, "fetch_market", _settled_market("yes"))
@@ -430,7 +430,7 @@ def test_resolve_losing_no_position(fresh_db, env_demo, cfg, monkeypatch):
     assert row["pnl_usd"] == pytest.approx(-4.0)
 
 
-def test_resolve_no_fill_row_closes_at_zero_with_null_outcome(fresh_db, env_demo, cfg):
+def test_resolve_no_fill_row_closes_at_zero_with_null_outcome(fresh_db, env_paper, cfg):
     pid = seed_position(status="canceled", ticker="RES-NOFILL",
                         filled_contracts=0, cost_usd=0.0)
     run_async(trader.mark_resolved_positions(cfg))
@@ -440,7 +440,7 @@ def test_resolve_no_fill_row_closes_at_zero_with_null_outcome(fresh_db, env_demo
     assert row["pnl_usd"] == pytest.approx(0.0)
 
 
-def test_resolve_clamps_pnl_to_physical_bounds(fresh_db, env_demo, cfg, monkeypatch):
+def test_resolve_clamps_pnl_to_physical_bounds(fresh_db, env_paper, cfg, monkeypatch):
     pid = seed_position(status="filled", ticker="CLAMP", direction="yes",
                         filled_contracts=10, cost_usd=6.0)
     monkeypatch.setattr(trader, "fetch_market", _settled_market("yes"))
@@ -455,7 +455,8 @@ def test_resolve_clamps_pnl_to_physical_bounds(fresh_db, env_demo, cfg, monkeypa
 
 
 
-def test_execute_duplicate_coid_rejection_adopts_live_order(fresh_db, env_demo, cfg, monkeypatch):
+
+def test_execute_duplicate_coid_rejection_adopts_live_order(fresh_db, env_paper, cfg, monkeypatch):
     cfg["enable_trading"] = True
     monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
 
@@ -465,7 +466,7 @@ def test_execute_duplicate_coid_rejection_adopts_live_order(fresh_db, env_demo, 
             "message": "an order with this client_order_id already exists",
         }})
 
-    async def _find(coid, ticker="", pin_env=None):
+    async def _find(coid, ticker="", pin_env=None, **_kw):
         return {"order_id": "OID-DUP", "status": "resting"}
 
     monkeypatch.setattr(trader, "place_limit_order", _place)
@@ -477,10 +478,10 @@ def test_execute_duplicate_coid_rejection_adopts_live_order(fresh_db, env_demo, 
     assert row["status"] == "submitted"
     assert row["kalshi_order_id"] == "OID-DUP"
     with db.get_db() as conn:
-        assert db.count_open_bot_positions(conn, "demo") == 1
+        assert db.count_open_bot_positions(conn, "paper") == 1
 
 
-def test_execute_duplicate_coid_but_lookup_misses_books_error(fresh_db, env_demo, cfg, monkeypatch):
+def test_execute_duplicate_coid_but_lookup_misses_books_error(fresh_db, env_paper, cfg, monkeypatch):
     cfg["enable_trading"] = True
     monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
 
@@ -490,7 +491,7 @@ def test_execute_duplicate_coid_but_lookup_misses_books_error(fresh_db, env_demo
             "message": "an order with this client_order_id already exists",
         }})
 
-    async def _find(coid, ticker="", pin_env=None):
+    async def _find(coid, ticker="", pin_env=None, **_kw):
         return None
 
     monkeypatch.setattr(trader, "place_limit_order", _place)
@@ -502,11 +503,11 @@ def test_execute_duplicate_coid_but_lookup_misses_books_error(fresh_db, env_demo
     assert row["status"] == "error"
 
 
-def test_execute_env_flip_books_unconfirmed_not_error(fresh_db, env_demo, cfg, monkeypatch):
+def test_execute_env_flip_books_unconfirmed_not_error(fresh_db, env_paper, cfg, monkeypatch):
     cfg["enable_trading"] = True
     monkeypatch.setattr(trader, "get_orderbook", _stub_empty_book)
 
-    env_now = {"v": "demo"}
+    env_now = {"v": "paper"}
     monkeypatch.setattr(trader, "get_env", lambda: env_now["v"])
 
     async def _place(**_kw):
@@ -516,7 +517,7 @@ def test_execute_env_flip_books_unconfirmed_not_error(fresh_db, env_demo, cfg, m
             "message": "environment switched mid-request; aborted",
         }})
 
-    async def _find(coid, ticker="", pin_env=None):
+    async def _find(coid, ticker="", pin_env=None, **_kw):
         raise AssertionError("lookup must not run against the wrong env")
 
     monkeypatch.setattr(trader, "place_limit_order", _place)
@@ -529,17 +530,17 @@ def test_execute_env_flip_books_unconfirmed_not_error(fresh_db, env_demo, cfg, m
     assert row["kalshi_order_id"] is None
     assert "UNCONFIRMED" in (row["error"] or "")
     with db.get_db() as conn:
-        assert db.count_open_bot_positions(conn, "demo") == 1
+        assert db.count_open_bot_positions(conn, "paper") == 1
 
 
-def test_cancel_all_books_raced_partial_fill(fresh_db, env_demo, monkeypatch):
+def test_cancel_all_books_raced_partial_fill(fresh_db, env_paper, monkeypatch):
     pid = seed_position(status="submitted", kalshi_order_id="OID-CA1",
                         target_contracts=5, limit_price_cents=50)
 
     async def _cancel(_oid, **_kw):
         return {}
 
-    async def _order(_oid):
+    async def _order(_oid, **_kw):
         return {"order": {
             "status": "canceled", "taker_fill_count": 2, "maker_fill_count": 0,
             "taker_fill_cost": 100, "maker_fill_cost": 0,
@@ -557,17 +558,17 @@ def test_cancel_all_books_raced_partial_fill(fresh_db, env_demo, monkeypatch):
     assert row["target_contracts"] == 2
     assert row["cost_usd"] == pytest.approx(1.0)
     with db.get_db() as conn:
-        assert db.count_open_bot_positions(conn, "demo") == 1
+        assert db.count_open_bot_positions(conn, "paper") == 1
 
 
-def test_cancel_all_confirmed_zero_fill_books_canceled(fresh_db, env_demo, monkeypatch):
+def test_cancel_all_confirmed_zero_fill_books_canceled(fresh_db, env_paper, monkeypatch):
     pid = seed_position(status="submitted", kalshi_order_id="OID-CA2",
                         target_contracts=5)
 
     async def _cancel(_oid, **_kw):
         return {}
 
-    async def _order(_oid):
+    async def _order(_oid, **_kw):
         return {"order": {
             "status": "canceled", "taker_fill_count": 0, "maker_fill_count": 0,
             "taker_fill_cost": 0, "maker_fill_cost": 0,
@@ -582,14 +583,14 @@ def test_cancel_all_confirmed_zero_fill_books_canceled(fresh_db, env_demo, monke
     assert fetch(pid)["status"] == "canceled"
 
 
-def test_cancel_all_unconfirmed_read_leaves_row_for_poll(fresh_db, env_demo, monkeypatch):
+def test_cancel_all_unconfirmed_read_leaves_row_for_poll(fresh_db, env_paper, monkeypatch):
     pid = seed_position(status="submitted", kalshi_order_id="OID-CA3",
                         target_contracts=5)
 
     async def _cancel(_oid, **_kw):
         return {}
 
-    async def _order(_oid):
+    async def _order(_oid, **_kw):
         raise KalshiAPIError(500, "boom")
 
     monkeypatch.setattr(trader, "cancel_order", _cancel)
@@ -600,7 +601,7 @@ def test_cancel_all_unconfirmed_read_leaves_row_for_poll(fresh_db, env_demo, mon
     assert fetch(pid)["status"] == "submitted"
 
 
-def test_poll_reentrancy_guard_skips_concurrent_run(fresh_db, env_demo, cfg, monkeypatch):
+def test_poll_reentrancy_guard_skips_concurrent_run(fresh_db, env_paper, cfg, monkeypatch):
     def _boom(conn, env=None):
         raise AssertionError("a second poll ran while one was active")
 
@@ -612,7 +613,7 @@ def test_poll_reentrancy_guard_skips_concurrent_run(fresh_db, env_demo, cfg, mon
         trader._poll_orders_active = False
 
 
-def test_poll_cancel_404_rereads_fills_before_gone(fresh_db, env_demo, cfg, monkeypatch):
+def test_poll_cancel_404_rereads_fills_before_gone(fresh_db, env_paper, cfg, monkeypatch):
     trader._poll_failures.clear()
     cfg["order_expiration_sec"] = 90
     pid = seed_position(status="submitted", kalshi_order_id="OID-R404",
@@ -623,7 +624,7 @@ def test_poll_cancel_404_rereads_fills_before_gone(fresh_db, env_demo, cfg, monk
 
     calls = {"n": 0}
 
-    async def _order(_oid):
+    async def _order(_oid, **_kw):
         calls["n"] += 1
         if calls["n"] == 1:
             return {"order": {
@@ -648,7 +649,7 @@ def test_poll_cancel_404_rereads_fills_before_gone(fresh_db, env_demo, cfg, monk
     assert fetch(pid)["status"] == "submitted"
 
 
-def test_poll_cancel_404_with_order_truly_unknown_books_gone(fresh_db, env_demo, cfg, monkeypatch):
+def test_poll_cancel_404_with_order_truly_unknown_books_gone(fresh_db, env_paper, cfg, monkeypatch):
     trader._poll_failures.clear()
     cfg["order_expiration_sec"] = 90
     pid = seed_position(status="submitted", kalshi_order_id="OID-R404B",
@@ -659,7 +660,7 @@ def test_poll_cancel_404_with_order_truly_unknown_books_gone(fresh_db, env_demo,
 
     calls = {"n": 0}
 
-    async def _order(_oid):
+    async def _order(_oid, **_kw):
         calls["n"] += 1
         if calls["n"] == 1:
             return {"order": {
@@ -680,7 +681,7 @@ def test_poll_cancel_404_with_order_truly_unknown_books_gone(fresh_db, env_demo,
     assert fetch(pid)["status"] == "gone"
 
 
-def test_poll_network_failures_do_not_feed_giveup_counter(fresh_db, env_demo, cfg, monkeypatch):
+def test_poll_network_failures_do_not_feed_giveup_counter(fresh_db, env_paper, cfg, monkeypatch):
     trader._poll_failures.clear()
     pid_nokid = seed_position(status="submitted", kalshi_order_id=None,
                               target_contracts=5)
@@ -701,7 +702,7 @@ def test_poll_network_failures_do_not_feed_giveup_counter(fresh_db, env_demo, cf
     assert fetch(pid_kid)["status"] == "submitted"
 
 
-def test_poll_confirmed_coid_miss_still_gives_up(fresh_db, env_demo, cfg, monkeypatch):
+def test_poll_confirmed_coid_miss_still_gives_up(fresh_db, env_paper, cfg, monkeypatch):
     trader._poll_failures.clear()
     pid = seed_position(status="submitted", kalshi_order_id=None,
                         target_contracts=5)
@@ -709,7 +710,7 @@ def test_poll_confirmed_coid_miss_still_gives_up(fresh_db, env_demo, cfg, monkey
     async def _no_positions(*_a, **_k):
         return []
 
-    async def _find_none(coid, ticker=""):
+    async def _find_none(coid, ticker="", **_kw):
         return None
 
     monkeypatch.setattr(trader, "get_positions", _no_positions)
@@ -720,7 +721,7 @@ def test_poll_confirmed_coid_miss_still_gives_up(fresh_db, env_demo, cfg, monkey
     assert fetch(pid)["status"] == "gone"
 
 
-def test_resolve_defers_fresh_gone_rows_to_poll_window(fresh_db, env_demo, cfg):
+def test_resolve_defers_fresh_gone_rows_to_poll_window(fresh_db, env_paper, cfg):
     pid = seed_position(status="gone", filled_contracts=0, cost_usd=0.0)
 
     run_async(trader.mark_resolved_positions(cfg))
@@ -735,10 +736,10 @@ def test_resolve_defers_fresh_gone_rows_to_poll_window(fresh_db, env_demo, cfg):
 
 
 def test_pending_query_is_env_scoped(fresh_db):
-    seed_position(status="submitted", kalshi_order_id="OID-D1", kalshi_env="demo")
+    seed_position(status="submitted", kalshi_order_id="OID-D1", kalshi_env="paper")
     seed_position(status="submitted", kalshi_order_id="OID-P1", kalshi_env="production")
     with db.get_db() as conn:
-        demo = db.get_pending_bot_positions(conn, "demo")
+        demo = db.get_pending_bot_positions(conn, "paper")
         both = db.get_pending_bot_positions(conn)
     assert [r["kalshi_order_id"] for r in demo] == ["OID-D1"]
     assert len(both) == 2
@@ -748,18 +749,18 @@ def test_refresh_balance_is_per_env(monkeypatch):
     trader._balance_cache.clear()
 
     async def fake_balance(*a, **k):
-        if trader.get_env() == "demo":
+        if trader.get_env() == "paper":
             return {"balance": 1000, "portfolio_value": 100}
         return {"balance": 5000, "portfolio_value": 500}
 
     monkeypatch.setattr(trader, "get_balance", fake_balance)
     cfg = {"balance_poll_interval": 60}
 
-    monkeypatch.setattr(trader, "get_env", lambda: "demo")
+    monkeypatch.setattr(trader, "get_env", lambda: "paper")
     assert run_async(trader.refresh_balance(cfg, force=True)) == (1000, 100)
 
     monkeypatch.setattr(trader, "get_env", lambda: "production")
     assert run_async(trader.refresh_balance(cfg, force=True)) == (5000, 500)
 
-    monkeypatch.setattr(trader, "get_env", lambda: "demo")
+    monkeypatch.setattr(trader, "get_env", lambda: "paper")
     assert run_async(trader.refresh_balance(cfg, force=False)) == (1000, 100)

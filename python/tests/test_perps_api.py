@@ -1,3 +1,6 @@
+"""kalshi_perps_api: money helpers, signed-path/env-pinning discipline,
+candle range chunking, order-body validation. No network — transport is
+monkeypatched."""
 from __future__ import annotations
 
 import asyncio
@@ -7,6 +10,7 @@ import pytest
 import kalshi_api
 import kalshi_auth
 import kalshi_perps_api as papi
+
 
 
 def test_usd_micro_roundtrip():
@@ -39,9 +43,23 @@ def test_rfc3339_to_sqlite():
 
 
 def test_env_ticker():
-    assert papi.env_ticker("KXBTCPERP", "demo") == "KXBTCPERP1"
     assert papi.env_ticker("KXBTCPERP", "production") == "KXBTCPERP"
-    assert papi.env_ticker("KXBTCPERP1", "demo") == "KXBTCPERP1"
+    assert papi.env_ticker("kxbtcperp", "paper") == "KXBTCPERP"
+
+
+def test_paper_refuses_every_signed_perps_call(monkeypatch):
+    """Perps have no paper book. In Paper a signed perps call is refused
+    before anything is signed or sent."""
+    def _sign(*_a):
+        raise AssertionError("must not sign in paper")
+    monkeypatch.setattr(papi, "sign_headers", _sign)
+    monkeypatch.setattr(papi, "get_env", lambda: "paper")
+    with pytest.raises(kalshi_api.KalshiAPIError) as ei:
+        asyncio.run(papi._signed_request("GET", "/margin/balance"))
+    assert ei.value.status == 403 and "paper_mode" in str(ei.value.body)
+    with pytest.raises(kalshi_api.KalshiAPIError):
+        asyncio.run(papi._signed_request("GET", "/margin/balance", pin_env="paper"))
+
 
 
 class _FakeResp:
@@ -76,6 +94,8 @@ class _FakeClient:
 
 
 def test_signed_request_signs_full_margin_path(monkeypatch):
+    """The RSA signature must cover /trade-api/v2/margin/... — signing the
+    bare /margin path is a guaranteed 401."""
     seen = {}
 
     def fake_sign(method, path):
@@ -95,7 +115,7 @@ def test_signed_request_signs_full_margin_path(monkeypatch):
 
 
 def test_env_pinning_aborts_on_flip(monkeypatch):
-    envs = iter(["production", "demo", "demo"])
+    envs = iter(["production", "paper", "paper"])
     monkeypatch.setattr(papi, "get_env", lambda: next(envs))
     monkeypatch.setattr(papi, "sign_headers", lambda m, p: {})
     fake = _FakeClient([_FakeResp(500, {}), _FakeResp(200, {"ok": True})])
@@ -151,6 +171,7 @@ def test_pub_get_soft_fails_to_none(monkeypatch):
     assert asyncio.run(papi.fetch_perps_markets()) == []
 
 
+
 def test_period_interval_validated():
     with pytest.raises(ValueError):
         asyncio.run(papi.fetch_perps_candlesticks("KXBTCPERP", 0, 60, 15))
@@ -161,6 +182,8 @@ def _mk_candle(end_ts):
 
 
 def test_candles_range_chunks_and_dedupes(monkeypatch):
+    """Full window coverage across chunk boundaries, no duplicate periods,
+    truncated pages resume from the last candle instead of skipping ahead."""
     windows = []
 
     async def fake_fetch(ticker, start_ts, end_ts, period):
@@ -190,6 +213,7 @@ def test_candles_range_terminates_on_empty(monkeypatch):
         "KXBTCPERP", 0, 10_000_000, 1, sleep_between=0.0, max_requests=5,
     ))
     assert out == []
+
 
 
 def test_place_order_validation():

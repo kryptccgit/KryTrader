@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { ShardStrip } from '../src/components/terminal/ShardBalances';
 import { ToastProvider } from '../src/state/ToastProvider';
 
+
 const shards = [
   { index: 0, name: 'general', cashUsd: 1204.5 },
   { index: 2, name: 'crypto', cashUsd: 0 },
@@ -23,7 +24,7 @@ const mount = (props: Partial<Parameters<typeof ShardStrip>[0]> = {}) => render(
   <ToastProvider>
     <ShardStrip
       shards={shards}
-      transferUrl="https://demo.kalshi.co/account/exchange-indexes"
+      transferUrl="https://kalshi.com/account/exchange-indexes"
       {...props}
     />
   </ToastProvider>,

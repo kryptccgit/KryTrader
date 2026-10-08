@@ -11,6 +11,8 @@ import { TickerLink } from '../components/KalshiTicker';
 import { BacktestPanel } from '../components/BacktestPanel';
 import { ShardBalances } from '../components/terminal/ShardBalances';
 import { cls, fmtUsd } from '../utils/format';
+import { c15WaitingLiveRunners } from '../utils/c15Live';
+import { userMessage } from '../utils/errors';
 
 const POLL_MS = 4000;
 
@@ -58,7 +60,7 @@ export function Crypto15mPage() {
       setStatus(st);
       setErr(null);
     } catch (e: any) {
-      setErr(e?.message || String(e));
+      setErr(userMessage(e));
     } finally {
       setLoading(false);
     }
@@ -78,7 +80,7 @@ export function Crypto15mPage() {
       await window.krypt.config.update(patch);
       await load();
     } catch (e: any) {
-      setErr(e?.message || String(e));
+      setErr(userMessage(e));
     } finally {
       setBusy(false);
     }
@@ -86,10 +88,21 @@ export function Crypto15mPage() {
 
   const toggleEnabled = (next: boolean) => patchAndReload({ crypto15mEnabled: next });
 
+  const roster = config?.crypto15mRunners ?? [];
+  const rosterLive = roster.filter((r) => r.enabled && r.mode === 'live');
+  const waitingLive = c15WaitingLiveRunners(config);
+
   async function toggleLive(next: boolean) {
+    const what = roster.length === 0
+      ? 'The 15-minute crypto executor will place REAL orders'
+      : rosterLive.length > 0
+        ? `${rosterLive.length} Multi-Run runner${rosterLive.length === 1 ? '' : 's'} set to LIVE `
+          + `(${rosterLive.map((r) => r.name).join(', ')}) will place REAL orders`
+        : 'No Multi-Run runner is set to LIVE yet, but any you switch to LIVE will place REAL orders';
     if (next && !window.confirm(
-      'Go LIVE? The 15-minute crypto executor will place REAL orders with your '
-      + 'Kalshi balance — independently of the main bot\'s Start Trading switch.',
+      `Arm 15m LIVE? ${what} with your Kalshi balance — independently of the main bot's `
+      + 'Start Trading switch.'
+      + (config?.accountMode === 'live' ? '' : ' (The app is in Paper now: nothing is real until you Go live in Settings → Account.)'),
     )) return;
     await patchAndReload({ crypto15mLive: next });
   }
@@ -100,7 +113,8 @@ export function Crypto15mPage() {
   const isLive = !!status?.live;
   const authed = !!status?.authed;
   const liveSupported = status?.liveSupported ?? true;
-  const mode: 'OFF' | 'MONITOR' | 'LIVE' = !enabled ? 'OFF' : isLive ? 'LIVE' : 'MONITOR';
+  const paperRunning = (status?.runners ?? []).some((r) => r.enabled && r.mode === 'paper');
+  const mode: Mode = !enabled ? 'OFF' : isLive ? 'LIVE' : paperRunning ? 'PAPER' : 'MONITOR';
   const openPos = status?.open ?? [];
   const recentPos = (status?.recent ?? []).filter((p) => p.resolved);
   const runnerNames: Record<string, string> = {};
@@ -131,10 +145,14 @@ export function Crypto15mPage() {
               label="Enable 15-minute crypto executor"
               description={
                 mode === 'LIVE'
-                  ? 'LIVE — placing real orders on your Kalshi account.'
-                  : mode === 'MONITOR'
-                    ? 'Monitor only — tracking signals but not placing orders (needs a live production account).'
-                    : 'Off — monitor only.'
+                  ? (hasRunners
+                    ? `LIVE — ${status?.liveRunners ?? 0} runner${(status?.liveRunners ?? 0) === 1 ? '' : 's'} placing real orders on your Kalshi account.`
+                    : 'LIVE — placing real orders on your Kalshi account.')
+                  : mode === 'PAPER'
+                    ? 'Paper — Multi-Run paper runners simulate fills; no real orders.'
+                    : mode === 'MONITOR'
+                      ? 'Monitor only — tracking signals but not placing orders.'
+                      : 'Off — monitor only.'
               }
             />
           </div>
@@ -145,7 +163,9 @@ export function Crypto15mPage() {
                 disabled={busy}
                 onChange={(v) => void toggleLive(v)}
                 label="Real orders (LIVE)"
-                description="Runs on its own — the main bot's Start Trading switch is not required."
+                description={roster.length > 0
+                  ? 'Master switch for Multi-Run: a runner set to LIVE places real orders only while this is on. Off stops them all.'
+                  : "Runs on its own — the main bot's Start Trading switch is not required."}
               />
             </div>
           )}
@@ -241,9 +261,9 @@ export function Crypto15mPage() {
         )}
         {enabled && !liveSupported && (
           <div className="mt-2 text-[11px] text-krypt-warn">
-            Kalshi's <span className="text-krypt-muted">demo</span> exchange doesn't carry the 15-minute crypto
-            markets, so orders can't be placed here — this just monitors. Switch to a
-            <span className="text-krypt-muted"> Live</span> account in Settings to trade them for real.
+            The app is in <span className="text-krypt-muted">Paper</span>: every runner trades the paper
+            simulation on the real 15-minute markets, whatever its own mode. Go live in
+            Settings → Account to trade them for real.
           </div>
         )}
         {enabled && liveSupported && liveArmed && !authed && (
@@ -252,10 +272,23 @@ export function Crypto15mPage() {
             <span className="text-krypt-muted"> Settings → Credentials</span>.
           </div>
         )}
-        {enabled && liveSupported && !liveArmed && (
+        {enabled && liveSupported && !liveArmed && waitingLive.length > 0 && (
+          <div className="mt-2 text-[11px] text-krypt-warn">
+            {waitingLive.length} Multi-Run runner{waitingLive.length === 1 ? ' is' : 's are'} set to LIVE
+            ({waitingLive.map((r) => r.name).join(', ')}) but place nothing — not even paper — until you flip
+            <span className="text-krypt-muted"> Real orders (LIVE)</span>.
+          </div>
+        )}
+        {enabled && liveSupported && !liveArmed && waitingLive.length === 0 && (
           <div className="mt-2 text-[11px] text-krypt-dim">
-            Monitor only. Flip <span className="text-krypt-muted">Real orders (LIVE)</span> to trade your Kalshi
-            balance — no other settings needed.
+            {roster.length > 0 ? 'No real orders.' : 'Monitor only.'} Flip{' '}
+            <span className="text-krypt-muted">Real orders (LIVE)</span> to trade your Kalshi
+            balance{roster.length > 0 ? ' with runners set to LIVE.' : ' — no other settings needed.'}
+          </div>
+        )}
+        {enabled && liveSupported && liveArmed && authed && roster.length > 0 && rosterLive.length === 0 && (
+          <div className="mt-2 text-[11px] text-krypt-dim">
+            Real orders are armed, but no enabled Multi-Run runner is set to LIVE — nothing is placing real orders.
           </div>
         )}
       </div>
@@ -417,10 +450,14 @@ function HourTradeToggles({
   );
 }
 
-function ModePill({ mode }: { mode: 'OFF' | 'MONITOR' | 'LIVE' }) {
+type Mode = 'OFF' | 'MONITOR' | 'PAPER' | 'LIVE';
+
+function ModePill({ mode }: { mode: Mode }) {
   const sty =
     mode === 'LIVE'
       ? 'border-krypt-loss/50 bg-krypt-loss/15 text-krypt-loss'
+      : mode === 'PAPER'
+        ? 'border-krypt-purple/50 bg-krypt-purple/15 text-krypt-purple'
       : mode === 'MONITOR'
         ? 'border-krypt-warn/50 bg-krypt-warn/15 text-krypt-warn'
         : 'border-krypt-border bg-krypt-surface2 text-krypt-muted';
@@ -1097,7 +1134,7 @@ function EdgeHealthCard() {
       try {
         const r = await window.krypt.crypto15m.edgeHealth();
         if (alive) setEh(r);
-      } catch {  }
+      } catch {}
     };
     void load();
     const t = setInterval(() => void load(), 30_000);

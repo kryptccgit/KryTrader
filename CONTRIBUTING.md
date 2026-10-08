@@ -5,7 +5,8 @@ keep changes small, tested, and easy to review.
 
 ## Development setup
 
-**Prerequisites:** Node.js 18+ and Python 3.10+ on PATH.
+**Prerequisites:** Node.js 18+ and Python 3.11+ on PATH (CI and the release builds freeze the
+backend with 3.11, and `websockets` 17 needs at least 3.11).
 
 ```bash
 npm install

@@ -4,6 +4,7 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, renameS
 import { dirname, join } from 'node:path';
 import { appendLog } from '../ipc';
 
+
 const APP_EXE = 'Krypt Trader.exe';
 const BACKEND_EXE = 'krypt-trader-backend.exe';
 
@@ -23,6 +24,7 @@ export function sleepSync(ms: number): void {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   } catch {   }
 }
+
 
 interface ProcRow { ProcessId: number; ExecutablePath: string | null }
 
@@ -92,6 +94,7 @@ export function takeOverOtherInstances(): number {
   }
   return killed;
 }
+
 
 function readPrevVersion(statePath: string): string | null {
   try {

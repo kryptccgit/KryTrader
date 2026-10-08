@@ -31,6 +31,7 @@ def _ticker_msg(product: str, price: float) -> dict:
 
 
 
+
 def test_handle_message_stores_prices_by_asset():
     c = _fresh_client()
     c.handle_message(_ticker_msg("BTC-USD", 65000.5))
@@ -61,6 +62,7 @@ def test_stale_prices_are_not_served():
     c.prices["BTC"] = (time.time(), 65000.0)
     c.connected = False
     assert c.fresh_spots() == {}
+
 
 
 
@@ -99,6 +101,7 @@ def test_window_partial_filters_to_settlement_span():
     total, count = c.window_partial("BTC", close, now=close - 30)
     assert count == 1 and total == pytest.approx(10.0)
     assert c.window_partial("XRP", close) == (0.0, 0)
+
 
 
 
@@ -146,6 +149,7 @@ def test_settlement_prob_guards():
         100.0, 100.0, 0.002, 0.9, partial_sum=100.0 * 59, partial_count=59,
     )
     assert p is not None and 0.0 <= p <= 1.0
+
 
 
 

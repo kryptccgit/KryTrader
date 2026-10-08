@@ -6,6 +6,10 @@ import { useApp } from '../state/AppStateProvider';
 import { Card, Empty, Page, ShareableStat, StatCard } from '../components/common';
 import { cls, fmtPct, fmtRelative, fmtUsd } from '../utils/format';
 import { computeTradeWarnings } from '../utils/warnings';
+import { BOOK_LABEL, bookEnvOf, isLive } from '../utils/account';
+import { balanceView } from '../utils/balance';
+import { bragText } from '../utils/brag';
+import { hitRate } from '../utils/stats';
 import { WhyNotTrading } from '../components/WhyNotTrading';
 import type { PageId } from '../App';
 
@@ -14,8 +18,9 @@ interface DashboardProps {
 }
 
 export function DashboardPage({ onNav }: DashboardProps) {
-  const { account, scannerStats, signals, positions, backend, credentials, credentialsAll, config } = useApp();
+  const { account, scannerStats, signals, positions, backend, credentialsAll, config } = useApp();
   const [series, setSeries] = useState<PnlPoint[]>([]);
+  const mode = config?.accountMode;
 
   useEffect(() => {
     let mounted = true;
@@ -25,63 +30,62 @@ export function DashboardPage({ onNav }: DashboardProps) {
         if (mounted) setSeries(s);
       } catch {   }
     };
+    setSeries([]);
     void load();
     const i = window.setInterval(load, 30000);
     return () => {
       mounted = false;
       window.clearInterval(i);
     };
-  }, []);
+  }, [mode]);
 
   const openPos = positions.filter(
     (p) => !p.resolved
       && p.status !== 'dry_run'
       && (p.status === 'filled' || p.status === 'partial' || p.status === 'submitted'),
   );
+  const book = bookEnvOf(config);
   const botOpenPos = openPos.filter(
-    (p) => p.signalSource !== 'external' && (!config || p.kalshiEnv === config.kalshiEnv),
+    (p) => p.signalSource !== 'external' && (!config || p.kalshiEnv === book),
   );
   const botPendingCount = botOpenPos.filter((p) => p.status === 'submitted').length;
   const externalOpenCount = openPos.length - botOpenPos.length;
   const recentResolved = positions
-    .filter((p) => p.resolved)
+    .filter((p) => p.resolved && (!config || p.kalshiEnv === book))
     .slice(0, 5);
 
   const issues: { label: string; tone: 'warn' | 'bad' | 'good'; cta?: { label: string; page: PageId } }[] = [];
-  const activeEnvHasKeys = !!credentials?.hasApiKey && !!credentials?.hasRsaKey;
-  const otherEnv: 'demo' | 'production' = config?.kalshiEnv === 'production' ? 'demo' : 'production';
-  const otherEnvHasKeys = !!credentialsAll?.[otherEnv]?.hasApiKey && !!credentialsAll?.[otherEnv]?.hasRsaKey;
-  if (!activeEnvHasKeys) {
-    if (otherEnvHasKeys) {
-      issues.push({
-        label: `${config?.kalshiEnv === 'production' ? 'Live' : 'Demo'} keys not saved — your ${otherEnv === 'production' ? 'Live' : 'Demo'} keys are saved though, switch to that session?`,
-        tone: 'warn',
-        cta: { label: 'Manage keys', page: 'api' },
-      });
-    } else {
-      issues.push({
-        label: 'API keys not configured — bot can only run in DRY-RUN mode',
-        tone: 'bad',
-        cta: { label: 'Add Keys', page: 'api' },
-      });
-    }
-  } else if (!backend.authOk) {
+  const hasKeys = !!credentialsAll?.production?.hasApiKey && !!credentialsAll?.production?.hasRsaKey;
+  const live = isLive(config);
+  const bal = balanceView(account, {
+    config, authOk: backend.authOk, hasKeys: credentialsAll ? hasKeys : null,
+    engineRunning: backend.status === 'running',
+  });
+  const brag = (t: string): string => bragText(t, live);
+  if (live && !hasKeys) {
+    issues.push({
+      label: 'The app is Live but no Kalshi key is saved — nothing can trade. Add a key, or switch back to Paper.',
+      tone: 'bad',
+      cta: { label: 'Add Keys', page: 'api' },
+    });
+  } else if (live && !backend.authOk) {
     issues.push({
       label: 'Saved keys could not authenticate to Kalshi',
       tone: 'bad',
       cta: { label: 'Re-test', page: 'api' },
     });
   }
-  if (config && !config.enableTrading && credentials?.hasApiKey) {
+  if (config && !config.enableTrading && (hasKeys || !live)) {
     issues.push({
       label: 'Auto-trading is paused — flip the switch in the top bar to enable',
       tone: 'warn',
     });
   }
-  if (config && config.enableTrading && config.kalshiEnv !== 'production') {
+  if (config && !live) {
     issues.push({
-      label: 'Running on the Demo environment — orders use Kalshi demo funds, not real money',
-      tone: 'warn',
+      label: 'PAPER mode — real Kalshi prices, imaginary money. Nothing here can send a real order. Go live in Settings → Account.',
+      tone: 'good',
+      cta: { label: 'Account', page: 'settings' },
     });
   }
   if (backend.status !== 'running' && backend.status !== 'starting') {
@@ -101,42 +105,54 @@ export function DashboardPage({ onNav }: DashboardProps) {
     issues.push({ label: 'Everything looks good. Bot is online and watching.', tone: 'good' });
   }
 
-  const sessionPnl = account?.sessionPnlUsd ?? 0;
-  const sessionBaseline = account?.sessionBaselineUsd ?? null;
-  const sessionRoi = account?.sessionRoiPct ?? 0;
+  const sessionPnl = bal.sessionPnlUsd;
+  const sessionBaseline = bal.known ? account?.sessionBaselineUsd ?? null : null;
+  const sessionRoi = bal.sessionRoiPct;
   const sessionStartedAt = account?.sessionStartedAt;
-  const alltimePnl = account?.alltimePnlUsd ?? 0;
-  const realizedPos = account?.realizedPnlUsd ?? 0;
-  const alltimeBaseline = account?.alltimeBaselineUsd ?? null;
+  const alltimePnl = bal.alltimePnlUsd;
+  const realizedPos = account?.realizedPnlUsd ?? null;
+  const alltimeBaseline = bal.known ? account?.alltimeBaselineUsd ?? null : null;
+  const decided = (account?.wins ?? 0) + (account?.losses ?? 0);
+  const tone = (v: number | null): 'good' | 'bad' | undefined => (v === null ? undefined : v >= 0 ? 'good' : 'bad');
 
   return (
-    <Page title="Dashboard" subtitle="Live snapshot of your portfolio, signals, and bot health.">
+    <Page title="Dashboard" subtitle="A snapshot of the book you are in now: balance, signals and bot health.">
       <div className="grid gap-4 md:grid-cols-3">
-        <ShareableStat
-          label="Total Balance"
-          value={fmtUsd(account?.totalUsd)}
-          hint={account?.balanceSyncing
-            ? '⏳ syncing — an order just filled or settled; Kalshi reflects it in a moment'
-            : `cash ${fmtUsd(account?.cashUsd)} · port ${fmtUsd(account?.portfolioUsd)}`}
-          shareText={`Krypt Trader balance: ${fmtUsd(account?.totalUsd)} `
-            + `(${fmtUsd(alltimePnl, { sign: true })} since I started). `
-            + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`}
-        />
-        <ShareableStat
-          label="Session P&L"
-          value={fmtUsd(sessionPnl, { sign: true })}
-          hint={
-            account?.balanceSyncing
-              ? '⏳ syncing — a fill/settlement is landing; this number self-corrects in a moment'
-              : sessionBaseline
-                ? `${fmtUsd(sessionBaseline)} → ${fmtUsd(account?.totalUsd)} · ${fmtPct(sessionRoi)} · since ${fmtRelative(sessionStartedAt)}`
-                : 'session baseline pending'
-          }
-          accent={account?.balanceSyncing ? undefined : sessionPnl >= 0 ? 'good' : 'bad'}
-          shareText={`This session on Krypt Trader: ${sessionPnl >= 0 ? '+' : ''}${fmtUsd(sessionPnl)} `
-            + `(${fmtPct(sessionRoi)} ROI). `
-            + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`}
-        />
+        {bal.known ? (
+          <ShareableStat
+            label={`Total Balance · ${live ? 'Live' : 'Paper'}`}
+            value={fmtUsd(bal.totalUsd)}
+            hint={account?.balanceSyncing
+              ? '⏳ syncing — an order just filled or settled; Kalshi reflects it in a moment'
+              : `cash ${fmtUsd(bal.cashUsd)} · port ${fmtUsd(bal.portfolioUsd)}`}
+            shareText={brag(`Krypt Trader balance: ${fmtUsd(bal.totalUsd)}`
+              + (alltimePnl !== null ? ` (${fmtUsd(alltimePnl, { sign: true })} since I started)` : '')
+              + '. Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader')}
+          />
+        ) : (
+          <StatCard label={`Total Balance · ${live ? 'Live' : 'Paper'}`} value="—" hint={bal.why ?? undefined} />
+        )}
+        {sessionPnl !== null ? (
+          <ShareableStat
+            label="Session P&L"
+            value={fmtUsd(sessionPnl, { sign: true })}
+            hint={
+              account?.balanceSyncing
+                ? '⏳ syncing — a fill/settlement is landing; this number self-corrects in a moment'
+                : `${fmtUsd(sessionBaseline)} → ${fmtUsd(bal.totalUsd)} · ${fmtPct(sessionRoi)} · since ${fmtRelative(sessionStartedAt)}`
+            }
+            accent={account?.balanceSyncing ? undefined : tone(sessionPnl)}
+            shareText={brag(`This session on Krypt Trader: ${fmtUsd(sessionPnl, { sign: true })}`
+              + (sessionRoi !== null ? ` (${fmtPct(sessionRoi)} ROI)` : '')
+              + '. Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader')}
+          />
+        ) : (
+          <StatCard
+            label="Session P&L"
+            value="—"
+            hint={bal.known ? 'session baseline pending' : bal.why ?? undefined}
+          />
+        )}
         <StatCard
           label="Open Positions"
           value={`${botOpenPos.length} / ${config?.maxOpenPositions ?? 25}`}
@@ -146,29 +162,35 @@ export function DashboardPage({ onNav }: DashboardProps) {
       </div>
 
       <div className="mt-3 grid gap-4 md:grid-cols-2">
-        <ShareableStat
-          label="All-time P&L"
-          value={fmtUsd(alltimePnl, { sign: true })}
-          hint={
-            alltimeBaseline
-              ? `${fmtUsd(alltimeBaseline)} → ${fmtUsd(account?.totalUsd)} · balance delta`
-              : 'pending baseline'
-          }
-          accent={alltimePnl >= 0 ? 'good' : 'bad'}
-          shareText={`All-time on Krypt Trader: ${alltimePnl >= 0 ? '+' : ''}${fmtUsd(alltimePnl)} `
-            + `(${fmtPct(account?.roiPct ?? 0)}). `
-            + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`}
-        />
-        <ShareableStat
-          label="Win Rate"
-          value={(account?.wins ?? 0) + (account?.losses ?? 0) > 0
-            ? `${(account?.winRate ?? 0).toFixed(1)}%`
-            : '—'}
-          hint={`${account?.wins ?? 0}W / ${account?.losses ?? 0}L · pos-derived realized ${fmtUsd(realizedPos, { sign: true })}`}
-          shareText={`Krypt Trader win rate: ${(account?.winRate ?? 0).toFixed(1)}% `
-            + `(${account?.wins ?? 0}W / ${account?.losses ?? 0}L). `
-            + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`}
-        />
+        {alltimePnl !== null ? (
+          <ShareableStat
+            label="All-time P&L"
+            value={fmtUsd(alltimePnl, { sign: true })}
+            hint={`${fmtUsd(alltimeBaseline)} → ${fmtUsd(bal.totalUsd)} · change in balance`}
+            accent={tone(alltimePnl)}
+            shareText={brag(`All-time on Krypt Trader: ${fmtUsd(alltimePnl, { sign: true })}`
+              + (bal.roiPct !== null ? ` (${fmtPct(bal.roiPct)})` : '')
+              + '. Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader')}
+          />
+        ) : (
+          <StatCard
+            label="All-time P&L"
+            value="—"
+            hint={bal.known ? 'Starts once the first balance snapshot is saved.' : bal.why ?? undefined}
+          />
+        )}
+        {decided > 0 ? (
+          <ShareableStat
+            label="Win Rate"
+            value={`${(account?.winRate ?? 0).toFixed(1)}%`}
+            hint={`${account?.wins ?? 0}W / ${account?.losses ?? 0}L · settled trades P&L ${fmtUsd(realizedPos, { sign: true })}`}
+            shareText={brag(`Krypt Trader win rate: ${(account?.winRate ?? 0).toFixed(1)}% `
+              + `(${account?.wins ?? 0}W / ${account?.losses ?? 0}L). `
+              + 'Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader')}
+          />
+        ) : (
+          <StatCard label="Win Rate" value="—" hint="No settled trades yet in this book." />
+        )}
       </div>
 
       <div className="mt-6 grid gap-4 lg:grid-cols-3">
@@ -265,11 +287,11 @@ export function DashboardPage({ onNav }: DashboardProps) {
             ))}
           </div>
           <div className="mt-4 grid grid-cols-2 gap-2 text-xs">
-            <Mini label="Whales seen" value={`${scannerStats?.whales.total ?? 0}`} />
-            <Mini label="Whales hit" value={`${(scannerStats?.whales.winRate ?? 0).toFixed(1)}%`} />
-            <Mini label="Momentum seen" value={`${scannerStats?.momentum.total ?? 0}`} />
-            <Mini label="Momentum hit" value={`${(scannerStats?.momentum.winRate ?? 0).toFixed(1)}%`} />
-            <Mini label="Markets" value={`${scannerStats?.marketsTracked ?? 0}`} />
+            <Mini label="Whales seen" value={scannerStats ? `${scannerStats.whales.total}` : '—'} />
+            <Mini label="Whales hit" value={hitRate(scannerStats?.whales)} />
+            <Mini label="Momentum seen" value={scannerStats ? `${scannerStats.momentum.total}` : '—'} />
+            <Mini label="Momentum hit" value={hitRate(scannerStats?.momentum)} />
+            <Mini label="Markets" value={scannerStats ? `${scannerStats.marketsTracked}` : '—'} />
             <Mini label="Last scan" value={fmtRelative(scannerStats?.lastTradeScanAt)} />
           </div>
           <div className="mt-4">
@@ -329,6 +351,7 @@ export function DashboardPage({ onNav }: DashboardProps) {
             <div className="flex items-center gap-2">
               <Sparkles className="h-4 w-4 text-krypt-pink" />
               <span className="text-sm text-white">Recent resolutions</span>
+              <span className="text-[11px] text-krypt-dim">· {BOOK_LABEL[book]} book</span>
             </div>
             <button onClick={() => onNav('history')} className="text-xs text-krypt-muted hover:text-white">
               View all <ArrowRight className="ml-1 inline h-3 w-3" />
@@ -368,6 +391,7 @@ export function DashboardPage({ onNav }: DashboardProps) {
     </Page>
   );
 }
+
 
 function Mini({ label, value }: { label: string; value: string }) {
   return (

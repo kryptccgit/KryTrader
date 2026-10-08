@@ -1,2 +1,5 @@
+# Dev/test-only dependencies. NOT bundled into the PyInstaller backend
+# (build-python.mjs installs requirements.txt only), so these never ship
+# in the desktop app.
 -r requirements.txt
 pytest>=8.0

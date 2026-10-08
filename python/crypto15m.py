@@ -32,6 +32,10 @@ ALL_ASSETS = [s["asset"] for s in SERIES]
 
 
 def asset_enabled(cfg: dict, asset: str) -> bool:
+    """True if the executor may open NEW positions on `asset`. None/missing
+    `crypto15m_assets` = all enabled; a list restricts to those symbols (an
+    empty list disables every asset). Monitoring/snapshots are unaffected —
+    this only gates entries."""
     raw = (cfg or {}).get("crypto15m_assets")
     if isinstance(raw, list):
         return asset.upper() in {str(a).upper() for a in raw}
@@ -96,36 +100,26 @@ def _to_float(v) -> float:
         return 0.0
 
 
-def _price_dollars(m: dict, key: str) -> Optional[float]:
-    # Kalshi sends "0.0000" for an empty book side and a never-traded market,
-    # and derives no_ask_dollars "1.0000" when there is no YES bid. Neither is
-    # a price. Read as one, an absent ask became a $0 entry cost and an absent
-    # bid a 99.9c paper exit. Only the open interval (0, 1) is a quote.
+def _price_dollars(m: dict, key: str) -> float:
     d = m.get(f"{key}_dollars")
     if d is not None:
-        v = _to_float(d)
-    elif m.get(key) is not None:
-        v = _to_float(m.get(key)) / 100.0
-    else:
-        return None
-    return v if 0.0 < v < 1.0 else None
+        return _to_float(d)
+    return _to_float(m.get(key)) / 100.0
 
 
-def _mid_up(
-    yes_bid: Optional[float], yes_ask: Optional[float], last_price: Optional[float],
-) -> Optional[float]:
+def _mid_up(yes_bid: float, yes_ask: float, last_price: float) -> float:
+    """Up/yes probability (0..1) from quotes. Average ONLY when both sides are
+    present — a one-sided book must use the single quote, never (bid+0)/2, which
+    halves the probability and trips spurious stop-loss sells / wrong-side rule
+    entries. Falls back to last_price when the book is empty."""
     if yes_bid and yes_ask:
         up = (yes_bid + yes_ask) / 2
     elif yes_bid:
         up = yes_bid
     elif yes_ask:
         up = yes_ask
-    elif last_price:
-        up = last_price
     else:
-        # No bid, no ask, never traded: nothing says which side is favoured.
-        # This used to fall through to 0.0 -- "down at 100%".
-        return None
+        up = last_price
     return max(0.0, min(1.0, up))
 
 
@@ -238,6 +232,10 @@ _indicator_cache: dict[str, dict] = {}
 async def _fetch_closes(
     asset: str, client: httpx.AsyncClient, lookback_min: int
 ) -> tuple[list[float], list[float]]:
+    """The last `lookback_min` one-minute (closes, volumes) for `asset` from
+    Hyperliquid, oldest→newest and index-aligned. Volume powers the true VWAP
+    field; a candle missing either is skipped so the two lists stay aligned.
+    Empty lists on any error (caller degrades to None fields)."""
     now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     body = {
         "type": "candleSnapshot",
@@ -273,6 +271,9 @@ async def _fetch_closes(
 
 
 async def asset_indicators(asset: str) -> dict:
+    """MACD/RSI bundle for one asset's underlying, cached ~60s and shared by
+    the monitor poll, executor tick and recorder. All-None on any failure or
+    until there's enough candle history."""
     loop = asyncio.get_event_loop()
     now = loop.time()
     cached = _indicator_cache.get(asset)
@@ -330,6 +331,11 @@ def hours_ok(cfg: dict, hour: Optional[int] = None) -> bool:
 
 
 def _market_strike(m: dict) -> Optional[float]:
+    """The market's strike / reference price — the level the underlying must be
+    above at close for YES/up to win. The self-tracked `open15m` (first cached
+    spot seen after the boundary) drifts from Kalshi's actual strike, and is
+    plain WRONG after a mid-window restart; the market object carries the real
+    number, so prefer it always."""
     for k in ("floor_strike", "floor_strike_dollars", "cap_strike",
               "strike", "strike_dollars"):
         v = m.get(k)
@@ -352,6 +358,10 @@ def model_up_prob(
     spot: Optional[float], strike: Optional[float],
     sigma_1m: Optional[float], mins_left: Optional[float],
 ) -> Optional[float]:
+    """Terminal-spot model P(up): probability the spot ends above the strike at
+    close, treating the remaining move as N(0, (σ√t·spot)²) with σ the realized
+    1-minute return vol. Kept as the simple fallback — settlement_up_prob is
+    the production model (Kalshi settles on a 60s AVERAGE, not the endpoint)."""
     if spot is None or strike is None or sigma_1m is None or mins_left is None:
         return None
     if spot <= 0 or strike <= 0 or sigma_1m <= 0:
@@ -372,6 +382,19 @@ def settlement_up_prob(
     sigma_1m: Optional[float], mins_left: Optional[float],
     *, partial_sum: float = 0.0, partial_count: int = 0,
 ) -> Optional[float]:
+    """P(up) under Kalshi's REAL settlement rule: the mean of ~60 one-second
+    index prints over the final minute, not the terminal spot.
+
+    Outside the final minute: diffusion to the window start plus the fixed
+    variance of the 60-print average (≈0.342 min equivalent — continuous with
+    the in-window branch at exactly 1 minute left).
+
+    Inside the final minute the settlement value is being REALIZED print by
+    print: `partial_sum/partial_count` are the prints already observed (from
+    spot_ws.window_partial); only the future prints are uncertain, so with 30
+    of 60 in, half the settlement is already locked. Elapsed-but-unobserved
+    prints (feed started late) are approximated at the current spot — a small
+    bias toward spot, zero variance, strictly better than ignoring them."""
     if spot is None or strike is None or sigma_1m is None or mins_left is None:
         return None
     if spot <= 0 or strike <= 0 or sigma_1m <= 0:
@@ -405,6 +428,12 @@ def settlement_up_prob(
 
 
 def _fee_cents(price_cents: float, contracts: int = 1) -> float:
+    """Kalshi taker fee in cents/contract, CEIL-aware: Kalshi rounds the
+    per-order fee UP to the next cent, so a 1-lot at 97c pays 1.0c — not the
+    0.20c the continuous 7·p·(1−p) curve claims. The continuous model
+    overstated net edge by up to ~0.8c exactly at the deep-favorite prices
+    the sniper buys. Defaults to the 1-lot (worst, most conservative) fee;
+    per-contract fee only falls as size grows."""
     import backtest as _bt
     p = max(1.0, min(99.0, price_cents)) / 100.0
     return _bt.kalshi_fee_per_contract(p, contracts=max(1, int(contracts))) * 100.0
@@ -413,6 +442,11 @@ def _fee_cents(price_cents: float, contracts: int = 1) -> float:
 def model_edge_net_cents(
     up_prob: Optional[float], yes_ask: Optional[float], no_ask: Optional[float],
 ) -> Optional[float]:
+    """Best fee-adjusted cents of edge the settlement model sees on EITHER
+    side: buy-up edge = P(up)·100 − upAsk − fee, buy-down mirrored. Positive =
+    the model thinks a side is underpriced net of the taker fee; the sign of
+    which side is implied by upProb vs the asks. None when the model or both
+    asks are unavailable."""
     if up_prob is None:
         return None
     edges = []
@@ -489,20 +523,13 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
     yes_bid = _price_dollars(m, "yes_bid")
     yes_ask = _price_dollars(m, "yes_ask")
     up = _mid_up(yes_bid, yes_ask, _price_dollars(m, "last_price"))
-    if up is None:
-        down = favorite = fav_price = None
-    else:
-        down = 1.0 - up
-        favorite = "up" if up >= down else "down"
-        fav_price = up if favorite == "up" else down
+    down = 1.0 - up
+    favorite = "up" if up >= down else "down"
+    fav_price = up if favorite == "up" else down
 
     no_ask = _price_dollars(m, "no_ask")
-    if favorite == "up":
-        entry_cost = yes_ask
-    elif favorite == "down":
-        entry_cost = no_ask if no_ask else ((1.0 - yes_bid) if yes_bid else None)
-    else:
-        entry_cost = None
+    entry_cost = yes_ask if favorite == "up" else (no_ask if no_ask else 1.0 - yes_bid)
+    entry_cost = max(0.0, min(1.0, entry_cost))
 
     mins_left = (close_epoch - now_epoch) / 60.0
     hour_utc = datetime.fromtimestamp(now_epoch, timezone.utc).hour
@@ -518,8 +545,6 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         delta_ok = delta_signed <= -min_dp
     signal = (
         in_window
-        and fav_price is not None
-        and entry_cost is not None
         and hours_ok(cfg)
         and fav_price >= _const(cfg, "entry_threshold")
         and entry_cost <= _const(cfg, "entry_max")
@@ -534,11 +559,9 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
         ),
         "hasMarket": True, "ticker": m.get("ticker"),
         "closeTime": m.get("close_time"), "minsLeft": round(mins_left, 2),
-        "upProb": round(up, 4) if up is not None else None,
-        "downProb": round(down, 4) if down is not None else None,
-        "favorite": favorite,
-        "favoritePrice": round(fav_price, 4) if fav_price is not None else None,
-        "entryCost": round(entry_cost, 4) if entry_cost is not None else None,
+        "upProb": round(up, 4), "downProb": round(down, 4),
+        "favorite": favorite, "favoritePrice": round(fav_price, 4),
+        "entryCost": round(entry_cost, 4),
         "yesBid": round(yes_bid, 4) if yes_bid else None,
         "yesAsk": round(yes_ask, 4) if yes_ask else None,
         "inWindow": in_window, "signal": signal, "hourUtc": hour_utc,
@@ -592,6 +615,14 @@ async def _asset_snapshot(entry: dict, spot: Optional[float], cfg: dict, now_epo
 
 
 def _apply_cross_asset(assets: list[dict], now_epoch: float) -> None:
+    """Compute timing + cross-asset correlation fields across the whole snapshot
+    and inject them per-asset (optional rule-builder fields, never forced gates):
+
+      hourUtc     current UTC hour 0-23 (also stamped on blank/errored assets)
+      marketBias  market-wide directional lean = (#up - #down) / #withFavorite,
+                  range -1..1; same for every asset (a breadth gauge)
+      peersAgree  fraction of the OTHER favorited assets whose favorite matches
+                  this asset's, range 0..1 — high = the pack agrees."""
     hour_utc = datetime.fromtimestamp(now_epoch, timezone.utc).hour
     favs = [a.get("favorite") for a in assets
             if a.get("hasMarket") and a.get("favorite") in ("up", "down")]
@@ -617,6 +648,9 @@ _SNAPSHOT_TTL = 3.0
 
 
 def active_tickers() -> set[str]:
+    """Tickers of the CURRENT 15m window per asset (from the last snapshot) —
+    the set the WS layer subscribes so entry/pairs decisions read live quotes,
+    not just positions we already hold."""
     snap = _snapshot_cache.get("data") or {}
     return {
         a["ticker"] for a in snap.get("assets", [])
@@ -625,6 +659,10 @@ def active_tickers() -> set[str]:
 
 
 def active_market_meta() -> list[dict]:
+    """Per-ticker metadata for the CURRENT 15m window from the last snapshot —
+    what the HF recorder needs to stamp each sample without re-fetching:
+    {ticker, asset, closeTime, minsLeft, strikeUsd, favorite}. Reads the same
+    ~3s snapshot cache active_tickers() does."""
     snap = _snapshot_cache.get("data") or {}
     out = []
     for a in snap.get("assets", []):
@@ -639,6 +677,11 @@ def active_market_meta() -> list[dict]:
 
 
 async def snapshot(cfg: dict) -> dict:
+    """Build the full monitor snapshot for all seven series, then inject the
+    cross-asset fields. Cached ~3s so the executor poll, the recorder and the
+    open Crypto tab SHARE one snapshot instead of each firing the full fan-out
+    (incl. the new Hyperliquid indicator calls) — well inside the poll interval
+    and a 15-min window, so the slight staleness is immaterial."""
     now_epoch = kalshi_auth.server_now()
     cached = _snapshot_cache.get("data")
     if cached is not None and (now_epoch - _snapshot_cache.get("at", 0.0)) < _SNAPSHOT_TTL:

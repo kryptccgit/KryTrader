@@ -5,7 +5,10 @@ import rules
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "kalshi_env": "demo",
+    "account_mode": "paper",
+    "paper_bankroll_usd": 1000.0,
+    "shard_auto_move": True,
+    "shard_auto_move_max_usd_day": 1000.0,
     "enable_trading": False,
     "auto_upgrade_api_level": True,
 
@@ -29,9 +32,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "allowed_whale_categories": None,
     "allowed_momentum_categories": None,
     "contrarian_only": True,
-
-    "gambling_mode": False,
-    "gambling_trade_probability": 0.10,
 
     "sizing_mode": "percent",
     "fixed_trade_usd": 5.0,
@@ -146,6 +146,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "mcp_min_edge_cents": 3.0,
     "mcp_daily_loss_usd": 50.0,
     "mcp_live_approval": True,
+    "mcp_http_enabled": False,
 
     "autopilot_enabled": False,
     "autopilot_interval_min": 60,
@@ -153,7 +154,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "autopilot_daily_token_budget": 1_500_000,
     "autopilot_max_steps": 15,
     "autopilot_mission": "",
-    "mcp_paper_bankroll_usd": 1000.0,
+    "autopilot_agent_id": "default",
+    "mcp_agents": None,
     "mcp_allow_research": False,
     "mcp_allow_scripts": False,
     "mcp_allow_script_run": False,
@@ -174,6 +176,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "perps_farm_daily_volume_usd": 0.0,
     "perps_farm_max_cost_bps": 4.0,
     "perps_farm_max_fee_bps": 0.0,
+
     "crypto15m_indicator_detect": True,
     "crypto15m_spot_ws": True,
     "crypto15m_arb_detect": True,
@@ -199,249 +202,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "enable_discord": True,
 }
 
-
-
-STRATEGY_PRESETS: list[dict[str, Any]] = [
-    {
-        "id": "krypt-balanced",
-        "name": "Krypt Balanced",
-        "tagline": "Whales + momentum, both gates active.",
-        "description": (
-            "Our default everyday strategy. Trades both whale signals and "
-            "trade-cluster momentum signals with edge ≥ 5pts and "
-            "confidence ≥ 55%. 2-6% sizing, $50 hard cap. Best fit for "
-            "most users — let it run a few weeks and check the stats."
-        ),
-        "riskLabel": "balanced",
-        "badge": "recommended",
-        "config": {},
-    },
-    {
-        "id": "krypt-conservative",
-        "name": "Krypt Conservative",
-        "tagline": "Tight sizing, high-edge only, capital-preservation mode.",
-        "description": (
-            "Only trades signals with edge ≥ 6pts net of fees and confidence "
-            "≥ 65%. Smaller sizing (1-3% of bankroll), $25 hard cap. Daily "
-            "stop-loss at -$25. Designed to ride out variance with "
-            "minimum drawdown. (Gate is 6, not 8: edge is fee-adjusted and "
-            "capped at 10/8 by the scorer — an 8pt net gate would sit above "
-            "what momentum can ever score.)"
-        ),
-        "riskLabel": "safe",
-        "config": {
-            "min_edge_pts_whale": 6.0,
-            "min_edge_pts_momentum": 6.0,
-            "min_confidence_whale": 65.0,
-            "min_confidence_momentum": 65.0,
-            "base_size_fraction": 0.015,
-            "min_size_fraction": 0.01,
-            "max_size_fraction": 0.03,
-            "hard_max_position_usd": 25.0,
-            "max_open_positions": 10,
-            "max_daily_new_positions": 15,
-            "stop_loss_on_day": -25.0,
-            "max_total_exposure_fraction": 0.50,
-        },
-    },
-    {
-        "id": "krypt-aggressive",
-        "name": "Krypt Aggressive",
-        "tagline": "More signals, larger sizing, higher variance.",
-        "description": (
-            "Loosens edge gates to 3pts and confidence to 50%. Sizing "
-            "scales 4-10% of bankroll, $100 cap. Higher max-open count. "
-            "Use only with a bankroll you can stand to drop 30% on a "
-            "bad day."
-        ),
-        "riskLabel": "aggressive",
-        "config": {
-            "min_edge_pts_whale": 3.0,
-            "min_edge_pts_momentum": 3.0,
-            "min_confidence_whale": 50.0,
-            "min_confidence_momentum": 50.0,
-            "base_size_fraction": 0.06,
-            "min_size_fraction": 0.04,
-            "max_size_fraction": 0.10,
-            "hard_max_position_usd": 100.0,
-            "max_open_positions": 40,
-            "max_daily_new_positions": 80,
-            "max_total_exposure_fraction": 0.85,
-            "stop_loss_on_day": -100.0,
-        },
-    },
-    {
-        "id": "krypt-whale-only",
-        "name": "Whale Hunter",
-        "tagline": "Follows large taker orders. No momentum signals.",
-        "description": (
-            "Pure whale-following. Disables momentum entirely and only "
-            "trades when a $2.5k+ taker order hits a market with a "
-            "scored edge ≥ 5pts. Best when you trust 'smart money' "
-            "patterns more than crowd contrarian setups."
-        ),
-        "riskLabel": "balanced",
-        "config": {
-            "trade_whales": True,
-            "trade_momentum": False,
-            "min_edge_pts_whale": 5.0,
-            "min_confidence_whale": 55.0,
-        },
-    },
-    {
-        "id": "krypt-momentum-only",
-        "name": "Crowd Contrarian",
-        "tagline": "Mean-reversion on trade clusters. No whale signals.",
-        "description": (
-            "Only fades clusters of trades against the underdog. "
-            "Empirically the highest-edge zone in the data: NO clusters "
-            "when YES is heavy favourite, YES clusters when YES is deep "
-            "underdog. Disables whale-following entirely."
-        ),
-        "riskLabel": "balanced",
-        "config": {
-            "trade_whales": False,
-            "trade_momentum": True,
-            "contrarian_only": True,
-            "min_edge_pts_momentum": 7.0,
-            "min_confidence_momentum": 50.0,
-            "allowed_momentum_signal_types": ["trade_cluster"],
-        },
-    },
-    {
-        "id": "krypt-edge-hunter",
-        "name": "Edge Hunter",
-        "tagline": "Top-decile edge only. Few but high-quality trades.",
-        "description": (
-            "Only fires on the highest-scored signals (edge ≥ 7pts whale / "
-            "6pts momentum — the scorer caps edge at 10/8, so these gates sit "
-            "just under the ceiling; the old 12pt gate was above it and could "
-            "NEVER trade). Sizes more aggressively on high-edge picks (4-8% "
-            "scaled). Expect long quiet periods between trades."
-        ),
-        "riskLabel": "balanced",
-        "config": {
-            "min_edge_pts_whale": 7.0,
-            "min_edge_pts_momentum": 6.0,
-            "min_confidence_whale": 60.0,
-            "min_confidence_momentum": 55.0,
-            "base_size_fraction": 0.04,
-            "min_size_fraction": 0.04,
-            "max_size_fraction": 0.08,
-            "sizing_base_edge": 7.0,
-            "sizing_max_edge": 10.0,
-            "max_open_positions": 15,
-        },
-    },
-    {
-        "id": "krypt-crypto-whale",
-        "name": "Crypto Whale",
-        "tagline": "Whale-following, crypto markets only.",
-        "description": (
-            "Most reliable edge (highest t-stat, 97% win). Whale signals in "
-            "CRYPTO backtested strongly positive net-of-fee while sports "
-            "whales lost. Entry cap raised to 98c because crypto whales follow "
-            "high-price favorites (the old 85c cap threw away most of the "
-            "edge). Edge gate lowered to 2pts: the scorer caps confidence at "
-            "97, so above ~92c the max computable edge shrinks toward zero — "
-            "the old 5pt gate silently re-capped entries at 92c, contradicting "
-            "the 98c cap this preset advertises. In-sample +9.3c/contract "
-            "(t=3.5, n=36). EXPERIMENTAL / in-sample on a small sample — "
-            "paper-trade to confirm."
-        ),
-        "riskLabel": "experimental",
-        "badge": "new",
-        "config": {
-            "trade_whales": True,
-            "trade_momentum": False,
-            "allowed_categories": ["crypto"],
-            "min_confidence_whale": 55.0,
-            "min_edge_pts_whale": 2.0,
-            "min_entry_price_cents": 15,
-            "max_entry_price_cents": 98,
-        },
-    },
-    {
-        "id": "krypt-sports-momentum",
-        "name": "Sports Momentum",
-        "tagline": "Contrarian trade-clusters, sports only.",
-        "description": (
-            "Highest raw edge, but noisier (single category, smaller sample). "
-            "Contrarian momentum in SPORTS backtested strongly positive "
-            "net-of-fee while news/world momentum lost. Fixed: confidence >= 40 "
-            "(the old 50 gate cut the edge to noise — momentum scores top out "
-            "near 60) and a wider 15-70c band. In-sample +18.2c/contract "
-            "(t=2.2, n=37). EXPERIMENTAL / in-sample — paper-trade to confirm."
-        ),
-        "riskLabel": "experimental",
-        "badge": "new",
-        "config": {
-            "trade_whales": False,
-            "trade_momentum": True,
-            "contrarian_only": True,
-            "allowed_categories": ["sports"],
-            "allowed_momentum_signal_types": ["trade_cluster"],
-            "min_confidence_momentum": 40.0,
-            "min_entry_price_cents": 15,
-            "max_entry_price_cents": 70,
-        },
-    },
-    {
-        "id": "krypt-edge",
-        "name": "Edge Stack",
-        "tagline": "Both backtested edges at once — crypto whales + sports momentum.",
-        "description": (
-            "Our recommended pick — the best risk-adjusted edge. Runs the two "
-            "signal sources that backtested net-POSITIVE after fees, each "
-            "restricted to where it has an edge — whales in CRYPTO / EXOTICS / "
-            "ENTERTAINMENT and contrarian momentum in SPORTS (confidence >= 40) "
-            "— with an 85c cap that drops the loss-making high-price favorites. "
-            "Sports Momentum has a higher raw edge, but this diversifies across "
-            "two independent sources, so it's the most reliable. In-sample "
-            "+15.6c/contract (t=3.2, n=81) vs the unfiltered default's "
-            "net-NEGATIVE edge. EXPERIMENTAL / in-sample — test on Demo "
-            "first to confirm it holds forward."
-        ),
-        "riskLabel": "experimental",
-        "badge": "recommended",
-        "config": {
-            "trade_whales": True,
-            "trade_momentum": True,
-            "contrarian_only": True,
-            "allowed_categories": None,
-            "allowed_whale_categories": ["crypto", "exotics", "entertainment"],
-            "allowed_momentum_categories": ["sports"],
-            "allowed_momentum_signal_types": ["trade_cluster"],
-            "min_confidence_whale": 55.0,
-            "min_edge_pts_whale": 5.0,
-            "min_confidence_momentum": 40.0,
-            "min_entry_price_cents": 15,
-            "max_entry_price_cents": 85,
-        },
-    },
-    {
-        "id": "krypt-experimental",
-        "name": "Convergence Hunter",
-        "tagline": "Trades only when 3+ whales agree on the same side.",
-        "description": (
-            "Experimental. Only trades when convergence is detected — "
-            "3+ whales taking the same side of the same market within 2 "
-            "hours. Rare but high-conviction setups. (Edge scales with the "
-            "pack: 3 whales score +4, 4 score +6, 5+ score +8, so the 4pt "
-            "gate needs at least a 3-whale group net of fees.)"
-        ),
-        "riskLabel": "experimental",
-        "badge": "new",
-        "config": {
-            "trade_whales": False,
-            "trade_momentum": False,
-            "trade_convergence": True,
-            "min_edge_pts_whale": 4.0,
-            "min_confidence_whale": 60.0,
-            "max_open_positions": 12,
-        },
-    },
-]
 
 
 CRYPTO15M_PRESETS: list[dict[str, Any]] = [
@@ -620,7 +380,6 @@ _FRACTION_KEYS = [
 _UNIT_KEYS = [
     "crypto15m_entry_threshold", "crypto15m_entry_max", "crypto15m_exit_threshold",
     "crypto15m_min_delta_pct", "crypto15m_entry_diff", "min_entry_price_frac",
-    "gambling_trade_probability",
 ]
 
 _CRYPTO15M_RULE_FIELDS = [
@@ -639,6 +398,10 @@ _C15_RUNNER_MODES = ("paper", "live")
 
 
 def _sanitize_runner_config(raw: Any) -> dict:
+    """A Multi-Run runner stores only the crypto15m_* keys it OVERRIDES on top
+    of the base config. Keep exactly those (never let a runner nest runners),
+    coercing each to the type of its DEFAULT_CONFIG entry so an imported/edited
+    runner can't smuggle a wrong-typed value into the sizing path."""
     if not isinstance(raw, dict):
         return {}
     out: dict[str, Any] = {}
@@ -678,6 +441,9 @@ def _sanitize_runner_config(raw: Any) -> dict:
 
 
 def _validate_schedule(raw: Any) -> list | None:
+    """A scheduled runner's hour→config map (Coin Optimizer output). Each slot
+    is {startHour, endHour, name, config}; hours clamp to 0..24, slots with
+    end<=start are dropped, config sanitized like a runner override."""
     if not isinstance(raw, list) or not raw:
         return None
     out: list[dict] = []
@@ -700,6 +466,9 @@ def _validate_schedule(raw: Any) -> list | None:
 
 
 def _validate_c15_runners(raw: Any) -> list | None:
+    """Validate the Multi-Run runner list. None/empty = legacy single-engine
+    mode (one implicit default runner). Drops malformed entries, dedups ids,
+    restricts coins to known assets, and clamps mode to paper|live."""
     if not isinstance(raw, list) or not raw:
         return None
     try:
@@ -766,7 +535,6 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["max_entry_slippage_cents"] = _clampi(cfg.get("max_entry_slippage_cents"), 0, 99, d["max_entry_slippage_cents"])
     cfg["min_market_volume"] = _clampf(cfg.get("min_market_volume"), 0.0, 1e12, d["min_market_volume"])
     cfg["max_trade_age_min"] = _clampi(cfg.get("max_trade_age_min"), 1, 1440, d["max_trade_age_min"])
-    cfg["gambling_mode"] = bool(cfg.get("gambling_mode", False))
     cfg["auto_upgrade_api_level"] = bool(cfg.get("auto_upgrade_api_level", True))
     cfg["crypto15m_live"] = bool(cfg.get("crypto15m_live", False))
     cfg["crypto15m_order_size"] = _clampi(cfg.get("crypto15m_order_size"), 1, 10_000, d["crypto15m_order_size"])
@@ -881,7 +649,7 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["ai_web_search"] = bool(cfg.get("ai_web_search", d["ai_web_search"]))
     cfg["mcp_enabled"] = bool(cfg.get("mcp_enabled", d["mcp_enabled"]))
     for _k in ("mcp_allow_research", "mcp_allow_scripts", "mcp_allow_script_run",
-               "mcp_allow_config", "mcp_allow_live_switches"):
+               "mcp_allow_config", "mcp_allow_live_switches", "mcp_http_enabled"):
         cfg[_k] = cfg.get(_k, d[_k]) is True
     cfg["mcp_port"] = _clampi(cfg.get("mcp_port"), 1024, 65535, d["mcp_port"])
     _m = str(cfg.get("mcp_trade_mode") or "").strip().lower()
@@ -904,12 +672,21 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     cfg["autopilot_max_steps"] = _clampi(
         cfg.get("autopilot_max_steps"), 3, 40, d["autopilot_max_steps"])
     cfg["autopilot_mission"] = str(cfg.get("autopilot_mission") or "")[:2000]
+    import mcp_agents as _ag
+    cfg["mcp_agents"] = _ag.validate_agents(cfg.get("mcp_agents"), cfg["mcp_trade_mode"])
+    _aid = str(cfg.get("autopilot_agent_id") or "").strip().lower()
+    cfg["autopilot_agent_id"] = _aid if _ag.valid_id(_aid) else _ag.DEFAULT_ID
     cfg["mcp_daily_loss_usd"] = _clampf(
         cfg.get("mcp_daily_loss_usd"), 1.0, 1e6, d["mcp_daily_loss_usd"])
     cfg["mcp_min_edge_cents"] = _clampf(
         cfg.get("mcp_min_edge_cents"), 0.0, 50.0, d["mcp_min_edge_cents"])
-    cfg["mcp_paper_bankroll_usd"] = _clampf(
-        cfg.get("mcp_paper_bankroll_usd"), 10.0, 1e7, d["mcp_paper_bankroll_usd"])
+    _am = str(cfg.get("account_mode") or "").strip().lower()
+    cfg["account_mode"] = "live" if _am == "live" else "paper"
+    cfg["paper_bankroll_usd"] = _clampf(
+        cfg.get("paper_bankroll_usd"), 10.0, 1e7, d["paper_bankroll_usd"])
+    cfg["shard_auto_move"] = cfg.get("shard_auto_move", True) is not False
+    cfg["shard_auto_move_max_usd_day"] = _clampf(
+        cfg.get("shard_auto_move_max_usd_day"), 1.0, 1e7, d["shard_auto_move_max_usd_day"])
     cfg["terminal_max_contracts"] = _clampi(
         cfg.get("terminal_max_contracts"), 1, 100_000, d["terminal_max_contracts"])
     cfg["terminal_max_notional_usd"] = _clampf(
@@ -922,19 +699,55 @@ def _validate_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return cfg
 
 
+_REMOVED_KEYS = frozenset({
+    "gambling_mode", "gambling_trade_probability",
+    "kalshi_env",
+    "mcp_paper_bankroll_usd",
+})
+
+
+def _migrate_account_mode(user: dict[str, Any]) -> dict[str, Any]:
+    """A config from before account_mode existed: production -> live (an
+    existing live trader keeps trading exactly as before, every per-engine
+    live switch untouched); demo, or no env at all -> paper. Idempotent: a
+    config that names account_mode is left alone, whatever env it also names.
+
+    The Electron store migrates settings.json the same way on load; this is
+    the backend's own copy so a config that skipped that (an old profile, a
+    hand-written file) still lands on the side that cannot spend money."""
+    if not isinstance(user, dict):
+        return {}
+    out = dict(user)
+    if "account_mode" not in out and "accountMode" not in out:
+        env = out.get("kalshi_env", out.get("kalshiEnv"))
+        out["account_mode"] = "live" if env == "production" else "paper"
+    if "paper_bankroll_usd" not in out and "paperBankrollUsd" not in out:
+        old = out.get("mcp_paper_bankroll_usd", out.get("mcpPaperBankrollUsd"))
+        if old is not None:
+            out["paper_bankroll_usd"] = old
+    return out
+
+
+def account_live(cfg: dict[str, Any]) -> bool:
+    """True only in Live mode. The master check every engine narrows under."""
+    return str((cfg or {}).get("account_mode") or "").lower() == "live"
+
+
+def scope_env(cfg: dict[str, Any]) -> str:
+    """The ledger scope the account mode trades in: 'production' when Live,
+    'paper' otherwise (see db.LIVE_ENV / db.PAPER_ENV)."""
+    return "production" if account_live(cfg) else "paper"
+
+
 def merge_with_defaults(user: dict[str, Any]) -> dict[str, Any]:
     out = dict(DEFAULT_CONFIG)
-    for k, v in (user or {}).items():
+    for k, v in _migrate_account_mode(user or {}).items():
         if k in out:
             out[k] = v
             continue
         sk = _camel_to_snake(k)
+        if sk in _REMOVED_KEYS:
+            continue
         out[sk] = v
     return _validate_config(out)
 
-
-def strategy_full_config(strategy_id: str) -> dict[str, Any] | None:
-    for s in STRATEGY_PRESETS:
-        if s["id"] == strategy_id:
-            return merge_with_defaults(s["config"])
-    return None

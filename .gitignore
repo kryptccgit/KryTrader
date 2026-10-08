@@ -1,5 +1,7 @@
+# ── Dependencies ──────────────────────────────────────────────────
 node_modules/
 
+# ── Build / packaging output ──────────────────────────────────────
 dist/
 dist-electron/
 release/
@@ -7,44 +9,49 @@ python/dist/
 python/build/
 *.spec
 
+# ── Python ────────────────────────────────────────────────────────
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# ── Local runtime state — NEVER COMMIT (may hold credentials / trades)
+# The backend falls back to ./credentials, ./data, ./logs next to the
+# Python files when KRYPT_TRADER_USERDATA is unset (dev runs).
 credentials/
 python/data/
 python/logs/
 *.db
 *.db-wal
 *.db-shm
+# live_staleness.py isolated data/credential dir + any RSA private key
 .staleness_data/
 *.pem
+# generated hand-off bundle (regenerate with python/bundle_staleness.py)
 staleness_dist/
 
+# ── Secrets / local env ───────────────────────────────────────────
 .env
 .env.*
 !.env.example
+!.env.staleness.example
 
+# ── Logs ──────────────────────────────────────────────────────────
 *.log
 
+# ── OS / editor cruft ─────────────────────────────────────────────
 .DS_Store
 Thumbs.db
 *.tmp
 .idea/
 
+# ── Local internal notes (not for the public repo) ────────────────
 AI_CONTEXT.md
 MARKETING.md
 PROS_AND_CONS.md
-PROJECT_STATE.md
-CLAUDE.md
-.claude/
 
-python/live_staleness.py
-python/bundle_staleness.py
-python/.env.staleness.example
-
-
+# Local testing copy of the app
 simulation/
 
+# Referral pool plaintext (encrypted into electron/system/referral-pool.gen.ts)
 referral-links.txt

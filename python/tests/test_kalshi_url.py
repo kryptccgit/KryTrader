@@ -44,13 +44,15 @@ def test_deep_link_production(monkeypatch):
     assert url == "https://kalshi.com/markets/kxbtcd/bitcoin-price-abovebelow/kxbtcd-26jun1400"
 
 
-def test_deep_link_demo_host_and_event_derived_from_ticker(monkeypatch):
+def test_deep_link_is_kalshi_com_in_paper_and_event_derived_from_ticker(monkeypatch):
+    """Paper trades production's markets, so its links open production's
+    pages. There is no other Kalshi web host."""
     monkeypatch.setattr(kalshi_api, "fetch_series", _stub_series("Bitcoin price Above/below"))
     url = _run(kalshi_api.web_market_url(
         ticker="KXBTCD-26JUN1400-T72299.99",
-        env="demo",
+        env="paper",
     ))
-    assert url == "https://demo.kalshi.co/markets/kxbtcd/bitcoin-price-abovebelow/kxbtcd-26jun1400"
+    assert url == "https://kalshi.com/markets/kxbtcd/bitcoin-price-abovebelow/kxbtcd-26jun1400"
 
 
 def test_falls_back_to_series_page_when_no_slug(monkeypatch):
@@ -63,8 +65,8 @@ def test_falls_back_to_series_page_when_lookup_raises(monkeypatch):
     async def _boom(_s):
         raise RuntimeError("network down")
     monkeypatch.setattr(kalshi_api, "fetch_series", _boom)
-    url = _run(kalshi_api.web_market_url(ticker="KXETHD-26JUN1400-T2000", env="demo"))
-    assert url == "https://demo.kalshi.co/markets/kxethd"
+    url = _run(kalshi_api.web_market_url(ticker="KXETHD-26JUN1400-T2000", env="paper"))
+    assert url == "https://kalshi.com/markets/kxethd"
 
 
 def test_unknown_env_defaults_to_production_host(monkeypatch):

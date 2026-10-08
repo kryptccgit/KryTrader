@@ -1,3 +1,10 @@
+"""Remote control.
+
+This is the surface where a text message can spend money, so most of what is
+pinned here is what the engine REFUSES to do: trade without the trading switch,
+trade without a second message, honour a stale or wrong confirmation, or answer
+anybody but the paired identity.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -28,6 +35,7 @@ def _say(text, sender="discord:1", trading=False, authed=True):
                              trading_enabled=trading))
 
 
+
 def test_trading_commands_are_refused_while_trading_is_off():
     for cmd in ("buy KXA yes 1 50", "sell KXA yes 1 50", "cancel abc",
                 "confirm 1234"):
@@ -41,6 +49,7 @@ def test_reading_still_works_while_trading_is_off():
     assert "buy" in out
 
 
+
 def test_an_order_is_quoted_and_waits_for_a_code(monkeypatch):
     import terminal
     sent = []
@@ -50,7 +59,7 @@ def test_an_order_is_quoted_and_waits_for_a_code(monkeypatch):
                 "source": "kalshi-rest"}
     async def fake_pf(authed):
         return {"positions": []}
-    async def fake_submit(req, *, cfg, authed):
+    async def fake_submit(req, *, cfg, authed, scope=None):
         sent.append(req)
         return {"ok": True, "message": "Filled 10 at 45c"}
     async def fake_gate(fn, *a, **k):
@@ -81,7 +90,7 @@ def test_a_wrong_confirmation_code_does_not_trade_and_does_not_discard(monkeypat
         return {"yesBid": 44.0, "yesAsk": 45.0, "source": "kalshi-rest"}
     async def fake_pf(authed):
         return {"positions": []}
-    async def fake_submit(req, *, cfg, authed):
+    async def fake_submit(req, *, cfg, authed, scope=None):
         sent.append(req)
         return {"ok": True, "message": "ok"}
     async def fake_gate(fn, *a, **k):
@@ -141,6 +150,7 @@ def test_malformed_orders_are_explained_not_executed():
     assert "whole number" in _say("buy KXA yes ten 50", trading=True)
 
 
+
 def test_a_pairing_code_is_single_use():
     code = remote.new_pair_code()
     assert remote.check_pair_code(code) is True
@@ -172,6 +182,7 @@ def test_pairing_codes_avoid_ambiguous_glyphs():
         assert not (set(remote.new_pair_code()) & set("O0I1"))
 
 
+
 def test_a_flood_is_dropped_rather_than_executed():
     for _ in range(remote.RATE_MAX):
         assert remote.rate_ok("discord:1") is True
@@ -186,11 +197,13 @@ def test_the_rate_limit_is_per_sender():
     assert remote.rate_ok("telegram:2") is True
 
 
+
 def test_unknown_values_render_as_a_dash_on_the_phone_too():
     assert remote._cents(None) == "—"
     assert remote._usd(None) == "—"
     assert remote._cents(0) == "0c"
     assert remote._usd(0) == "$0.00"
+
 
 
 def test_discord_ignores_everyone_but_the_paired_user():
@@ -309,6 +322,8 @@ def test_long_replies_are_split_on_line_boundaries():
 
 
 def test_a_factory_reset_disarms_standing_instructions(tmp_path, monkeypatch):
+    """A reset that leaves an armed stop loss behind means a user who wiped
+    everything still has an order waiting to sell on their behalf."""
     import sqlite3
     import db
     path = tmp_path / "fr.sqlite"
@@ -319,11 +334,11 @@ def test_a_factory_reset_disarms_standing_instructions(tmp_path, monkeypatch):
     c.executescript(db.SCHEMA)
     db.insert_terminal_rule(c, {
         "kind": "stop", "ticker": "KXA-1", "side": "yes",
-        "threshold_cents": 30.0, "direction": "below", "kalshi_env": "demo",
+        "threshold_cents": 30.0, "direction": "below", "kalshi_env": "paper",
     })
     c.commit()
-    assert len(db.list_terminal_rules(c, "demo", armed_only=True)) == 1
+    assert len(db.list_terminal_rules(c, "paper", armed_only=True)) == 1
 
     db.factory_reset()
-    assert db.list_terminal_rules(c, "demo") == []
+    assert db.list_terminal_rules(c, "paper") == []
     c.close()

@@ -5,6 +5,12 @@
 
 :root {
   color-scheme: dark;
+  --glass-hairline: rgba(255, 255, 255, 0.08);
+  --glass-hairline-hi: rgba(255, 255, 255, 0.2);
+  --glass-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  --glass-shadow: 0 22px 44px -22px rgba(0, 0, 0, 0.8), 0 2px 8px -2px rgba(0, 0, 0, 0.4);
+  --glass-frost-bg: linear-gradient(160deg, rgba(24, 22, 38, 0.84), rgba(11, 11, 18, 0.9));
+  --glass-ease: cubic-bezier(0.34, 1.36, 0.42, 1);
 }
 
 html,
@@ -14,7 +20,7 @@ body,
   width: 100%;
   margin: 0;
   padding: 0;
-  background: #0a0a0f;
+  background: #07070c;
   overflow: hidden;
 }
 
@@ -30,14 +36,17 @@ body {
   height: 10px;
 }
 ::-webkit-scrollbar-track {
-  background: rgba(255, 255, 255, 0.02);
+  background: transparent;
 }
 ::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.08);
+  border: 3px solid transparent;
+  background-clip: padding-box;
   border-radius: 999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.18);
+  background-clip: padding-box;
 }
 
 input,
@@ -73,15 +82,222 @@ button {
   }
 }
 
+.glass-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  overflow: hidden;
+  pointer-events: none;
+  contain: strict;
+  background:
+    radial-gradient(1100px 760px at 8% -12%, rgba(76, 36, 150, 0.2), transparent 62%),
+    radial-gradient(900px 700px at 104% 112%, rgba(120, 28, 92, 0.07), transparent 60%),
+    #040407;
+}
+.glass-aurora {
+  position: absolute;
+  border-radius: 50%;
+  will-change: transform;
+  backface-visibility: hidden;
+}
+.glass-aurora-a {
+  width: 80vmax;
+  height: 80vmax;
+  left: -26vmax;
+  top: -38vmax;
+  background: radial-gradient(closest-side, rgba(168, 85, 247, 0.34), rgba(168, 85, 247, 0.12) 50%, rgba(168, 85, 247, 0) 100%);
+  animation: glass-drift-a 38s ease-in-out infinite alternate;
+}
+.glass-aurora-b {
+  width: 66vmax;
+  height: 66vmax;
+  right: -22vmax;
+  bottom: -32vmax;
+  background: radial-gradient(closest-side, rgba(236, 72, 153, 0.15), rgba(236, 72, 153, 0.05) 52%, rgba(236, 72, 153, 0) 100%);
+  animation: glass-drift-b 47s ease-in-out infinite alternate;
+}
+.glass-aurora-c {
+  width: 42vmax;
+  height: 42vmax;
+  left: 44%;
+  top: 34%;
+  background: radial-gradient(closest-side, rgba(34, 211, 238, 0.12), rgba(34, 211, 238, 0.035) 52%, rgba(34, 211, 238, 0) 100%);
+  animation: glass-drift-c 55s ease-in-out infinite alternate;
+}
+.glass-aurora-d {
+  width: 58vmax;
+  height: 58vmax;
+  left: 34%;
+  top: -34vmax;
+  background: radial-gradient(closest-side, rgba(99, 102, 241, 0.24), rgba(99, 102, 241, 0.07) 52%, rgba(99, 102, 241, 0) 100%);
+  animation: glass-drift-d 63s ease-in-out infinite alternate;
+}
+@keyframes glass-drift-a {
+  0% { transform: translate3d(0, 0, 0) scale(1); }
+  50% { transform: translate3d(16vw, 12vh, 0) scale(1.12); }
+  100% { transform: translate3d(6vw, 30vh, 0) scale(0.94); }
+}
+@keyframes glass-drift-b {
+  0% { transform: translate3d(0, 0, 0) scale(1.05); }
+  50% { transform: translate3d(-18vw, -10vh, 0) scale(0.92); }
+  100% { transform: translate3d(-6vw, -26vh, 0) scale(1.1); }
+}
+@keyframes glass-drift-c {
+  0% { transform: translate3d(0, 0, 0) scale(0.9); }
+  50% { transform: translate3d(-22vw, 8vh, 0) scale(1.2); }
+  100% { transform: translate3d(14vw, -14vh, 0) scale(1); }
+}
+@keyframes glass-drift-d {
+  0% { transform: translate3d(0, 0, 0) scale(1); }
+  50% { transform: translate3d(-14vw, 16vh, 0) scale(1.1); }
+  100% { transform: translate3d(18vw, 6vh, 0) scale(0.95); }
+}
+.glass-grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+  background-size: 56px 56px;
+  background-position: -1px -1px;
+  filter: blur(1.4px);
+  -webkit-mask-image: radial-gradient(ellipse 80% 70% at 55% 30%, #000 25%, transparent 85%);
+  mask-image: radial-gradient(ellipse 80% 70% at 55% 30%, #000 25%, transparent 85%);
+}
+.glass-grain {
+  position: absolute;
+  inset: 0;
+  opacity: 0.07;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.6 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+}
+.glass-vignette {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse 120% 95% at 50% 35%, transparent 55%, rgba(0, 0, 0, 0.72) 100%);
+}
+@media (prefers-reduced-motion: reduce) {
+  .glass-aurora {
+    animation: none;
+  }
+}
+:root[data-window-hidden] *,
+:root[data-window-hidden] *::before,
+:root[data-window-hidden] *::after {
+  animation-play-state: paused !important;
+}
+
+
+.glass-live {
+  box-shadow: var(--glass-shadow);
+}
+
+.glass-frost {
+  border: 1px solid transparent;
+  background:
+    var(--glass-frost-bg) padding-box,
+    linear-gradient(160deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.05) 30%, rgba(255, 255, 255, 0.03) 70%, rgba(168, 85, 247, 0.2)) border-box;
+  -webkit-backdrop-filter: blur(16px) saturate(1.5);
+  backdrop-filter: blur(16px) saturate(1.5);
+  box-shadow: var(--glass-highlight), var(--glass-shadow);
+}
+
+.glass-track {
+  background: linear-gradient(180deg, rgba(4, 4, 10, 0.5), rgba(14, 14, 24, 0.42));
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.5), inset 0 0 0 1px rgba(255, 255, 255, 0.06), 0 1px 0 rgba(255, 255, 255, 0.04);
+}
+.glass-live.glass-lens {
+  box-shadow: 0 4px 14px -4px rgba(10, 6, 30, 0.7), 0 0 18px -6px rgba(168, 85, 247, 0.55);
+}
+.glass-live.glass-btn {
+  box-shadow: 0 10px 24px -12px rgba(0, 0, 0, 0.85);
+  transition: box-shadow 0.2s, filter 0.2s;
+}
+.glass-btn:hover {
+  filter: brightness(1.12);
+}
+.glass-live.glass-btn-primary {
+  box-shadow: 0 10px 28px -10px rgba(168, 85, 247, 0.75);
+}
+.glass-live.glass-btn-primary:hover {
+  box-shadow: 0 0 40px -6px rgba(168, 85, 247, 0.85);
+}
+.glass-btn-primary > button {
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0) 55%);
+}
+.glass-live.glass-btn-danger {
+  box-shadow: inset 0 0 0 1px rgba(239, 68, 68, 0.45), 0 10px 26px -12px rgba(239, 68, 68, 0.6);
+}
+.glass-live.glass-btn-active {
+  box-shadow: inset 0 0 0 1px rgba(168, 85, 247, 0.55), 0 0 22px -6px rgba(168, 85, 247, 0.7);
+}
+.glass-live.glass-btn-gold {
+  box-shadow: 0 0 22px -4px rgba(251, 191, 36, 0.75);
+}
+.glass-frost.glass-btn {
+  border-color: transparent;
+}
+
+.glass-frost.glass-lens {
+  -webkit-backdrop-filter: none;
+  backdrop-filter: none;
+}
+.mac-glass-control:has(input:focus-visible) {
+  outline: 2px solid rgba(168, 85, 247, 0.7);
+  outline-offset: 3px;
+}
+
+@keyframes glass-pop {
+  0% { opacity: 0; transform: translateY(6px) scale(0.97); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+}
+.glass-pop {
+  animation: glass-pop 340ms var(--glass-ease) both;
+}
+
+.glass-title {
+  background: linear-gradient(180deg, #ffffff 45%, #ebe4ff 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+thead.sticky {
+  background-color: rgba(15, 15, 24, 0.86);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+}
+
 @layer components {
   .krypt-card {
-    @apply rounded-xl border border-krypt-border bg-krypt-surface p-5;
+    @apply rounded-2xl p-5;
+    border: 1px solid transparent;
+    background:
+      var(--glass-frost-bg) padding-box,
+      linear-gradient(160deg, rgba(255, 255, 255, 0.16), rgba(255, 255, 255, 0.045) 28%, rgba(255, 255, 255, 0.03) 72%, rgba(168, 85, 247, 0.16)) border-box;
+    -webkit-backdrop-filter: blur(16px) saturate(1.45);
+    backdrop-filter: blur(16px) saturate(1.45);
+    box-shadow: var(--glass-highlight), var(--glass-shadow);
   }
   .krypt-card-hover {
-    @apply transition-colors hover:border-krypt-borderHi;
+    transition: border-color 0.2s, box-shadow 0.25s, transform 0.25s var(--glass-ease);
+  }
+  .krypt-card-hover:hover {
+    border-color: rgba(255, 255, 255, 0.14);
+    box-shadow: var(--glass-highlight), var(--glass-shadow), 0 0 0 1px rgba(168, 85, 247, 0.12);
   }
   .krypt-input {
-    @apply w-full rounded-md border border-krypt-border bg-krypt-surface2 px-3 py-2 text-sm text-white outline-none transition-colors placeholder:text-krypt-dim focus:border-krypt-indigo;
+    @apply w-full rounded-[10px] px-3 py-2 text-sm text-white outline-none placeholder:text-krypt-dim;
+    border: 1px solid rgba(255, 255, 255, 0.09);
+    background: linear-gradient(180deg, rgba(4, 4, 10, 0.55), rgba(10, 10, 18, 0.45));
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.45), inset 0 -1px 0 rgba(255, 255, 255, 0.03);
+    transition: border-color 0.2s, box-shadow 0.2s;
+  }
+  .krypt-input:hover {
+    border-color: rgba(255, 255, 255, 0.14);
+  }
+  .krypt-input:focus {
+    border-color: rgba(168, 85, 247, 0.6);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.45), 0 0 0 3px rgba(168, 85, 247, 0.16), 0 0 18px -4px rgba(168, 85, 247, 0.45);
   }
   .krypt-label {
     @apply mb-1 block text-xs font-medium uppercase tracking-wider text-krypt-muted;
@@ -89,48 +305,92 @@ button {
   .krypt-help {
     @apply mt-1 text-xs text-krypt-dim;
   }
+  .krypt-hint {
+    @apply mt-1 block text-xs text-krypt-dim;
+  }
   .krypt-btn {
-    @apply inline-flex select-none items-center justify-center gap-2 rounded-md border border-krypt-border px-3 py-2 text-sm font-medium text-white transition-colors disabled:cursor-not-allowed disabled:opacity-50;
+    @apply inline-flex select-none items-center justify-center gap-2 rounded-[10px] px-3 py-2 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-50;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    transition: transform 0.22s var(--glass-ease), box-shadow 0.2s, background-color 0.2s, border-color 0.2s, filter 0.2s;
+  }
+  .krypt-btn:active:not(:disabled) {
+    transform: scale(0.965);
+    transition-duration: 0.08s;
   }
   .krypt-btn-default {
-    @apply krypt-btn bg-krypt-surface2 hover:border-krypt-borderHi hover:bg-white/5;
+    @apply krypt-btn;
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.085), rgba(255, 255, 255, 0.025));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.1), 0 8px 18px -10px rgba(0, 0, 0, 0.8);
+  }
+  .krypt-btn-default:hover:not(:disabled) {
+    border-color: rgba(255, 255, 255, 0.2);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.13), rgba(255, 255, 255, 0.04));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.16), 0 10px 22px -10px rgba(0, 0, 0, 0.85);
   }
   .krypt-btn-primary {
-    @apply krypt-btn border-transparent bg-gradient-to-r from-krypt-indigo via-krypt-purple to-krypt-pink shadow-krypt-soft hover:shadow-krypt-strong;
+    @apply krypt-btn;
+    border-color: rgba(255, 255, 255, 0.2);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.26), rgba(255, 255, 255, 0) 55%),
+      linear-gradient(90deg, #6366f1, #a855f7 50%, #ec4899);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.38), inset 0 -1px 0 rgba(0, 0, 0, 0.18), 0 10px 26px -10px rgba(168, 85, 247, 0.7);
+    text-shadow: 0 1px 1px rgba(0, 0, 0, 0.25);
+  }
+  .krypt-btn-primary:hover:not(:disabled) {
+    filter: brightness(1.07) saturate(1.05);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45), inset 0 -1px 0 rgba(0, 0, 0, 0.18), 0 0 42px -8px rgba(168, 85, 247, 0.8);
   }
   .krypt-btn-danger {
-    @apply krypt-btn border-krypt-loss/40 bg-krypt-loss/10 text-krypt-loss hover:border-krypt-loss hover:bg-krypt-loss/15;
+    @apply krypt-btn text-red-300;
+    border-color: rgba(239, 68, 68, 0.42);
+    background: linear-gradient(180deg, rgba(239, 68, 68, 0.2), rgba(239, 68, 68, 0.07));
+    box-shadow: inset 0 1px 0 rgba(255, 180, 180, 0.14), 0 8px 22px -12px rgba(239, 68, 68, 0.6);
+  }
+  .krypt-btn-danger:hover:not(:disabled) {
+    border-color: rgba(239, 68, 68, 0.75);
+    background: linear-gradient(180deg, rgba(239, 68, 68, 0.28), rgba(239, 68, 68, 0.1));
+    box-shadow: inset 0 1px 0 rgba(255, 180, 180, 0.2), 0 0 30px -8px rgba(239, 68, 68, 0.6);
   }
   .krypt-btn-ghost {
-    @apply krypt-btn border-transparent bg-transparent hover:bg-white/5;
+    @apply krypt-btn border-transparent bg-transparent hover:bg-white/[0.06];
   }
   .krypt-btn-rainbow {
     @apply krypt-btn border-transparent font-semibold text-white shadow-krypt-soft hover:shadow-krypt-strong;
-    background-image: linear-gradient(90deg, #ff4d6d, #ff9e00, #ffe600, #38f59b, #2bd6ff, #8b5cf6, #ff4d6d);
-    background-size: 300% 100%;
+    background-image:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.25), rgba(255, 255, 255, 0) 55%),
+      linear-gradient(90deg, #ff4d6d, #ff9e00, #ffe600, #38f59b, #2bd6ff, #8b5cf6, #ff4d6d);
+    background-size: 100% 100%, 300% 100%;
     animation: krypt-rainbow 5s linear infinite;
   }
   .krypt-pill {
-    @apply inline-flex items-center gap-1 rounded-full border border-krypt-border bg-krypt-surface2 px-2 py-0.5 text-[11px] font-medium uppercase tracking-wider;
+    @apply inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium uppercase tracking-wider;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.07), rgba(255, 255, 255, 0.02));
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.07);
   }
   .krypt-section-title {
     @apply mb-4 flex items-center gap-2 text-xs font-semibold uppercase tracking-[0.16em] text-krypt-muted;
   }
   .krypt-table {
     @apply w-full text-sm;
+    font-variant-numeric: tabular-nums;
+    background-color: rgba(9, 9, 15, 0.93);
   }
   .krypt-table th {
-    @apply border-b border-krypt-border px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wider text-krypt-muted;
+    @apply px-3 py-2 text-left text-[11px] font-semibold uppercase tracking-wider text-krypt-muted;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.09);
   }
   .krypt-table td {
-    @apply border-b border-krypt-border/50 px-3 py-2 text-white/90;
+    @apply px-3 py-2 text-white/90;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.045);
+    transition: background-color 0.15s;
   }
   .krypt-table tr:hover td {
-    @apply bg-white/[0.02];
+    background-color: rgba(255, 255, 255, 0.035);
   }
 }
 
 @keyframes krypt-rainbow {
-  0% { background-position: 0% 50%; }
-  100% { background-position: 300% 50%; }
+  0% { background-position: 0 0, 0% 50%; }
+  100% { background-position: 0 0, 300% 50%; }
 }

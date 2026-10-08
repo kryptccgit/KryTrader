@@ -11,8 +11,7 @@ export function AboutPage() {
   const open = (url: string) => () => void window.krypt.app.openExternal(url);
 
   const showFolder = async (): Promise<void> => {
-    const p = await window.krypt.app.getUserDataPath();
-    await window.krypt.app.showItemInFolder(p);
+    await window.krypt.app.openUserDataFolder();
   };
 
   return (
@@ -29,7 +28,7 @@ export function AboutPage() {
                 Free Kalshi auto-trading bot · v{appVersion}
               </div>
               <div className="mt-1 text-xs text-krypt-dim">
-                Backend: {backend.status} · {config?.kalshiEnv?.toUpperCase()} · pid {backend.pid ?? '—'}
+                Backend: {backend.status} · {config?.accountMode === 'live' ? 'LIVE' : 'PAPER'} · pid {backend.pid ?? '—'}
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
                 <button onClick={open(KRYPT_TRADER_PAGE)} className="krypt-btn-default">
@@ -64,7 +63,6 @@ export function AboutPage() {
           <div className="text-sm text-white">Quick links</div>
           <div className="mt-3 flex flex-col gap-1.5 text-sm">
             <LinkRow label="Kalshi public site" onClick={open('https://kalshi.com')} />
-            <LinkRow label="Kalshi demo dashboard" onClick={open('https://demo.kalshi.co')} />
             <LinkRow label="Kalshi API docs" onClick={open('https://trading-api.readme.io')} />
             <LinkRow label="Krypt Tools homepage" onClick={open(KRYPT_TOOLS)} />
           </div>
@@ -135,8 +133,8 @@ export function AboutPage() {
               and API rules (including whether automated/algorithmic trading is
               permitted on your account), for all applicable laws, eligibility, age,
               and taxes in your jurisdiction, and for the security of your API keys and
-              machine. Test on the <span className="text-white">demo</span> environment
-              until you trust your config.
+              machine. Test in <span className="text-white">Paper</span> mode (real prices,
+              imaginary money) until you trust your config.
             </p>
             <p>
               <span className="text-white">Privacy.</span> There is no Krypt server.

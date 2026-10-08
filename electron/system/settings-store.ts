@@ -2,6 +2,9 @@ import { app } from 'electron';
 import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import type { AppState, Profile, TraderConfig } from '../../shared/types';
+import { migrateConfig, normalizeActiveProfileId } from './legacy-settings';
+import { DEFAULT_AGENT_ID, defaultAgent } from '../../shared/agents';
+import { botSettingsResetPatch } from './sanitize';
 
 
 const userDataDir = (): string => app.getPath('userData');
@@ -9,7 +12,10 @@ const userDataDir = (): string => app.getPath('userData');
 const settingsFile = (): string => join(userDataDir(), 'settings.json');
 
 export const DEFAULT_CONFIG: TraderConfig = {
-  kalshiEnv: 'demo',
+  accountMode: 'paper',
+  paperBankrollUsd: 1000,
+  shardAutoMove: true,
+  shardAutoMoveMaxUsdDay: 1000,
   enableTrading: false,
   autoUpgradeApiLevel: true,
 
@@ -33,9 +39,6 @@ export const DEFAULT_CONFIG: TraderConfig = {
   allowedWhaleCategories: null,
   allowedMomentumCategories: null,
   contrarianOnly: true,
-
-  gamblingMode: false,
-  gamblingTradeProbability: 0.10,
 
   sizingMode: 'percent',
   fixedTradeUsd: 5,
@@ -167,15 +170,17 @@ export const DEFAULT_CONFIG: TraderConfig = {
   mcpDailySpendUsd: 100,
   mcpMaxPositions: 10,
   mcpMinEdgeCents: 3,
-  mcpPaperBankrollUsd: 1000,
   mcpDailyLossUsd: 50,
   mcpLiveApproval: true,
+  mcpHttpEnabled: false,
   autopilotEnabled: false,
   autopilotIntervalMin: 60,
   autopilotMaxRunsPerDay: 12,
   autopilotDailyTokenBudget: 1_500_000,
   autopilotMaxSteps: 15,
   autopilotMission: '',
+  autopilotAgentId: DEFAULT_AGENT_ID,
+  mcpAgents: [defaultAgent('paper')],
   mcpAllowResearch: false,
   mcpAllowScripts: false,
   mcpAllowScriptRun: false,
@@ -202,6 +207,8 @@ export const DEFAULT_STATE: AppState = {
   acceptedDisclaimer: false,
   windowBounds: null,
   terminalWatchlist: [],
+  trayHintShown: false,
+  onboardingSeen: 0,
 };
 
 let cached: AppState | null = null;
@@ -211,8 +218,8 @@ function ensureDir(): void {
   if (!existsSync(d)) mkdirSync(d, { recursive: true });
 }
 
-function mergeConfig(loaded: Partial<TraderConfig> | undefined): TraderConfig {
-  return { ...DEFAULT_CONFIG, ...(loaded || {}) };
+function mergeConfig(loaded: Partial<TraderConfig> | undefined, live = false): TraderConfig {
+  return migrateConfig(loaded, DEFAULT_CONFIG, { live });
 }
 
 function mergeProfile(loaded: any): Profile | null {
@@ -236,8 +243,8 @@ function mergeState(loaded: any): AppState {
     ? loaded.customProfiles.map(mergeProfile).filter((p: Profile | null): p is Profile => p !== null)
     : [];
   return {
-    config: mergeConfig(loaded.config),
-    activeProfileId: loaded.activeProfileId || null,
+    config: mergeConfig(loaded.config, true),
+    activeProfileId: normalizeActiveProfileId(loaded.activeProfileId),
     activeCrypto15mProfileId: loaded.activeCrypto15mProfileId || null,
     customProfiles: profiles,
     startMinimized: !!loaded.startMinimized,
@@ -246,6 +253,9 @@ function mergeState(loaded: any): AppState {
       typeof loaded.enableDiscordRpc === 'boolean' ? loaded.enableDiscordRpc : true,
     acceptedDisclaimer: !!loaded.acceptedDisclaimer,
     windowBounds: loaded.windowBounds || null,
+    trayHintShown: !!loaded.trayHintShown,
+    onboardingSeen: Number.isInteger(loaded.onboardingSeen) && loaded.onboardingSeen > 0
+      ? Math.min(loaded.onboardingSeen, 1000) : 0,
     terminalWatchlist: Array.isArray(loaded.terminalWatchlist)
       ? loaded.terminalWatchlist
           .filter((t: unknown): t is string => typeof t === 'string')
@@ -294,7 +304,7 @@ export function get(): AppState {
 
 export function patchConfig(patch: Partial<TraderConfig>): AppState {
   const cur = get();
-  const next: AppState = { ...cur, config: { ...cur.config, ...patch } };
+  const next: AppState = { ...cur, config: mergeConfig({ ...cur.config, ...patch }) };
   return save(next);
 }
 
@@ -304,11 +314,12 @@ export function replaceConfig(config: TraderConfig): AppState {
   return save(next);
 }
 
-export function resetConfig(): AppState {
+export function resetBotSettings(): AppState {
   const cur = get();
   const next: AppState = {
-    ...cur, config: { ...DEFAULT_CONFIG },
-    activeProfileId: null, activeCrypto15mProfileId: null,
+    ...cur,
+    config: mergeConfig({ ...cur.config, ...botSettingsResetPatch(DEFAULT_CONFIG) }),
+    activeProfileId: null,
   };
   return save(next);
 }

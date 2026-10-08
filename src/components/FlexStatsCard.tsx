@@ -3,6 +3,8 @@ import { X, Download, Copy } from 'lucide-react';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import spriteUrl from '../assets/mossy.png';
+import { useBalance } from '../state/useBalance';
+import { bookEnvOf, isLive } from '../utils/account';
 
 const W = 1080;
 const H = 1350;
@@ -10,7 +12,7 @@ const FRAMES = 8;
 const FRAME_PX = 50;
 const SITE_URL = 'krypt.cc/tools/trader';
 
-interface Stats { pnl: number; volume: number; trades: number; }
+interface Stats { pnl: number | null; volume: number; trades: number; paper: boolean; }
 
 function money(n: number, dp = 0): string {
   return n.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp });
@@ -71,16 +73,31 @@ function drawCard(ctx: CanvasRenderingContext2D, sprite: HTMLImageElement, frame
   ctx.drawImage(sprite, (frame % FRAMES) * FRAME_PX, 0, FRAME_PX, FRAME_PX, W / 2 - size / 2, 270, size, size);
   ctx.imageSmoothingEnabled = true;
 
-  const pos = s.pnl >= 0;
-  const col = pos ? '#22C55E' : '#EF4444';
+  if (s.paper) {
+    ctx.save();
+    ctx.textAlign = 'center';
+    ctx.font = '700 34px "Chakra Petch", sans-serif';
+    const label = 'PAPER TRADING · IMAGINARY MONEY';
+    const tw = ctx.measureText(label).width + 56;
+    ctx.fillStyle = 'rgba(168,85,247,0.22)';
+    ctx.strokeStyle = 'rgba(168,85,247,0.85)';
+    ctx.lineWidth = 3;
+    roundRect(ctx, W / 2 - tw / 2, 222, tw, 56, 28); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#E9D5FF';
+    ctx.fillText(label, W / 2, 262);
+    ctx.restore();
+  }
+
+  const pos = (s.pnl ?? 0) >= 0;
+  const col = s.pnl === null ? '#A1A1AA' : pos ? '#22C55E' : '#EF4444';
   ctx.font = '600 34px "Chakra Petch", sans-serif';
   ctx.fillStyle = 'rgba(161,161,170,0.95)';
-  ctx.fillText('PROFIT / LOSS', W / 2, 700);
+  ctx.fillText(s.paper ? 'PAPER PROFIT / LOSS' : 'PROFIT / LOSS', W / 2, 700);
   ctx.save();
   ctx.shadowColor = col; ctx.shadowBlur = 45;
   ctx.fillStyle = col;
   ctx.font = '700 118px "JetBrains Mono", monospace';
-  ctx.fillText(`${pos ? '+' : '-'}$${money(Math.abs(s.pnl), 2)}`, W / 2, 815);
+  ctx.fillText(s.pnl === null ? '—' : `${pos ? '+' : '-'}$${money(Math.abs(s.pnl), 2)}`, W / 2, 815);
   ctx.restore();
 
   drawStat(ctx, W * 0.30, 'VOLUME', `$${money(s.volume)}`);
@@ -97,15 +114,20 @@ function drawCard(ctx: CanvasRenderingContext2D, sprite: HTMLImageElement, frame
 }
 
 export function FlexStatsCard({ onClose }: { onClose: () => void }) {
-  const { account, positions } = useApp();
+  const { account, positions, config } = useApp();
   const toast = useToast();
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [sprite, setSprite] = useState<HTMLImageElement | null>(null);
+  const bal = useBalance();
+  const book = bookEnvOf(config);
+  const mine = positions.filter((p) => p.kalshiEnv === book);
 
   const stats: Stats = {
-    pnl: account?.alltimePnlUsd ?? account?.realizedPnlUsd ?? 0,
-    volume: positions.reduce((acc, p) => acc + (p.costUsd || 0), 0),
-    trades: account?.totalOpened ?? positions.filter((p) => (p.filledContracts || 0) > 0).length,
+    pnl: bal.alltimePnlUsd ?? (typeof account?.realizedPnlUsd === 'number' && (account.wins + account.losses) > 0
+      ? account.realizedPnlUsd : null),
+    volume: mine.reduce((acc, p) => acc + (p.costUsd || 0), 0),
+    trades: account?.totalOpened ?? mine.filter((p) => (p.filledContracts || 0) > 0).length,
+    paper: !isLive(config),
   };
   const statsRef = useRef(stats);
   statsRef.current = stats;

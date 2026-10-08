@@ -1,3 +1,10 @@
+"""Standing instructions, Discover filters, and our own microstructure.
+
+The rules engine is the only thing in the app that acts without a click at the
+moment it acts, so most of what is pinned here is what it does NOT do: fire on
+a price nobody could produce, fire on a mid no bid supports, or sell more than
+is held.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -14,13 +21,14 @@ import terminal
 def conn(tmp_path, monkeypatch):
     path = tmp_path / "t.sqlite"
     monkeypatch.setattr(db, "db_path", lambda: path)
-    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "demo")
+    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "paper")
     c = sqlite3.connect(path)
     c.row_factory = sqlite3.Row
     c.executescript(db.SCHEMA)
     c.commit()
     yield c
     c.close()
+
 
 
 def test_a_stop_defaults_to_watching_for_the_price_falling(conn):
@@ -73,6 +81,7 @@ def test_rules_are_scoped_to_the_environment(conn):
     assert terminal.list_rules()["rules"] == []
 
 
+
 def test_a_below_rule_fires_at_or_under_the_threshold():
     assert terminal._rule_fires("below", 29.0, 30.0) is True
     assert terminal._rule_fires("below", 30.0, 30.0) is True
@@ -95,6 +104,7 @@ def test_a_one_sided_book_yields_no_exit_price_rather_than_a_guess():
     assert terminal._exit_price_for({"yesBid": None, "yesAsk": 44.0}, "yes")[0] is None
     assert terminal._exit_price_for({"yesBid": 40.0, "yesAsk": None}, "no")[0] is None
     assert terminal._exit_price_for(None, "yes") == (None, None)
+
 
 
 def _armed(kind="stop", threshold=30.0, direction="below", side="yes"):
@@ -184,7 +194,7 @@ def test_a_triggered_stop_sells_through_the_bid_so_it_actually_fills(conn, monke
 
     seen: list = []
 
-    async def fake_submit(req, *, cfg, authed):
+    async def fake_submit(req, *, cfg, authed, scope=None):
         seen.append(req)
         return {"ok": True, "message": "Filled 12 at 35c", "orderId": "ord-1"}
     monkeypatch.setattr(terminal, "submit", fake_submit)
@@ -215,7 +225,7 @@ def test_a_stop_never_sells_more_than_is_actually_held(conn, monkeypatch):
 
     seen: list = []
 
-    async def fake_submit(req, *, cfg, authed):
+    async def fake_submit(req, *, cfg, authed, scope=None):
         seen.append(req)
         return {"ok": True, "message": "ok", "orderId": "o"}
     monkeypatch.setattr(terminal, "submit", fake_submit)
@@ -272,7 +282,7 @@ def test_a_refused_exit_stays_armed_because_nothing_was_sent(conn, monkeypatch):
         return {"positions": [{"ticker": "KXA-1", "side": "yes", "contracts": 3}]}
     monkeypatch.setattr(terminal, "portfolio", fake_portfolio)
 
-    async def fake_submit(req, *, cfg, authed):
+    async def fake_submit(req, *, cfg, authed, scope=None):
         return {"ok": False, "message": "Kalshi rejected the order: closed"}
     monkeypatch.setattr(terminal, "submit", fake_submit)
 
@@ -282,6 +292,8 @@ def test_a_refused_exit_stays_armed_because_nothing_was_sent(conn, monkeypatch):
 
 
 def test_an_unconfirmed_exit_stops_and_asks_for_a_human(conn, monkeypatch):
+    """The one case that must NOT re-arm: the order may be LIVE on Kalshi, so
+    firing again could double the exit."""
     _armed(kind="stop", threshold=40.0)
 
     async def fake_book(t):
@@ -292,13 +304,14 @@ def test_an_unconfirmed_exit_stops_and_asks_for_a_human(conn, monkeypatch):
         return {"positions": [{"ticker": "KXA-1", "side": "yes", "contracts": 3}]}
     monkeypatch.setattr(terminal, "portfolio", fake_portfolio)
 
-    async def fake_submit(req, *, cfg, authed):
+    async def fake_submit(req, *, cfg, authed, scope=None):
         return {"ok": False, "status": "unconfirmed",
                 "message": "sent but Kalshi's reply was lost"}
     monkeypatch.setattr(terminal, "submit", fake_submit)
 
     changed = asyncio.run(terminal.evaluate_rules({}, authed=True))
     assert changed[0]["status"] == "error"
+
 
 
 def _row(**kw):
@@ -377,6 +390,7 @@ def test_the_note_distinguishes_skipped_from_excluded():
     assert "3" in note and "unmeasured, not low" in note
     assert "4" in note and "not a member of a set you named" in note
     assert terminal._filter_note(0, 0) == ""
+
 
 
 def test_an_unrecorded_market_reports_nothing_rather_than_zeros(monkeypatch):
@@ -463,6 +477,7 @@ def test_nothing_is_recorded_while_the_socket_is_down(monkeypatch):
     terminal._micro_last_sample = 0.0
     assert terminal.sample_microstructure() == 0
     assert terminal._micro == {}
+
 
 
 def test_a_404_is_distinguished_from_a_failure_to_ask(monkeypatch):

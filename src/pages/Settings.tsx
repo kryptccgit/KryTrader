@@ -1,17 +1,22 @@
 import { useState } from 'react';
 import {
-  AlertTriangle, Banknote, Bitcoin, Cloud, Dices, Film, Globe2, RotateCcw, Save,
+  AlertTriangle, Banknote, Bitcoin, Cloud, Compass, Dices, Film, Globe2, PlayCircle, Power, RotateCcw, Save,
   Trophy, Vote,
 } from 'lucide-react';
 import type { TraderConfig } from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import {
-  Card, NameDialog, NumberInput, Page, PercentInput, Section, Switch, useOptimisticValue,
+  Card, ConfirmDialog, NameDialog, NumberInput, Page, PercentInput, Section, Switch, useOptimisticValue,
 } from '../components/common';
+import { resetSummaryWords } from '../utils/resetSummary';
 import { AiSettings } from '../components/AiSettings';
 import { cls } from '../utils/format';
 import { computeTradeWarnings } from '../utils/warnings';
+import { AccountModePanel } from '../components/AccountModePanel';
+import { useSetTrading } from '../components/TopBar';
+import { useGuide } from '../components/tour/useTour';
+import { userMessage } from '../utils/errors';
 
 const KRYPT_CATEGORIES: { id: string; label: string; Icon: typeof Trophy }[] = [
   { id: 'sports', label: 'Sports', Icon: Trophy },
@@ -24,11 +29,36 @@ const KRYPT_CATEGORIES: { id: string; label: string; Icon: typeof Trophy }[] = [
   { id: 'exotics', label: 'Exotics', Icon: Dices },
 ];
 
+export function GettingStartedCard() {
+  const { replayOnboarding, startTour } = useGuide();
+  return (
+    <Card className="mt-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <div className="min-w-[220px] flex-1">
+          <div className="text-sm font-medium text-white">Getting started</div>
+          <div className="text-xs text-krypt-muted">
+            See the first-run setup again, or the tour of every tab. Replaying changes nothing
+            unless you act in a step.
+          </div>
+        </div>
+        <button type="button" onClick={startTour} className="krypt-btn-default" data-testid="settings-tour">
+          <Compass className="h-4 w-4" /> Take the tour
+        </button>
+        <button type="button" onClick={replayOnboarding} className="krypt-btn-default" data-testid="settings-replay-onboarding">
+          <PlayCircle className="h-4 w-4" /> Replay onboarding
+        </button>
+      </div>
+    </Card>
+  );
+}
+
 export function SettingsPage() {
-  const { config, account, credentialsAll, refresh, state } = useApp();
+  const { config, account, refresh, state } = useApp();
   const toast = useToast();
   const [busy, setBusy] = useState(false);
   const [saveOpen, setSaveOpen] = useState(false);
+  const [askReset, setAskReset] = useState(false);
+  const setTrading = useSetTrading();
 
   if (!config) return <Page title="Settings"><div className="text-krypt-muted">Loading…</div></Page>;
 
@@ -37,7 +67,7 @@ export function SettingsPage() {
       await window.krypt.config.update(p);
       await refresh.state();
     } catch (e: any) {
-      toast.error(`${e?.message || e}`);
+      toast.error(userMessage(e));
     }
   };
 
@@ -52,36 +82,15 @@ export function SettingsPage() {
     return patch(p);
   };
 
-  const switchEnv = async (e: 'demo' | 'production'): Promise<void> => {
-    if (!config || e === config.kalshiEnv) return;
-    if (e === 'production' && !window.confirm(
-      config.enableTrading
-        ? 'Switch to PRODUCTION (real money)?\n\nAuto-trading is currently ON — the bot may place REAL-money orders on your Kalshi account immediately after switching.'
-        : 'Switch to PRODUCTION (real money)?\n\nOrders placed in this environment use real funds.',
-    )) return;
-    await update('kalshiEnv', e);
-    const label = e === 'production' ? 'Production (real money)' : 'Demo (play money)';
-    const creds = e === 'production' ? credentialsAll?.production : credentialsAll?.demo;
-    if (!creds?.hasApiKey || !creds?.hasRsaKey) {
-      toast.warn(`Switched to ${label}, but no API keys are saved for it. Add them on the API Keys page or the bot can't connect or trade.`);
-      return;
-    }
-    const r = await window.krypt.credentials.test(e);
-    if (r.ok) {
-      toast.success(`Connected to ${label}.`);
-    } else {
-      toast.error(`${label} keys were rejected by Kalshi — open the API Keys page and re-check the key for this environment. (${r.message ?? 'auth failed'})`);
-    }
-    await refresh.credentials();
-  };
-
   const reset = async (): Promise<void> => {
-    if (!window.confirm('Reset all trading settings to defaults?')) return;
+    setAskReset(false);
     setBusy(true);
     try {
       await window.krypt.config.reset();
       await refresh.state();
-      toast.success('Reset to defaults');
+      toast.success('The bot\'s settings are back to their defaults.');
+    } catch (e) {
+      toast.error(userMessage(e));
     } finally {
       setBusy(false);
     }
@@ -96,7 +105,6 @@ export function SettingsPage() {
     } else toast.error(r.message || 'Could not save profile');
   };
 
-  const env = config.kalshiEnv;
   const warnings = computeTradeWarnings(config, account);
 
   return (
@@ -105,8 +113,9 @@ export function SettingsPage() {
       subtitle="Every knob the bot has. Changes are saved + applied immediately."
       actions={
         <>
-          <button onClick={reset} disabled={busy} className="krypt-btn-default">
-            <RotateCcw className="h-4 w-4" /> Reset
+          <button onClick={() => setAskReset(true)} disabled={busy} className="krypt-btn-default"
+            title="Put the bot's strategy settings back to their defaults" data-testid="settings-reset">
+            <RotateCcw className="h-4 w-4" /> Reset bot settings
           </button>
           <button onClick={() => setSaveOpen(true)} className="krypt-btn-primary">
             <Save className="h-4 w-4" /> Save as Profile
@@ -133,44 +142,27 @@ export function SettingsPage() {
         </div>
       )}
 
-      <Section title="Environment">
+      <Section
+        title="Account"
+        description="Paper or Live — the master switch over every engine in the app."
+      >
+        <AccountModePanel />
+      </Section>
+
+      <Section title="Main bot">
         <Card>
-          <div className="grid gap-4 md:grid-cols-2">
-            <div>
-              <label className="krypt-label">Kalshi environment</label>
-              <div className="flex gap-2">
-                {(['demo', 'production'] as const).map((e) => (
-                  <button
-                    key={e}
-                    onClick={() => void switchEnv(e)}
-                    className={cls(
-                      'flex-1 rounded-md border px-3 py-2 text-sm capitalize transition-colors',
-                      env === e
-                        ? 'border-krypt-purple bg-krypt-purple/10 text-white'
-                        : 'border-krypt-border bg-krypt-surface2 text-krypt-muted hover:border-krypt-borderHi',
-                    )}
-                  >
-                    {e}
-                  </button>
-                ))}
-              </div>
-              <p className="krypt-help">
-                Demo runs against demo-api.kalshi.co. Production trades real money.
+          <div className="flex flex-col gap-2">
+            <Switch
+              label="Auto-trading enabled"
+              description="Controls the main signal bot (whales/momentum). When off, signals still stream in but the main bot places no orders. The 15-minute crypto executor and user scripts are separate — each has its own switch on its page and this toggle does not stop them. In Paper every order it places is paper."
+              checked={config.enableTrading}
+              onChange={(v) => void setTrading(v)}
+            />
+            {config.crypto15mEnabled && config.crypto15mLive && config.accountMode === 'live' && (
+              <p className="krypt-help text-krypt-warn">
+                Heads up: the 15-minute crypto executor is armed LIVE and trades independently of this switch.
               </p>
-            </div>
-            <div className="flex flex-col gap-2">
-              <Switch
-                label="Auto-trading enabled"
-                description="Controls the main signal bot (whales/momentum). When off, signals still stream in but the main bot places no orders. The 15-minute crypto executor and live user scripts are separate — each has its own arm switch on its page and this toggle does not stop them. To test risk-free, run on the Demo environment above."
-                checked={config.enableTrading}
-                onChange={(v) => void update('enableTrading', v)}
-              />
-              {config.crypto15mEnabled && config.crypto15mLive && config.kalshiEnv === 'production' && (
-                <p className="krypt-help text-krypt-warn">
-                  Heads up: the 15-minute crypto executor is armed LIVE and trades independently of this switch.
-                </p>
-              )}
-            </div>
+            )}
           </div>
         </Card>
       </Section>
@@ -663,14 +655,46 @@ export function SettingsPage() {
               onChange={(v) => window.krypt.state.setStartMinimized(v).then(refresh.state)}
             />
           </div>
+          <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-krypt-border pt-3">
+            <div className="min-w-[220px] flex-1 text-xs text-krypt-muted">
+              Closing the window keeps Krypt Trader running in the tray — and anything you switched
+              on keeps trading. Quit stops the app completely.
+            </div>
+            <button type="button" className="krypt-btn-default" onClick={() => void window.krypt.app.quit?.()}
+              data-testid="settings-quit">
+              <Power className="h-4 w-4" /> Quit Krypt Trader
+            </button>
+          </div>
         </Card>
+        <GettingStartedCard />
       </Section>
 
       <DangerZone busy={busy} setBusy={setBusy} />
+      <ConfirmDialog
+        open={askReset}
+        title="Reset the bot's settings?"
+        confirmLabel="Reset bot settings"
+        onClose={() => setAskReset(false)}
+        onConfirm={() => void reset()}
+        body={
+          <div className="space-y-2" data-testid="settings-reset-confirm">
+            <p>
+              Puts the <span className="text-white">bot&apos;s strategy settings</span> back to their
+              defaults: signal gates, categories, position sizing, order placement, risk limits,
+              trading hours, scan timing and the scanner thresholds.
+            </p>
+            <p className="text-krypt-muted">
+              Kept exactly as they are: Paper/Live mode and whether the bot is on, your AI agents
+              and their tokens, Autopilot, your AI provider and model, phone remote control, Discord
+              webhooks, manual-order limits, 15-minute crypto settings, profiles and API keys.
+            </p>
+          </div>
+        }
+      />
       <NameDialog
         open={saveOpen}
         title="Save these settings as a profile"
-        label="Saves a snapshot of every knob below. It'll appear under Your Strategies."
+        label="Saves a snapshot of every knob below. It'll appear on the Strategies page."
         placeholder="e.g. My small-balance sports config"
         confirmLabel="Save"
         onSubmit={(name) => void saveAsProfile(name)}
@@ -708,18 +732,15 @@ function DangerZone({
       const r = await window.krypt.app.factoryReset();
       if (r.ok) {
         const summary = (r.data as { deleted?: Record<string, number> })?.deleted || {};
-        const detail = Object.entries(summary)
-          .filter(([k, v]) => !k.startsWith('_') && (v as number) > 0)
-          .map(([k, v]) => `${k}: ${v}`)
-          .join(', ');
-        toast.success(detail
-          ? `Wiped — ${detail}`
-          : (r.message || 'Local data cleared (nothing to delete)'));
+        const detail = resetSummaryWords(summary);
+        toast.push(detail !== 'nothing'
+          ? `Cleared: ${detail}.`
+          : (r.message || 'There was nothing to clear.'), 'success', 9000);
       } else {
         toast.error(r.message || 'Reset failed');
       }
     } catch (e: any) {
-      toast.error(`${e?.message || e}`);
+      toast.error(userMessage(e));
     } finally {
       setBusy(false);
       setPhrase('');
@@ -770,10 +791,12 @@ function DangerZone({
             <div className="mt-3 space-y-2 text-sm text-krypt-muted">
               <p>This will permanently delete:</p>
               <ul className="ml-5 list-disc space-y-1">
-                <li>all bot positions and trade history</li>
-                <li>all bot runs (session P&amp;L)</li>
-                <li>all P&amp;L snapshots</li>
-                <li>all whale and momentum signals</li>
+                <li>all bot positions and trade history, Paper and Live</li>
+                <li>all bot runs (session P&amp;L) and balance snapshots</li>
+                <li>all whale and momentum signals, and 15-minute crypto trades</li>
+                <li>the paper account&apos;s orders and fills</li>
+                <li>your AI agents&apos; order log and Autopilot runs</li>
+                <li>armed standing instructions (stop-loss / take-profit rules)</li>
               </ul>
               <p className="pt-2">
                 API keys, profiles, and settings are <strong>kept</strong>.

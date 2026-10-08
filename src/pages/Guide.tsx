@@ -1,10 +1,10 @@
 import {
-  Activity, AlertTriangle, BarChart3, BookOpen, Briefcase, CheckCircle2,
+  Activity, AlertTriangle, BarChart3, BookOpen, Bot, Briefcase, CheckCircle2,
   ExternalLink, Eye, FlaskConical, Gift, KeyRound, Layers, PlayCircle, Sparkles, Target, Twitter, Zap,
 } from 'lucide-react';
 import { Card, Page, Section } from '../components/common';
 import {
-  GUIDE_VIDEO_URL, KALSHI_DEMO_GUIDE, KALSHI_DEMO_SIGNUP, KALSHI_DEMO_URL, openKalshiReferral,
+  GUIDE_VIDEO_URL, KALSHI_API_KEYS_URL, openKalshiReferral,
 } from '../utils/links';
 import { followYuhgo, X_PROFILE } from '../utils/share';
 
@@ -65,6 +65,81 @@ export function GuidePage() {
           </div>
         </div>
       </Card>
+
+      <Section title="Paper vs Live — the one switch that matters">
+        <Card>
+          <div className="grid gap-4 md:grid-cols-2" data-testid="guide-paper-live">
+            <div className="rounded-xl border border-krypt-purple/30 bg-krypt-purple/[0.05] p-4">
+              <div className="flex items-center gap-2 text-sm font-semibold text-krypt-purple">
+                <FlaskConical className="h-4 w-4" /> Paper (where everyone starts)
+              </div>
+              <ul className="mt-2 list-disc space-y-1 pl-5 text-xs leading-relaxed text-krypt-muted">
+                <li>Real Kalshi markets and real prices — with <span className="text-white">imaginary money</span>.</li>
+                <li>No Kalshi account or key needed. Nothing can send a real order.</li>
+                <li>Every part of the app works: the bot, your AI agents, the Terminal, scripts.</li>
+                <li>A purple <span className="text-white">PAPER</span> label next to the balance says you are here.</li>
+              </ul>
+            </div>
+            <div className="rounded-xl border border-krypt-loss/30 bg-krypt-loss/[0.05] p-4">
+              <div className="flex items-center gap-2 text-sm font-semibold text-krypt-loss">
+                <AlertTriangle className="h-4 w-4" /> Live (real money)
+              </div>
+              <ul className="mt-2 list-disc space-y-1 pl-5 text-xs leading-relaxed text-krypt-muted">
+                <li>Orders spend the money in <span className="text-white">your own Kalshi account</span>.</li>
+                <li>Needs a Kalshi API key, then Settings → Account → Go live, which checks everything first.</li>
+                <li>Each engine (the bot, agents, 15-minute crypto, scripts) still has its own on/off switch.</li>
+                <li>A red <span className="text-white">LIVE</span> label says you are here. Back to Paper is one click.</li>
+              </ul>
+            </div>
+          </div>
+          <p className="mt-3 text-xs text-krypt-muted">
+            Paper and Live keep separate records: a paper win never shows up in your Live totals, and
+            pages like Positions and History let you pick which book you are looking at.
+          </p>
+        </Card>
+      </Section>
+
+      <Section title="AI agents, in plain words">
+        <Card>
+          <div className="space-y-3 text-sm leading-relaxed text-krypt-muted" data-testid="guide-ai-agents">
+            <p>
+              <Bot className="mr-1.5 inline h-4 w-4 text-krypt-purple" />
+              An <span className="text-white">AI agent</span> is an AI (like Claude or ChatGPT) that can
+              look at Kalshi markets for you, write down what it thinks will happen, and — if you let
+              it — place trades. The app keeps it inside rules it cannot change.
+            </p>
+            <ol className="list-decimal space-y-2 pl-5 text-xs">
+              <li>
+                <span className="text-white">Connect one.</span> On the AI Agents page, the easiest
+                choice is <span className="text-white">In-app Autopilot</span>: nothing to install, the
+                app runs the agent itself with an AI key you add (or a free model on your computer). If
+                you already use Claude Desktop, there is a one-click <span className="text-white">Add
+                to Claude Desktop</span> button; Claude Code, Cursor and Codex work too.
+              </li>
+              <li>
+                <span className="text-white">Paper first.</span> Agents start on paper — real prices,
+                imaginary money — and must write down a forecast that beats the price (after Kalshi&apos;s
+                fee) before every buy.
+              </li>
+              <li>
+                <span className="text-white">Named agents.</span> Make several, each with its own
+                personality, rules (which markets, what prices, how much) and record. A rule you set is
+                enforced by the app on every order that agent places.
+              </li>
+              <li>
+                <span className="text-white">The scoreboard.</span> Once markets settle, every forecast
+                is scored against what the market itself said at that moment. If an agent doesn&apos;t
+                beat the market there, it has no edge — whatever it sounds like.
+              </li>
+              <li>
+                <span className="text-white">Go live — only if the record says so.</span> Real money
+                needs the app in Live and agent trading set to Live. Live agent orders wait for your
+                approval by default, and a daily loss limit stops new buys for the day.
+              </li>
+            </ol>
+          </div>
+        </Card>
+      </Section>
 
       <Section title="Two halves: the Terminal and the bot">
         <Card>
@@ -209,63 +284,66 @@ export function GuidePage() {
           <ol className="space-y-4 text-sm">
             <Step
               n={1}
-              title="Sign up to Kalshi"
+              title="Start on paper — no account needed"
               body={
                 <>
-                  Use the referral link above for $25 free. Demo mode works without a
-                  funded production account if you only want to test on demo.
+                  The app opens in <span className="text-white">Paper</span> mode: Kalshi&apos;s real
+                  markets and prices, imaginary money. Nothing to sign up for, no key to paste. Every
+                  engine works in Paper — the bot, 15-minute crypto, scripts, the Terminal ticket,
+                  phone orders and AI agents — and none of them can send a real order.
                 </>
               }
             />
             <Step
               n={2}
-              title="Generate API credentials on Kalshi"
+              title="Make your own strategy"
               body={
                 <>
-                  Kalshi → <span className="text-white">Account → API Keys → New Key</span>.
-                  Save the API key ID and download the private key file (Ed25519 or RSA both work; it's a
-                  one-time download). For demo, do this on{' '}
-                  <button
-                    onClick={open('https://demo.kalshi.co')}
-                    className="text-krypt-purple hover:underline"
-                  >demo.kalshi.co</button>.
+                  Nothing ships pre-made — no built-in strategy has a proven
+                  edge. Tune the gates, sizing and scanners in Settings and save
+                  them on <Sparkles className="inline h-3.5 w-3.5" /> Strategies,
+                  write one as code on Scripts, or let an AI agent with
+                  &ldquo;Change strategy settings&rdquo; on tune them for you.
                 </>
               }
             />
             <Step
               n={3}
-              title="Paste them on the API Keys page"
+              title="Run it on paper and judge it"
               body={
                 <>
-                  Click <KeyRound className="inline h-3.5 w-3.5" /> API Keys in the
-                  sidebar, paste the key ID, paste the RSA PEM block, hit{' '}
-                  <span className="text-white">Save &amp; Verify</span>. The bot
-                  authenticates with Kalshi and starts streaming your balance.
+                  Turn auto-trading on and let it rack up a few hundred resolved paper trades, then
+                  read the <span className="text-white">History</span> page. Paper fills walk the
+                  real order book and pay Kalshi&apos;s fee, so a paper loss is a real warning. Reset
+                  the paper account any time from Settings → Account.
                 </>
               }
             />
             <Step
               n={4}
-              title="Pick a strategy preset"
+              title="Ready for real money: add a Kalshi key"
               body={
                 <>
-                  <Sparkles className="inline h-3.5 w-3.5" /> Strategies offers
-                  Conservative, Balanced, and High-Risk presets. They tweak edge
-                  thresholds, position sizing, and which scanners are enabled. You
-                  can clone one into <Briefcase className="inline h-3.5 w-3.5" /> Profiles
-                  and tune any field.
+                  Sign up to Kalshi (the referral link above gives $25 after your first deposit),
+                  then on{' '}
+                  <button onClick={open(KALSHI_API_KEYS_URL)} className="text-krypt-purple hover:underline">
+                    kalshi.com
+                  </button>{' '}
+                  go to <span className="text-white">Account → API Keys → New Key</span>. Paste the
+                  key ID and private key on the <KeyRound className="inline h-3.5 w-3.5" /> API Keys
+                  page (the step-by-step wizard checks both).
                 </>
               }
             />
             <Step
               n={5}
-              title="Test on demo, then go live"
+              title="Go live"
               body={
                 <>
-                  Run on the <span className="text-white">Demo</span> environment
-                  (Settings) until you've watched a few scan cycles and trust the
-                  config, then switch to Production to trade real money. The Pause
-                  button at the top right is your kill-switch.
+                  Settings → Account → <span className="text-white">Go live</span> verifies the key,
+                  lists every engine that will start spending real money, and asks you to confirm.
+                  Each engine&apos;s own live switch still applies on top. Paper is one click away,
+                  and the Pause button at the top right is your kill-switch.
                 </>
               }
             />
@@ -273,65 +351,36 @@ export function GuidePage() {
         </Card>
       </Section>
 
-      <Section title="Test free on Kalshi's demo exchange">
+      <Section title="Paper mode: real prices, imaginary money">
         <Card className="border-krypt-win/25 bg-krypt-win/[0.03]">
           <div className="mb-4 flex items-start gap-3">
             <div className="grid h-10 w-10 shrink-0 place-items-center rounded-xl bg-krypt-win/15 text-krypt-win">
               <FlaskConical className="h-5 w-5" />
             </div>
             <p className="text-sm text-krypt-muted">
-              Kalshi runs a full <span className="text-white">demo exchange</span> with real order
-              matching, fills, and settlement — but <span className="text-white">play money</span>.
-              It's the most realistic way to test a strategy with zero risk: connect demo keys, enable
-              auto-trading, and the bot places real orders against the sandbox — play money, no risk.
+              Paper trades Kalshi&apos;s <span className="text-white">real production markets</span>{' '}
+              against a local book with a starting balance you choose. It reads Kalshi&apos;s public
+              prices and order books — no Kalshi account, no key, nothing signed — and it is the
+              master switch: while the app is in Paper, no engine can reach your real account.
             </p>
           </div>
-          <ol className="space-y-4 text-sm">
-            <Step n={1} title="Create a demo account" body={
-              <>Go to{' '}
-                <button onClick={open(KALSHI_DEMO_SIGNUP)} className="text-krypt-purple hover:underline">demo.kalshi.co/sign-up</button>
-                {' '}and sign up with mock info (fake name, address, SSN — no real details), a real
-                email, and a password. <span className="text-white">The domain is .co, not .com.</span>
-              </>
-            } />
-            <Step n={2} title="Add play money" body={
-              <>Deposit with a test card — Visa <span className="font-mono text-white">4000 0566 5566 5556</span>{' '}
-                or Mastercard <span className="font-mono text-white">5200 8282 8282 8210</span>, any future
-                expiry and any CVV. It's all sandbox; no real money moves.
-              </>
-            } />
-            <Step n={3} title="Generate demo API keys" body={
-              <>On{' '}
-                <button onClick={open(KALSHI_DEMO_URL)} className="text-krypt-purple hover:underline">demo.kalshi.co</button>
-                {' '}→ Account → API Keys → New Key. Save the key ID and download the private key.
-                Demo keys are completely separate from production.
-              </>
-            } />
-            <Step n={4} title="Connect them here (Demo env)" body={
-              <>Open <KeyRound className="inline h-3.5 w-3.5" /> API Keys, set the environment to{' '}
-                <span className="text-white">Demo</span>, paste the key ID + RSA PEM, and hit Save &amp; Verify.
-              </>
-            } />
-            <Step n={5} title="Run it for real — on the sandbox" body={
-              <>Pick a strategy and turn <span className="text-white">Auto-trading on</span> in Settings.
-                The bot now fires live orders with fake money. Let it rack up a few hundred resolved
-                trades, then judge it on the <span className="text-white">History</span> page (and the
-                backtested-edge chips on the Strategies page).
-              </>
-            } />
-          </ol>
-          <div className="mt-4 flex flex-wrap gap-2">
-            <button onClick={open(KALSHI_DEMO_SIGNUP)} className="krypt-btn-primary">
-              <FlaskConical className="h-4 w-4" /> Open demo.kalshi.co <ExternalLink className="h-3 w-3" />
-            </button>
-            <button onClick={open(KALSHI_DEMO_GUIDE)} className="krypt-btn-default">
-              Full Kalshi demo guide <ExternalLink className="h-3 w-3" />
-            </button>
-          </div>
-          <div className="mt-3 text-[11px] text-krypt-dim">
-            Demo and production are fully separate (separate logins, keys, and funds). Never send real
-            crypto to demo wallet addresses.
-          </div>
+          <ul className="list-disc space-y-1.5 pl-5 text-sm text-krypt-muted">
+            <li>
+              An order fills at once against the real order book, level by level, up to its limit,
+              with Kalshi&apos;s fee. The rest rests and fills only if the real book later crosses
+              your price — never on a print at it, since your place in the queue is unknowable.
+            </li>
+            <li>Positions settle on the real outcome. Your size never moves the paper book.</li>
+            <li>
+              Paper and Live keep separate books: paper positions never count toward Live caps,
+              and the reverse. A <span className="text-white">PAPER</span> pill by the balance always
+              says which one you are looking at.
+            </li>
+            <li>
+              Not modelled: queue position, market impact, depth beyond the visible book. Read
+              paper P&amp;L as a rehearsal of a strategy, not a promise of what Live will pay.
+            </li>
+          </ul>
         </Card>
       </Section>
 
@@ -371,44 +420,44 @@ export function GuidePage() {
         <Card>
           <div className="grid gap-x-8 gap-y-3 md:grid-cols-2">
             <SettingRow
-              label="min_confidence_*"
-              hint="The signal's quality score (0–100). Higher = more selective. Conservative ≈ 78, Balanced ≈ 70, High-Risk ≈ 60."
+              label="Min confidence (Signal gates)"
+              hint="The signal's quality score (0–100). Higher = pickier, fewer trades."
             />
             <SettingRow
-              label="min_edge_pts_*"
-              hint="Required gap between confidence and the market's implied probability. 5 pts = a small edge, 12+ pts = strong."
+              label="Min edge (Signal gates)"
+              hint="How far the signal's confidence must be above the market price, in points. 5 = a small edge, 12+ = strong."
             />
             <SettingRow
-              label="min/max_size_fraction"
-              hint="Fraction of bankroll bet at minimum / maximum edge. Sizing interpolates between them. Cap with hard_max_position_usd."
+              label="Min size / Max size (Position sizing)"
+              hint="The share of your balance bet at the smallest and biggest edge; sizes in between scale. A hard dollar cap sits on top."
             />
             <SettingRow
-              label="max_open_positions"
-              hint="Hard ceiling on simultaneous unsettled bets. Protects against signal storms."
+              label="Max open positions (Concurrency & risk)"
+              hint="The most unsettled bets at once. Protects against a burst of signals."
             />
             <SettingRow
-              label="max_total_exposure_fraction"
-              hint="At-risk capital cannot exceed this fraction of bankroll. Shrinks new bets when full."
+              label="Max total exposure (Position sizing)"
+              hint="Money at risk can't exceed this share of your balance. New bets shrink when it's full."
             />
             <SettingRow
-              label="stop_loss_on_day"
-              hint="Negative dollar amount. If today's realized P&L hits this, no new entries until tomorrow."
+              label="Daily stop-loss (Concurrency & risk)"
+              hint="If today's settled losses reach this, the bot opens nothing new until tomorrow."
             />
             <SettingRow
-              label="take_profit_on_day"
-              hint="Positive dollar amount. Same idea — locks in a profitable day."
+              label="Daily take-profit"
+              hint="Same idea the other way — stop for the day once you're up this much."
             />
             <SettingRow
-              label="order_style"
-              hint="limit_cross (aggressive: cross spread to fill fast), limit_mid (cheaper, may not fill), or market."
+              label="Order style (Order placement)"
+              hint="Cross the spread to fill fast, sit at the middle to pay less (may not fill), or market."
             />
             <SettingRow
-              label="allowed_categories"
-              hint="Toggle market categories on/off (Sports, Politics, Crypto, etc.). Empty = trade nothing."
+              label="Categories"
+              hint="Which kinds of market the bot may trade (Sports, Politics, Crypto…). None picked = nothing."
             />
             <SettingRow
-              label="min_cash_reserve_fraction"
-              hint="Always keep at least this fraction of bankroll in cash. Prevents over-leveraging."
+              label="Min cash reserve (Position sizing)"
+              hint="Always keep at least this share of your balance in cash."
             />
           </div>
         </Card>
@@ -463,22 +512,21 @@ export function GuidePage() {
           </div>
           <ul className="mt-2 space-y-1.5 text-sm text-krypt-muted">
             <li>
-              <span className="text-white">Positions → Reconcile</span> — re-syncs
-              local rows with Kalshi's live position list.
+              <span className="text-white">Positions → Refresh</span> — checks every
+              open and pending order again and re-syncs the list with your account.
             </li>
             <li>
-              <span className="text-white">Positions → Resolve Now</span> — forces
-              one resolution pass for any settled markets.
+              Check the <span className="text-white">Book</span> picker on Positions and
+              History — Paper and Live are kept apart, so a missing trade is often in the
+              other book.
             </li>
             <li>
-              <span className="text-white">Positions → Recompute P&amp;L</span> —
-              wipes locally-stored P&L for resolved trades and rebuilds from each
-              market's settlement value. Use after upgrading or if the dashboard
-              shows obviously wrong wins/losses.
+              <span className="text-white">Restart</span> button (top bar) — restarts the
+              trading engine (the background part of the app) if it&apos;s stuck.
             </li>
             <li>
-              <span className="text-white">Restart</span> button (top bar) — bounces
-              the Python backend if it's stuck.
+              <span className="text-white">Logs → Copy diagnostics</span> — copies a
+              report without any keys in it, to paste into a bug report.
             </li>
           </ul>
         </Card>
@@ -491,7 +539,7 @@ export function GuidePage() {
               icon={Zap}
               tone="loss"
               title="High Risk"
-              body="Lower confidence floor (~60), wider edge tolerance, higher max size fraction. Lots of fills, lots of swings, biggest variance. Best for finding what works fast on demo."
+              body="Lower confidence floor (~60), wider edge tolerance, higher max size fraction. Lots of fills, lots of swings, biggest variance. Best for finding what works fast on paper."
             />
             <StratBlock
               icon={Activity}
@@ -507,9 +555,9 @@ export function GuidePage() {
             />
           </div>
           <div className="mt-4 text-xs text-krypt-dim">
-            All three are starting points — clone any of them into a Profile and
-            adjust. Track outcomes via the History page over a few days before you
-            commit real capital.
+            These are descriptions of three styles, not built-in presets — the app ships
+            none, because none has a proven edge. Set the numbers yourself in Settings, save
+            them as a Profile, and watch History for a few days on Paper before any real money.
           </div>
         </Card>
       </Section>
@@ -556,18 +604,18 @@ export function GuidePage() {
           <ul className="space-y-2 text-sm text-krypt-muted">
             <li>
               <BookOpen className="mr-2 inline h-3.5 w-3.5" />
-              Run the bot on demo for at least a few hundred resolved trades before
-              flipping to production. The Profiles page lets you A/B test settings.
+              Run the bot on Paper for at least a few hundred settled trades before
+              going Live. The Profiles page lets you compare settings.
             </li>
             <li>
               <BookOpen className="mr-2 inline h-3.5 w-3.5" />
-              Tighten <span className="text-white">allowed_categories</span> if you
-              don't trust certain markets (e.g., low-liquidity regional sports).
+              Narrow the <span className="text-white">Categories</span> in Settings if you
+              don&apos;t trust certain markets (e.g. thinly traded regional sports).
             </li>
             <li>
               <BookOpen className="mr-2 inline h-3.5 w-3.5" />
-              Use <span className="text-white">order_expiration_sec</span> to cancel
-              resting orders that haven't filled. Stale fills at bad prices kill edge.
+              Use <span className="text-white">Order expiration</span> (Settings → Order placement) to
+              cancel orders that haven&apos;t filled. A late fill at a stale price eats the edge.
             </li>
             <li>
               <BookOpen className="mr-2 inline h-3.5 w-3.5" />

@@ -1,12 +1,18 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Bar, BarChart, Cell, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts';
 import { History as HistoryIcon, Play, Receipt, Square, Trash2, Trophy } from 'lucide-react';
-import type { BotRun, Crypto15mPosition } from '@shared/types';
+import type { BookEnv, BotRun, Crypto15mPosition } from '@shared/types';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import { Card, ConfirmDialog, Empty, Page, ShareableStat, StatCard } from '../components/common';
+import { GlassSegmented } from '../components/glass/GlassSegmented';
 import { TickerLink } from '../components/KalshiTicker';
 import { cls, fmtPct, fmtUsd, fmtDateTime } from '../utils/format';
+import { resetSummaryWords } from '../utils/resetSummary';
+import { BOOK_LABEL, bookEnvOf } from '../utils/account';
+import { bragText } from '../utils/brag';
+import { winRatePct } from '../utils/stats';
+import { userMessage } from '../utils/errors';
 
 type HistoryTab = 'runs' | 'trades' | 'crypto15m';
 
@@ -17,6 +23,12 @@ export function HistoryPage() {
   const [runs, setRuns] = useState<BotRun[]>([]);
   const [c15Rows, setC15Rows] = useState<Crypto15mPosition[]>([]);
   const [c15Paper, setC15Paper] = useState(false);
+  const [scopePick, setScopePick] = useState<BookEnv | null>(null);
+  const scope: BookEnv = scopePick ?? bookEnvOf(config);
+  const byEnvDemo = account?.byEnv?.demo;
+  const hasRetired = positions.some((p) => p.kalshiEnv === 'demo')
+    || !!(byEnvDemo && (byEnvDemo.wins + byEnvDemo.losses) > 0);
+  const scopes: BookEnv[] = hasRetired ? ['paper', 'production', 'demo'] : ['paper', 'production'];
 
   useEffect(() => {
     if (tab !== 'crypto15m') return;
@@ -38,12 +50,12 @@ export function HistoryPage() {
           .filter(([k]) => !k.startsWith('_'))
           .reduce((acc, [, v]) => acc + (Number(v) > 0 ? Number(v) : 0), 0);
         setRuns([]);
-        toast.success(n > 0 ? `History cleared — ${n} rows removed` : (r.message || 'History was already empty'));
+        toast.success(n > 0 ? `History cleared — ${resetSummaryWords(summary)} removed` : (r.message || 'History was already empty'));
       } else {
         toast.error(r.message || 'Wipe failed');
       }
     } catch (e: any) {
-      toast.error(`${e?.message || e}`);
+      toast.error(userMessage(e));
     } finally {
       setWiping(false);
     }
@@ -53,17 +65,17 @@ export function HistoryPage() {
     let mounted = true;
     const load = async () => {
       try {
-        const r = await window.krypt.data.botRuns(config?.kalshiEnv ?? null, 100);
+        const r = await window.krypt.data.botRuns(scope, 100);
         if (mounted) setRuns(r.runs);
       } catch {   }
     };
     void load();
     const i = window.setInterval(load, 15000);
     return () => { mounted = false; window.clearInterval(i); };
-  }, [config?.kalshiEnv]);
+  }, [scope]);
 
   const resolved = useMemo(() => {
-    const env = config?.kalshiEnv;
+    const env = scope;
     const ts = (p: { resolvedAt: string | null; lastUpdated: string; createdAt: string }) => {
       const cands = [p.resolvedAt, p.lastUpdated, p.createdAt];
       for (const c of cands) {
@@ -81,7 +93,7 @@ export function HistoryPage() {
         && p.outcomeCorrect !== null,
       )
       .sort((a, b) => ts(b) - ts(a));
-  }, [positions, config?.kalshiEnv]);
+  }, [positions, scope]);
 
   return (
     <Page
@@ -99,22 +111,53 @@ export function HistoryPage() {
         </button>
       }
     >
-      <div className="mb-4 inline-flex rounded-md border border-krypt-border bg-krypt-surface2 p-0.5">
-        <TabButton active={tab === 'runs'} onClick={() => setTab('runs')} icon={<HistoryIcon className="h-3.5 w-3.5" />}>
-          Run history
-          <span className="ml-1.5 rounded bg-krypt-surface px-1.5 py-0.5 text-[10px]">{runs.length}</span>
-        </TabButton>
-        <TabButton active={tab === 'trades'} onClick={() => setTab('trades')} icon={<Receipt className="h-3.5 w-3.5" />}>
-          Trade history
-          <span className="ml-1.5 rounded bg-krypt-surface px-1.5 py-0.5 text-[10px]">{resolved.length}</span>
-        </TabButton>
-        <TabButton active={tab === 'crypto15m'} onClick={() => setTab('crypto15m')} icon={<Receipt className="h-3.5 w-3.5" />}>
-          15m trades
-        </TabButton>
-      </div>
+      <GlassSegmented
+        className="mb-4"
+        value={tab}
+        onChange={setTab}
+        options={[
+          {
+            value: 'runs',
+            icon: <HistoryIcon className="h-3.5 w-3.5" />,
+            label: <>Run history<span className="ml-1.5 rounded-md bg-white/[0.08] px-1.5 py-0.5 font-mono text-[10px]">{runs.length}</span></>,
+          },
+          {
+            value: 'trades',
+            icon: <Receipt className="h-3.5 w-3.5" />,
+            label: <>Trade history<span className="ml-1.5 rounded-md bg-white/[0.08] px-1.5 py-0.5 font-mono text-[10px]">{resolved.length}</span></>,
+          },
+          { value: 'crypto15m', icon: <Receipt className="h-3.5 w-3.5" />, label: '15m trades' },
+        ]}
+      />
 
-      {tab === 'runs' && <RunHistory runs={runs} env={config?.kalshiEnv} />}
-      {tab === 'trades' && <TradeHistory resolved={resolved} account={account} />}
+      {tab !== 'crypto15m' && (
+        <div className="mb-4 flex flex-wrap items-center gap-2 text-xs" data-testid="history-scope">
+          <span className="text-krypt-muted">Book:</span>
+          {scopes.map((s) => (
+            <button
+              key={s}
+              type="button"
+              onClick={() => setScopePick(s)}
+              data-testid={`history-scope-${s}`}
+              className={cls(
+                'rounded-md border px-2.5 py-1 transition-colors',
+                scope === s
+                  ? s === 'production' ? 'border-krypt-loss/50 bg-krypt-loss/10 text-white'
+                    : 'border-krypt-purple/50 bg-krypt-purple/10 text-white'
+                  : 'border-krypt-border text-krypt-muted hover:text-white',
+              )}
+            >
+              {BOOK_LABEL[s]}
+            </button>
+          ))}
+          {scope === 'demo' && (
+            <span className="text-krypt-dim">History from Kalshi&apos;s demo exchange, which the app no longer uses. Counted in no cap or total.</span>
+          )}
+        </div>
+      )}
+
+      {tab === 'runs' && <RunHistory runs={runs} env={BOOK_LABEL[scope]} live={scope === 'production'} />}
+      {tab === 'trades' && <TradeHistory resolved={resolved} account={account} live={scope === 'production'} />}
       {tab === 'crypto15m' && <Crypto15mHistory rows={c15Rows} showPaper={c15Paper} onTogglePaper={setC15Paper} />}
 
       <ConfirmDialog
@@ -127,7 +170,7 @@ export function HistoryPage() {
         body={
           <>
             Permanently deletes all locally stored <b>positions, run history,
-            P&amp;L snapshots, daily stats, and signals</b> (both Demo and Live).
+            P&amp;L snapshots, daily stats, and signals</b> (Paper and Live alike).
             <br /><br />
             Your <b>settings, profiles, and API keys are kept.</b> Any positions
             still live on Kalshi are re-imported on the next sync.
@@ -138,29 +181,7 @@ export function HistoryPage() {
   );
 }
 
-function TabButton({
-  active, onClick, icon, children,
-}: {
-  active: boolean;
-  onClick: () => void;
-  icon: React.ReactNode;
-  children: React.ReactNode;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className={cls(
-        'inline-flex items-center gap-1.5 rounded-[6px] px-3 py-1.5 text-xs font-medium transition-colors',
-        active ? 'bg-krypt-purple/15 text-krypt-purple' : 'text-krypt-muted hover:text-white',
-      )}
-    >
-      {icon}
-      {children}
-    </button>
-  );
-}
-
-function RunHistory({ runs, env }: { runs: BotRun[]; env?: string }) {
+function RunHistory({ runs, env, live }: { runs: BotRun[]; env?: string; live: boolean }) {
   const totals = useMemo(() => {
     let pnl = 0;
     let trades = 0;
@@ -172,11 +193,13 @@ function RunHistory({ runs, env }: { runs: BotRun[]; env?: string }) {
       wins += r.tradesWon;
       losses += r.tradesLost;
     }
-    const wr = wins + losses > 0 ? (wins / (wins + losses)) * 100 : 0;
+    const wr = winRatePct(wins, losses);
     const completed = runs.filter((r) => !r.isActive);
     const winningRuns = completed.filter((r) => r.pnlUsd > 0).length;
     return { pnl, trades, wins, losses, wr, completed, winningRuns };
   }, [runs]);
+
+  const chronological = useMemo(() => [...runs].reverse(), [runs]);
 
   const bestRun = useMemo(
     () => runs.reduce((m, r) => (r.pnlUsd > (m?.pnlUsd ?? -Infinity) ? r : m), runs[0]),
@@ -195,22 +218,26 @@ function RunHistory({ runs, env }: { runs: BotRun[]; env?: string }) {
           value={fmtUsd(totals.pnl, { sign: true })}
           accent={totals.pnl >= 0 ? 'good' : 'bad'}
           hint={`${runs.length} run${runs.length === 1 ? '' : 's'} · ${env ?? 'all envs'}`}
-          shareText={`Krypt Trader has run ${runs.length}× and netted ${fmtUsd(totals.pnl, { sign: true })} `
+          shareText={bragText(`Krypt Trader has run ${runs.length}× and netted ${fmtUsd(totals.pnl, { sign: true })} `
             + `(${totals.wins}W / ${totals.losses}L). `
-            + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`}
+            + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`, live)}
         />
-        <ShareableStat
-          label="Run win rate"
-          value={fmtPct(totals.completed.length ? (totals.winningRuns / totals.completed.length) * 100 : 0)}
-          hint={`${totals.winningRuns} green of ${totals.completed.length} finished`}
-          accent={totals.winningRuns >= totals.completed.length / 2 ? 'good' : 'warn'}
-          shareText={`${totals.winningRuns} out of ${totals.completed.length} Krypt Trader sessions ended green. `
-            + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`}
-        />
+        {totals.completed.length > 0 ? (
+          <ShareableStat
+            label="Run win rate"
+            value={fmtPct((totals.winningRuns / totals.completed.length) * 100)}
+            hint={`${totals.winningRuns} green of ${totals.completed.length} finished`}
+            accent={totals.winningRuns >= totals.completed.length / 2 ? 'good' : 'warn'}
+            shareText={bragText(`${totals.winningRuns} out of ${totals.completed.length} Krypt Trader sessions ended green. `
+              + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`, live)}
+          />
+        ) : (
+          <StatCard label="Run win rate" value="—" hint="No finished runs yet." />
+        )}
         <StatCard
           label="Trades opened (total)"
           value={`${totals.trades}`}
-          hint={`${totals.wins}W · ${totals.losses}L · ${fmtPct(totals.wr)} hit rate`}
+          hint={`${totals.wins}W · ${totals.losses}L · ${totals.wr === null ? 'no settled trades' : `${fmtPct(totals.wr)} hit rate`}`}
         />
         <StatCard
           label="Avg run P&L"
@@ -232,7 +259,7 @@ function RunHistory({ runs, env }: { runs: BotRun[]; env?: string }) {
           ) : (
             <div className="h-56">
               <ResponsiveContainer>
-                <BarChart data={[...runs].reverse().map((r) => ({
+                <BarChart data={chronological.map((r) => ({
                   label: shortDate(r.startedAt),
                   pnl: r.pnlUsd,
                   ...r,
@@ -244,7 +271,7 @@ function RunHistory({ runs, env }: { runs: BotRun[]; env?: string }) {
                     formatter={(v: number) => [fmtUsd(v, { sign: true }), 'P&L']}
                   />
                   <Bar dataKey="pnl">
-                    {runs.map((r) => (
+                    {chronological.map((r) => (
                       <Cell key={r.id} fill={r.pnlUsd >= 0 ? '#22C55E' : '#EF4444'} />
                     ))}
                   </Bar>
@@ -297,9 +324,10 @@ function RunHistory({ runs, env }: { runs: BotRun[]; env?: string }) {
                 <td>
                   <span className={cls(
                     'rounded-md px-1.5 py-0.5 text-[10px] font-semibold uppercase',
-                    r.kalshiEnv === 'production' ? 'bg-krypt-loss/15 text-krypt-loss' : 'bg-krypt-warn/15 text-krypt-warn',
+                    r.kalshiEnv === 'production' ? 'bg-krypt-loss/15 text-krypt-loss'
+                      : r.kalshiEnv === 'paper' ? 'bg-krypt-purple/15 text-krypt-purple' : 'bg-krypt-surface2 text-krypt-muted',
                   )}>
-                    {r.kalshiEnv === 'production' ? 'live' : 'demo'}
+                    {r.kalshiEnv === 'production' ? 'live' : r.kalshiEnv === 'paper' ? 'paper' : 'retired demo'}
                   </span>
                 </td>
                 <td className="font-mono text-xs text-krypt-muted">
@@ -370,9 +398,10 @@ function shortDate(iso: string): string {
   }
 }
 
-function TradeHistory({ resolved, account }: {
+function TradeHistory({ resolved, account, live }: {
   resolved: ReturnType<typeof Object>[] | any[];
   account: ReturnType<typeof Object> | null;
+  live: boolean;
 }) {
   const byDay = useMemo(() => {
     const map = new Map<string, { day: string; pnl: number; wins: number; losses: number; trades: number }>();
@@ -394,7 +423,7 @@ function TradeHistory({ resolved, account }: {
     const losses = resolved.filter((p: any) => p.outcomeCorrect === 0).length;
     const realized = resolved.reduce((s: number, p: any) => s + (p.pnlUsd ?? 0), 0);
     const cost = resolved.reduce((s: number, p: any) => s + (p.costUsd ?? 0), 0);
-    const wr = wins + losses > 0 ? (wins / (wins + losses)) * 100 : 0;
+    const wr = winRatePct(wins, losses);
     return { wins, losses, realized, cost, wr };
   }, [resolved]);
 
@@ -409,19 +438,24 @@ function TradeHistory({ resolved, account }: {
           value={fmtUsd(totals.realized, { sign: true })}
           accent={totals.realized >= 0 ? 'good' : 'bad'}
           hint={`${resolved.length} resolved trades`}
-          shareText={`My Krypt Trader history: ${fmtUsd(totals.realized, { sign: true })} `
-            + `realized over ${resolved.length} trades · ${fmtPct(totals.wr)} win rate. `
-            + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`}
+          shareText={bragText(`My Krypt Trader history: ${fmtUsd(totals.realized, { sign: true })} `
+            + `realized over ${resolved.length} trades`
+            + (totals.wr !== null ? ` · ${fmtPct(totals.wr)} win rate` : '')
+            + '. Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader', live)}
         />
-        <ShareableStat
-          label="Win Rate"
-          value={totals.wins + totals.losses > 0 ? fmtPct(totals.wr) : '—'}
-          hint={`${totals.wins}W · ${totals.losses}L`}
-          accent={totals.wr >= 50 ? 'good' : 'warn'}
-          shareText={`Krypt Trader hit rate: ${fmtPct(totals.wr)} `
-            + `(${totals.wins}W / ${totals.losses}L). `
-            + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`}
-        />
+        {totals.wr !== null ? (
+          <ShareableStat
+            label="Win Rate"
+            value={fmtPct(totals.wr)}
+            hint={`${totals.wins}W · ${totals.losses}L`}
+            accent={totals.wr >= 50 ? 'good' : 'warn'}
+            shareText={bragText(`Krypt Trader hit rate: ${fmtPct(totals.wr)} `
+              + `(${totals.wins}W / ${totals.losses}L). `
+              + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`, live)}
+          />
+        ) : (
+          <StatCard label="Win Rate" value="—" hint="No settled trades yet." />
+        )}
         <StatCard
           label="Total Risked"
           value={fmtUsd(totals.cost)}
@@ -429,12 +463,12 @@ function TradeHistory({ resolved, account }: {
         />
         <ShareableStat
           label="ROI on Capital"
-          value={fmtPct(totals.cost > 0 ? (totals.realized / totals.cost) * 100 : 0)}
+          value={totals.cost > 0 ? fmtPct((totals.realized / totals.cost) * 100) : '—'}
           accent={totals.realized >= 0 ? 'good' : 'bad'}
-          shareText={`Krypt Trader ROI on capital: `
+          shareText={bragText(`Krypt Trader ROI on capital: `
             + `${fmtPct(totals.cost > 0 ? (totals.realized / totals.cost) * 100 : 0)} `
             + `over ${resolved.length} trades. `
-            + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`}
+            + `Free Kalshi auto-trader by @YuhgoSlavia · krypt.cc/tools/trader`, live)}
         />
       </div>
 
@@ -478,10 +512,10 @@ function TradeHistory({ resolved, account }: {
             <Standout label="Worst day" day={worstDay} accent="bad" />
           </div>
           <div className="mt-4 border-t border-krypt-border pt-3">
-            <div className="text-[11px] uppercase tracking-wider text-krypt-muted">By env</div>
+            <div className="text-[11px] uppercase tracking-wider text-krypt-muted">By book</div>
             <div className="mt-2 grid grid-cols-2 gap-2 text-xs">
-              <EnvStat env="DEMO" v={(account as any)?.byEnv?.demo} />
-              <EnvStat env="PROD" v={(account as any)?.byEnv?.production} />
+              <EnvStat env="PAPER" v={account?.byEnv?.paper} />
+              <EnvStat env="LIVE" v={account?.byEnv?.production} />
             </div>
           </div>
         </Card>
@@ -585,7 +619,7 @@ function Standout({
 }
 
 function EnvStat({ env, v }: { env: string; v?: { wins: number; losses: number; realizedPnl: number } }) {
-  const wr = v && (v.wins + v.losses) ? (v.wins / (v.wins + v.losses)) * 100 : 0;
+  const wr = winRatePct(v?.wins, v?.losses);
   return (
     <div className="rounded-lg border border-krypt-border bg-krypt-surface2 p-2">
       <div className="text-[10px] uppercase tracking-wider text-krypt-dim">{env}</div>
@@ -596,7 +630,7 @@ function EnvStat({ env, v }: { env: string; v?: { wins: number; losses: number; 
         {fmtUsd(v?.realizedPnl ?? 0, { sign: true })}
       </div>
       <div className="text-[11px] text-krypt-muted">
-        {v?.wins ?? 0}W / {v?.losses ?? 0}L · {wr.toFixed(1)}%
+        {v?.wins ?? 0}W / {v?.losses ?? 0}L · {wr === null ? '—' : `${wr.toFixed(1)}%`}
       </div>
     </div>
   );
@@ -680,8 +714,9 @@ function Crypto15mHistory({ rows, showPaper, onTogglePaper }: {
                 <td className="py-1.5 pr-3 font-mono text-krypt-dim">{r.filledContracts}</td>
                 <td className="py-1.5 pr-3 font-mono text-krypt-dim">{r.avgEntryCents != null ? `${Math.round(r.avgEntryCents)}¢` : '—'}</td>
                 <td className="py-1.5 pr-3 text-krypt-dim">{r.exitReason || r.status}</td>
-                <td className={cls('py-1.5 font-mono', (r.pnlUsd ?? 0) >= 0 ? 'text-krypt-win' : 'text-krypt-loss')}>
-                  {fmtUsd(r.pnlUsd ?? 0, { sign: true })}
+                <td className={cls('py-1.5 font-mono',
+                  r.pnlUsd == null ? 'text-krypt-dim' : r.pnlUsd >= 0 ? 'text-krypt-win' : 'text-krypt-loss')}>
+                  {fmtUsd(r.pnlUsd, { sign: true })}
                 </td>
               </tr>
             ))}

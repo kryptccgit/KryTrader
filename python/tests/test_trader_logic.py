@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import random
+
 import pytest
 
 import trader
@@ -146,22 +148,40 @@ def test_should_trade_per_source_whale_category_blocks(cfg):
     assert ok is False and "whale set" in reason
 
 
-def test_gambling_mode_hits_on_low_roll(cfg, monkeypatch):
-    cfg["gambling_mode"] = True
-    monkeypatch.setattr(trader.random, "random", lambda: 0.05)
-    sig = {"ticker": "X", "price": 0.95, "confidence": 1.0,
-           "taker_side": "yes", "category": "world"}
-    ok, reason = trader.should_trade(sig, "whale", cfg)
-    assert ok is True and "gambling" in reason and "HIT" in reason
+_GATE_PROBES = [
+    ({"ticker": "X", "price": 0.95, "confidence": 1.0,
+      "taker_side": "yes", "category": "world"}, "whale"),
+    ({"ticker": "X", "price": 0.60, "confidence": 70.0,
+      "taker_side": "yes", "category": "crypto"}, "whale"),
+    ({"ticker": "X", "price": 0.60, "confidence": 99.0,
+      "taker_side": "yes", "category": "sports"}, "momentum"),
+    ({"ticker": "X", "price": 0.99, "confidence": 99.0,
+      "taker_side": "yes", "category": "sports"}, "whale"),
+]
 
 
-def test_gambling_mode_misses_on_high_roll(cfg, monkeypatch):
-    cfg["gambling_mode"] = True
-    monkeypatch.setattr(trader.random, "random", lambda: 0.5)
-    sig = {"ticker": "X", "price": 0.60, "confidence": 99.0,
-           "taker_side": "yes", "category": "sports"}
-    ok, reason = trader.should_trade(sig, "whale", cfg)
-    assert ok is False and "gambling" in reason and "no hit" in reason
+@pytest.mark.parametrize("sig,source", _GATE_PROBES)
+def test_stale_gambling_mode_trades_exactly_like_its_absence(cfg, monkeypatch, sig, source):
+    monkeypatch.setattr(random, "random", lambda: 0.0)
+    legacy = dict(cfg, gambling_mode=True, gambling_trade_probability=1.0)
+    assert (trader.should_trade(dict(sig), source, legacy)
+            == trader.should_trade(dict(sig), source, cfg))
+
+
+def test_stale_gambling_mode_signal_still_meets_the_confidence_gate(cfg):
+    legacy = dict(cfg, gambling_mode=True, gambling_trade_probability=1.0)
+    ok, reason = trader.should_trade(
+        {"ticker": "X", "price": 0.95, "confidence": 1.0,
+         "taker_side": "yes", "category": "world"}, "whale", legacy)
+    assert ok is False and reason.startswith("conf 1.0 <")
+
+
+def test_merge_drops_the_removed_gambling_keys():
+    for raw in ({"gamblingMode": True, "gamblingTradeProbability": 1.0},
+                {"gambling_mode": True, "gambling_trade_probability": 1.0}):
+        cfg = merge_with_defaults(raw)
+        assert "gambling_mode" not in cfg
+        assert "gambling_trade_probability" not in cfg
 
 
 def test_balance_fetch_not_poisoned_by_concurrent_cred_test(monkeypatch):
@@ -180,7 +200,7 @@ def test_balance_fetch_not_poisoned_by_concurrent_cred_test(monkeypatch):
 
         async def cred_test():
             async with kalshi_auth.ENV_LOCK:
-                kalshi_auth.set_env("demo")
+                kalshi_auth.set_env("paper")
                 await released.wait()
                 kalshi_auth.set_env("production")
 
@@ -345,6 +365,7 @@ def test_yes_payout_legacy_cents_field():
 
 def test_yes_payout_none_market_is_none():
     assert trader._market_yes_payout(None) is None
+
 
 
 

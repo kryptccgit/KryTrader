@@ -1,3 +1,14 @@
+"""The privacy catalogue must stay true.
+
+A panel that names most of the hosts is worse than no panel at all: it converts
+"I did not check" into "I checked and it was fine". So this walks every source
+file and asserts that every https:// and wss:// literal the app can actually
+call is either named in `terminal.HOSTS` or explicitly excused here with a
+reason.
+
+If this fails, the fix is to update the catalogue — never to widen the
+exclusions without one.
+"""
 from __future__ import annotations
 
 import re
@@ -10,7 +21,6 @@ PY_DIR = Path(__file__).resolve().parents[1]
 
 EXCUSED = {
     "kalshi.com": "documentation / market links, opened in your browser",
-    "demo.kalshi.co": "demo web app link, opened in your browser",
     "docs.kalshi.com": "documentation link",
     "help.kalshi.com": "documentation link",
     "krypt.cc": "our own site, opened in your browser from About",
@@ -21,7 +31,7 @@ EXCUSED = {
     "polymarket.com": "market link, opened in your browser",
 }
 
-_URL = re.compile(r"(?:https?|wss)://([A-Za-z0-9.-]+)")
+_URL = re.compile(r"(?:https?|wss)://([A-Za-z0-9.-]+(?::\d+)?)")
 
 
 def _hosts_in_sources() -> set[str]:
@@ -68,6 +78,10 @@ def test_the_discord_webhook_is_named_as_sending_your_trading_elsewhere():
 
 
 def test_nothing_reports_home():
+    """The app used to post anonymous P&L to four Krypt-owned Discord webhooks
+    on a ~30-minute timer, on by default. It was removed. This pins the
+    absence: no module, no hardcoded webhook URL anywhere in the backend, and
+    no host entry claiming otherwise."""
     from pathlib import Path
     py = Path(__file__).resolve().parents[1]
     assert not (py / "leaderboard.py").exists()
@@ -85,6 +99,7 @@ def test_nothing_reports_home():
     blob = f"{d['purpose']} {d['when']} {d['sends']}".lower()
     assert "leaderboard" not in blob
     assert "nothing is sent to us" in blob
+
 
 
 NOT_REQUESTED = {
@@ -115,8 +130,10 @@ TRACKERS = (
 
 
 def _literal_hosts(root):
+    """Every https?://host literal in a directory tree, with where it came
+    from."""
     import re
-    pat = re.compile(r"https?://([A-Za-z0-9._-]+)")
+    pat = re.compile(r"https?://([A-Za-z0-9._-]+(?::\d+)?)")
     found = {}
     for path in sorted(root.rglob("*.py")):
         parts = set(path.parts)
@@ -128,6 +145,9 @@ def _literal_hosts(root):
 
 
 def test_every_reachable_host_is_disclosed():
+    """A host the backend can reach but the Privacy screen does not name is,
+    from the user's side, indistinguishable from telemetry. Adding one means
+    adding a catalogue entry describing what it sends and how to stop it."""
     from pathlib import Path
     py = Path(__file__).resolve().parents[1]
     named = {h["host"] for h in terminal.HOSTS}
@@ -145,6 +165,8 @@ def test_every_reachable_host_is_disclosed():
 
 
 def test_no_analytics_endpoint_anywhere():
+    """No crash reporter, no analytics SDK, no product-metrics pipe — in the
+    backend, the Electron main process, or the renderer."""
     from pathlib import Path
     root = Path(__file__).resolve().parents[2]
     hits = []
@@ -164,6 +186,8 @@ def test_no_analytics_endpoint_anywhere():
 
 
 def test_nothing_reports_home_on_a_timer():
+    """The leaderboard fired from the scanner loop's scheduler. Nothing in the
+    service should post to a host we control on a timer again."""
     from pathlib import Path
     svc = (Path(__file__).resolve().parents[1] / "service.py").read_text(
         encoding="utf-8", errors="replace")
@@ -173,6 +197,15 @@ def test_nothing_reports_home_on_a_timer():
 
 
 def test_discord_rich_presence_stays_on_and_stays_dumb():
+    """Rich Presence is deliberate marketing, not telemetry, and it must NOT be
+    removed by a future privacy sweep — including one of mine. It is how the
+    app gets found.
+
+    Two properties matter. It stays unconditional: started at app-ready with no
+    setting gating it. And it stays account-blind: the payload names the app,
+    never the account. Adding balance/P&L/ticker to the presence would turn a
+    marketing string into a broadcast of the user's book to their friends list.
+    """
     from pathlib import Path
     root = Path(__file__).resolve().parents[2]
     rpc = (root / "electron" / "system" / "discord.ts").read_text(
@@ -194,7 +227,56 @@ def test_discord_rich_presence_stays_on_and_stays_dumb():
 def test_the_perps_api_hosts_are_catalogued():
     named = {h["host"] for h in terminal.HOSTS}
     assert "external-api.kalshi.com" in named
-    assert "external-api.demo.kalshi.co" in named
+
+
+def test_no_retired_demo_host_remains():
+    """Kalshi's demo exchange is gone from the app: no demo host in the
+    catalogue or anywhere in the backend's source."""
+    named = {h["host"] for h in terminal.HOSTS}
+    assert not any("demo" in h for h in named)
+    for py in PY_DIR.glob("*.py"):
+        assert "demo.kalshi.co" not in py.read_text(encoding="utf-8"), py.name
+        assert "demo-api.kalshi.co" not in py.read_text(encoding="utf-8"), py.name
+
+
+def test_every_ai_provider_host_is_disclosed_and_local_ones_say_so():
+    """Each AI provider's hardcoded base is named in the catalogue, by the
+    same host key the call counter uses, and the two that run on this machine
+    say so — "the model runs locally" is the whole privacy argument for them,
+    and a reader should not have to know what 127.0.0.1 means."""
+    import ai_providers
+    named = {h["host"]: h for h in terminal.HOSTS}
+    for base in (ai_providers.ANTHROPIC_BASE, ai_providers.OPENAI_BASE,
+                 ai_providers.OPENROUTER_BASE, ai_providers.GEMINI_BASE,
+                 ai_providers.OLLAMA_BASE, ai_providers.LMSTUDIO_BASE):
+        key = ai_providers.stat_host(base)
+        assert key in named, key
+        assert named[key]["required"] is False, key
+    for base in (ai_providers.OLLAMA_BASE, ai_providers.LMSTUDIO_BASE):
+        h = named[ai_providers.stat_host(base)]
+        assert "on this machine" in h["purpose"], h["host"]
+        assert "no key" in h["sends"].lower(), h["host"]
+    for base in (ai_providers.OPENROUTER_BASE, ai_providers.GEMINI_BASE):
+        assert "key" in named[ai_providers.stat_host(base)]["sends"].lower()
+
+
+def test_ai_calls_are_counted_under_the_catalogued_host(monkeypatch):
+    """The counter must key a local call by host:port, or both local servers
+    land in one '127.0.0.1' row the catalogue does not name — which the panel
+    would then show as an UNLISTED host."""
+    import httpx
+
+    import ai_providers
+    kalshi_api.NET_STATS.clear()
+    monkeypatch.setattr(ai_providers, "_TRANSPORT", httpx.MockTransport(
+        lambda req: httpx.Response(200, json={"models": []})))
+    ai_providers._LISTED.clear()
+    ai_providers.list_models("ollama", fresh=True)
+    monkeypatch.setattr(terminal.kalshi_ws, "stats", lambda: {})
+    rep = terminal.network_report()
+    assert rep["unlisted"] == []
+    row = next(r for r in rep["hosts"] if r["host"] == "127.0.0.1:11434")
+    assert row["calls"] == 1
 
 
 def test_calls_are_counted_per_host():

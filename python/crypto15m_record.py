@@ -148,7 +148,7 @@ async def _resolve(now_epoch: float) -> int:
 
 
 async def record_tick(cfg: dict) -> dict:
-    env = kalshi_auth.get_env()
+    env = kalshi_auth.PRODUCTION
     now_epoch = datetime.now(timezone.utc).timestamp()
     captured = 0
     resolved = 0

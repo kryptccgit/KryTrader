@@ -7,7 +7,9 @@ import { ConfirmDialog } from '../common';
 import { useApp } from '../../state/AppStateProvider';
 import { useToast } from '../../state/ToastProvider';
 import { cls } from '../../utils/format';
+import { publishActivity } from '../../state/activity';
 import { Cents, Unknown, Usd } from './atoms';
+import { isModeMismatch, userMessage } from '../../utils/errors';
 
 export function TradeTicket({
   market, book, position, onDone,
@@ -26,11 +28,14 @@ export function TradeTicket({
   const [preview, setPreview] = useState<TicketPreview | null>(null);
   const [pricing, setPricing] = useState(false);
   const [confirming, setConfirming] = useState(false);
+  const [confirmedMode, setConfirmedMode] = useState<'paper' | 'live' | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<TicketResult | null>(null);
   const seq = useRef(0);
 
-  const live = config?.kalshiEnv === 'production';
+  const live = config?.accountMode === 'live';
+  const expectMode: 'paper' | 'live' = live ? 'live' : 'paper';
+  const modeSwitched = `The app switched to ${live ? 'Live' : 'Paper'} — check the ticket again.`;
 
   const bookRef = useRef(book);
   bookRef.current = book;
@@ -61,20 +66,20 @@ export function TradeTicket({
     setPricing(true);
     try {
       const pv = await window.krypt.terminal.preview({
-        ticker: market.ticker, side, action, count: countN, priceCents: priceN,
+        ticker: market.ticker, side, action, count: countN, priceCents: priceN, expectMode,
       });
       if (mine === seq.current) setPreview(pv);
     } catch (e) {
       if (mine === seq.current) {
         setPreview(null);
-        toast.error(
-          `Could not price this order: ${e instanceof Error ? e.message : String(e)}`,
-        );
+        toast.error(isModeMismatch(e)
+          ? modeSwitched
+          : `Could not price this order: ${userMessage(e)}`);
       }
     } finally {
       if (mine === seq.current) setPricing(false);
     }
-  }, [market.ticker, side, action, countN, priceN, price, toast]);
+  }, [market.ticker, side, action, countN, priceN, price, toast, expectMode]);
 
   useEffect(() => {
     const id = setTimeout(() => { void runPreview(); }, 220);
@@ -85,16 +90,36 @@ export function TradeTicket({
 
   const submit = async (): Promise<void> => {
     setConfirming(false);
+    const sentMode = confirmedMode ?? expectMode;
+    if (sentMode !== expectMode) {
+      toast.push(modeSwitched, 'warn', 9000);
+      return;
+    }
     setSubmitting(true);
     try {
       const res = await window.krypt.terminal.submit({
-        ticker: market.ticker, side, action, count: countN, priceCents: priceN,
+        ticker: market.ticker, side, action, count: countN, priceCents: priceN, expectMode: sentMode,
       });
+      if (!res.ok && isModeMismatch(res)) {
+        setResult(null);
+        toast.push(modeSwitched, 'warn', 9000);
+        void runPreview();
+        return;
+      }
       setResult(res);
+      publishActivity(() => ({
+        kind: 'manualOrder', op: 'submit', ok: res.ok, ticker: market.ticker, side, action,
+        status: res.status, filled: res.filledContracts, avgCents: res.avgFillCents, message: res.message,
+      }));
       toast.push(res.message, res.ok ? 'success' : 'error', 9000);
       if (res.ok) onDone();
     } catch (e) {
-      toast.error(`Order failed: ${e instanceof Error ? e.message : String(e)}`);
+      if (isModeMismatch(e)) {
+        toast.push(modeSwitched, 'warn', 9000);
+        void runPreview();
+      } else {
+        toast.error(`Order failed: ${userMessage(e)}`);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -114,10 +139,10 @@ export function TradeTicket({
               : 'border-krypt-warn/40 bg-krypt-warn/10 text-krypt-warn',
           )}
           title={live
-            ? 'Production: orders here spend real money.'
-            : 'Demo: orders here use Kalshi’s paper environment.'}
+            ? 'Live: orders here spend real money.'
+            : 'Paper: real prices, imaginary money. Nothing is sent to Kalshi.'}
         >
-          {live ? 'live money' : 'demo'}
+          {live ? 'live money' : 'paper'}
         </span>
       </div>
 
@@ -230,7 +255,7 @@ export function TradeTicket({
       ))}
 
       <button
-        onClick={() => setConfirming(true)}
+        onClick={() => { setConfirmedMode(expectMode); setConfirming(true); }}
         disabled={blocked || submitting}
         className={cls('w-full', blocked ? 'krypt-btn-default' : 'krypt-btn-primary')}
       >
@@ -257,7 +282,7 @@ export function TradeTicket({
 
       <ConfirmDialog
         open={confirming}
-        title={live ? 'Send a REAL order?' : 'Send this demo order?'}
+        title={live ? 'Send a REAL order?' : 'Send this paper order?'}
         danger={live}
         confirmLabel={live ? 'Send real order' : 'Send'}
         onClose={() => setConfirming(false)}
@@ -280,8 +305,7 @@ export function TradeTicket({
             )}
             {live && (
               <p className="text-krypt-loss">
-                This is the production environment. Real money leaves your Kalshi
-                account.
+                The app is Live (real money): this money leaves your Kalshi account.
               </p>
             )}
           </div>

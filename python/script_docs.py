@@ -1,3 +1,10 @@
+"""The AI context pack: everything an external AI (ChatGPT/Claude/Gemini/…)
+needs to write a valid KrypTrader strategy script, rendered as one copy-paste
+prompt. Generated python-side so the field vocabulary, allowed-builtins
+list, rails, and the user's actual data inventory can never drift from what
+the sandbox/engine/backtester really do — the doc is rendered FROM those
+modules, not maintained by hand.
+"""
 from __future__ import annotations
 
 import db as dbmod
@@ -244,6 +251,8 @@ def supervise(app):
 
 
 def _inventory(env: str) -> str:
+    """The user's actual recorded-data inventory, so the AI knows what a
+    backtest can even see."""
     lines: list[str] = []
     try:
         with dbmod.get_db() as conn:

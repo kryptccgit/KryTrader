@@ -1,3 +1,11 @@
+"""Backtest the imported Turbine strategy library on OUR recorded ticks.
+
+Runs each importable strategy through replay.replay (the live entry gate over
+recorded ticks, held to settlement, fee-adjusted) and ranks them by
+risk-adjusted net edge on our own data. Requires the trend/VWAP fields to be
+present on the ticks — run crypto15m_backfill first, or the VWAP/momentum rules
+match nothing (0 trades).
+"""
 from __future__ import annotations
 
 import argparse
@@ -28,6 +36,9 @@ _MIN_N = 15
 
 
 def _rank_score(net_cents: float, t: Optional[float], n: int) -> float:
+    """One-SE conservative lower bound on the edge (matches the Strategies page):
+    net − |net|/t. Tiny samples are pushed to the bottom (a +15¢ edge on n=3 is
+    noise, not a #1 strategy), and no t → treated as unproven."""
     if n is None or n < _MIN_N:
         return -100.0 + net_cents * 0.001
     if t is None or t == 0:
@@ -71,6 +82,7 @@ def _meta(item: dict) -> dict:
 
 
 def run_worker(params: dict) -> list:
+    """Picklable entrypoint for the service process pool."""
     return run(env=str((params or {}).get("env") or "production"),
                since_days=int((params or {}).get("sinceDays") or 90))
 

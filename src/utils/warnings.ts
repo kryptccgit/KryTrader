@@ -56,7 +56,7 @@ export function computeTradeWarnings(
     ? shadowBlocked(config.allowedWhaleCategories, config.allowedCategories) : [];
   if (whaleShadow.length > 0) {
     out.push({ id: 'whale-cats-shadow', severity: 'warn', ...toSettings,
-      message: `A strategy preset limits whale trades to ${(config.allowedWhaleCategories ?? []).join(', ')} — `
+      message: `A hidden per-source filter limits whale trades to ${(config.allowedWhaleCategories ?? []).join(', ')} — `
         + `${whaleShadow.join(', ')} whale signals are blocked even with their category toggles on. `
         + 'Re-pick categories in Settings to clear it.' });
   }
@@ -64,7 +64,7 @@ export function computeTradeWarnings(
     ? shadowBlocked(config.allowedMomentumCategories, config.allowedCategories) : [];
   if (momShadow.length > 0) {
     out.push({ id: 'mom-cats-shadow', severity: 'warn', ...toSettings,
-      message: `A strategy preset limits momentum trades to ${(config.allowedMomentumCategories ?? []).join(', ')} — `
+      message: `A hidden per-source filter limits momentum trades to ${(config.allowedMomentumCategories ?? []).join(', ')} — `
         + `${momShadow.join(', ')} momentum signals are blocked even with their category toggles on. `
         + 'Re-pick categories in Settings to clear it.' });
   }

@@ -1,11 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { TitleBar } from './components/TitleBar';
 import { Sidebar } from './components/Sidebar';
 import { TopBar } from './components/TopBar';
+import { GlassBackdrop } from './components/glass/GlassBackdrop';
 import { Crypto15mLiveBanner } from './components/Crypto15mLiveBanner';
 import { AppStateProvider, useApp } from './state/AppStateProvider';
 import { ToastProvider, useToast } from './state/ToastProvider';
-import { OnboardingModal } from './pages/Onboarding';
+import { GuideHost } from './components/tour/GuideHost';
+import { autoOnboarding } from '@shared/onboarding';
 import { DashboardPage } from './pages/Dashboard';
 import { StrategiesPage } from './pages/Strategies';
 import { SettingsPage } from './pages/Settings';
@@ -28,12 +30,13 @@ import { PrivacyPage } from './pages/Privacy';
 import { RemotePage } from './pages/Remote';
 import { AiAgentsPage } from './pages/AiAgents';
 import { TerminalProvider } from './state/TerminalProvider';
+import { agentCallEvent, agentEvent, publishActivity, ruleEvent } from './state/activity';
 
-export type PageId =
-  | 'dashboard' | 'strategies' | 'positions' | 'signals' | 'history'
-  | 'profiles' | 'settings' | 'api' | 'logs' | 'guide' | 'about'
-  | 'visualizer' | 'crypto15m' | 'perps' | 'backtest' | 'scripts'
-  | 'terminal' | 'terminalPortfolio' | 'privacy' | 'remote' | 'aiAgents';
+import { PageGuard, usePersistedPage } from './components/PageGuard';
+import { useWindowVisibility } from './state/visibility';
+import type { PageId } from './state/lastPage';
+
+export type { PageId } from './state/lastPage';
 
 export default function App() {
   return (
@@ -48,46 +51,65 @@ export default function App() {
 }
 
 function Shell() {
-  const [page, setPage] = useState<PageId>('dashboard');
+  const [page, setPage, onPageCrash] = usePersistedPage();
+  useWindowVisibility();
   const { state } = useApp();
   const toast = useToast();
 
-  useEffect(() => window.krypt.terminal.onRule(({ message }) => {
+  useEffect(() => window.krypt.terminal.onRule((d) => {
+    const { message } = d;
+    publishActivity(() => ruleEvent(d));
     toast.push(message, 'warn', 12_000);
     try {
       new Notification('Krypt Terminal', { body: message, silent: true });
-    } catch {  }
+    } catch {}
   }), [toast]);
 
-  const showOnboarding = state ? !state.acceptedDisclaimer : false;
+  useEffect(() => window.krypt.app.onNavigate?.((p) => {
+    if (p !== 'dashboard') return;
+    setPage('dashboard');
+    toast.push('To resume LIVE trading, press Start Trading at the top right. It asks before using real money.', 'info', 10_000);
+  }), [setPage, toast]);
 
   useEffect(() => {
-    if (!state) return;
-    if (!state.acceptedDisclaimer) return;
-  }, [state]);
+    const offAgent = window.krypt.terminal.onMcpOrder((d) => publishActivity(() => agentEvent(d)));
+    const offCalls = window.krypt.terminal.onMcpToolCall?.((d) => publishActivity(() => agentCallEvent(d)));
+    const offScript = window.krypt.scripts.onStatus((d) => publishActivity(() => (
+      d.enabled ? null : {
+        kind: 'script', op: 'autoDisabled', name: null, id: d.id, ok: false, errors: null,
+        detail: d.lastError ?? null,
+      })));
+    return () => { offAgent(); offCalls?.(); offScript(); };
+  }, []);
+
+  const auto = autoOnboarding(state);
 
   return (
-    <div className="flex h-full w-full flex-col bg-krypt-radial bg-krypt-void">
+    <GuideHost needsOnboarding={auto === 'first'} needsUpdateOnboarding={auto === 'update'} setPage={setPage}>
+    <div className="flex h-full w-full flex-col">
+      <GlassBackdrop />
       <TitleBar />
-      <div className="flex h-[calc(100%-2.25rem)] w-full">
+      <div className="relative flex h-[calc(100%-2.25rem)] w-full">
         <Sidebar page={page} setPage={setPage} />
         <main className="relative flex flex-1 flex-col overflow-hidden">
           <TopBar />
           <Crypto15mLiveBanner />
-          <div className="flex-1 overflow-hidden bg-krypt-radial-r">
-            <PageRouter page={page} setPage={setPage} />
+          <div className="flex-1 overflow-hidden">
+            <PageGuard page={page} setPage={setPage} onCrash={onPageCrash}>
+              <PageRouter page={page} setPage={setPage} />
+            </PageGuard>
           </div>
         </main>
       </div>
-      {showOnboarding && <OnboardingModal onDone={() => setPage('api')} />}
     </div>
+    </GuideHost>
   );
 }
 
 function PageRouter({ page, setPage }: { page: PageId; setPage: (p: PageId) => void }) {
   switch (page) {
     case 'dashboard': return <DashboardPage onNav={setPage} />;
-    case 'strategies': return <StrategiesPage />;
+    case 'strategies': return <StrategiesPage onNav={setPage} />;
     case 'positions': return <PositionsPage />;
     case 'signals': return <SignalsPage />;
     case 'history': return <HistoryPage />;
@@ -106,7 +128,7 @@ function PageRouter({ page, setPage }: { page: PageId; setPage: (p: PageId) => v
     case 'terminalPortfolio': return <TerminalPortfolioPage />;
     case 'privacy': return <PrivacyPage />;
     case 'remote': return <RemotePage />;
-    case 'aiAgents': return <AiAgentsPage />;
-    default: return <DashboardPage onNav={setPage} />;
+    case 'aiAgents': return <AiAgentsPage onNav={setPage} />;
+    default: return <AiAgentsPage onNav={setPage} />;
   }
 }

@@ -3,11 +3,13 @@ import {
   AlertTriangle, BookOpen, Bot, CheckCircle2, ClipboardCopy, Code2, FileDown,
   FlaskConical, Play, Plus, ShieldAlert, ShieldCheck, Trash2, X,
 } from 'lucide-react';
-import type { ScriptApiDocs, ScriptBacktest, UserScript } from '@shared/types';
+import type { ScriptApiDocs, ScriptBacktest, TraderConfig, UserScript } from '@shared/types';
 import { Page, Card } from '../components/common';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import { cls, fmtUsd } from '../utils/format';
+import { backtestEvent, publishActivity } from '../state/activity';
+import { userMessage } from '../utils/errors';
 
 const ScriptEditor = lazy(() =>
   import('../components/ScriptEditor').then((m) => ({ default: m.ScriptEditor })));
@@ -108,6 +110,10 @@ export function ScriptsPage() {
     setBusy('save');
     try {
       const r = await window.krypt.scripts.save({ id: sel.id, code: codeRef.current });
+      publishActivity(() => ({
+        kind: 'script', op: 'saved', name: r.script?.name ?? sel.name, id: sel.id,
+        ok: r.errors.length === 0, errors: r.errors.length, detail: null,
+      }));
       setErrors(r.errors);
       setWarnings(r.warnings);
       setDirty(false);
@@ -116,7 +122,7 @@ export function ScriptsPage() {
       else toast.success('Script saved.');
       return r.script;
     } catch (e: any) {
-      toast.error(e?.message || String(e));
+      toast.error(userMessage(e));
       return null;
     } finally {
       setBusy(null);
@@ -127,13 +133,17 @@ export function ScriptsPage() {
     setBusy('create');
     try {
       const r = await window.krypt.scripts.save({ code: initialCode, name });
+      publishActivity(() => ({
+        kind: 'script', op: 'created', name: r.script?.name ?? name ?? null, id: r.script?.id ?? null,
+        ok: r.errors.length === 0, errors: r.errors.length, detail: null,
+      }));
       await refresh(false);
       setSelId(r.script.id);
       setErrors(r.errors);
       setWarnings(r.warnings);
       if (r.errors.length) toast.warn('Imported with validation errors — fix before enabling.');
     } catch (e: any) {
-      toast.error(e?.message || String(e));
+      toast.error(userMessage(e));
     } finally {
       setBusy(null);
     }
@@ -143,11 +153,15 @@ export function ScriptsPage() {
     setBusy('validate');
     try {
       const r = await window.krypt.scripts.validate(codeRef.current, sel?.trusted);
+      publishActivity(() => ({
+        kind: 'script', op: 'validated', name: r.name || sel?.name || null, id: sel?.id ?? null,
+        ok: r.ok, errors: r.errors.length, detail: null,
+      }));
       setErrors(r.errors);
       setWarnings(r.warnings);
       if (r.ok) toast.success('Script is valid.');
     } catch (e: any) {
-      toast.error(e?.message || String(e));
+      toast.error(userMessage(e));
     } finally {
       setBusy(null);
     }
@@ -161,9 +175,10 @@ export function ScriptsPage() {
       if (dirty) await save();
       const r = await window.krypt.scripts.backtest({ id: sel.id, sinceDays: btDays });
       setBtRes(r);
+      publishActivity(() => backtestEvent('script', sel.name, btDays, r));
       if (!r) toast.error('Engine not running — start the backend first.');
     } catch (e: any) {
-      toast.error(e?.message || String(e));
+      toast.error(userMessage(e));
     } finally {
       setBusy(null);
     }
@@ -172,12 +187,16 @@ export function ScriptsPage() {
   const setEnabled = async (s: UserScript, enabled: boolean) => {
     try {
       const r = await window.krypt.scripts.setEnabled(s.id, enabled);
+      publishActivity(() => ({
+        kind: 'script', op: r.script.enabled ? 'enabled' : 'disabled', name: r.script.name, id: s.id,
+        ok: r.script.enabled === enabled, errors: null, detail: null,
+      }));
       setScripts((cur) => cur.map((x) => (x.id === s.id ? r.script : x)));
       if (enabled && !config?.scriptsLiveEnabled) {
         toast.info('Script enabled — flip the master "Scripts live" switch to let it trade.');
       }
     } catch (e: any) {
-      toast.error(e?.message || String(e));
+      toast.error(userMessage(e));
     }
   };
 
@@ -191,7 +210,7 @@ export function ScriptsPage() {
         ? 'Trusted mode ON. The script was disabled — re-enable it consciously.'
         : 'Back to sandboxed mode.');
     } catch (e: any) {
-      toast.error(e?.message || String(e));
+      toast.error(userMessage(e));
     }
   };
 
@@ -203,7 +222,7 @@ export function ScriptsPage() {
       await refresh(false);
       toast.success('Script deleted.');
     } catch (e: any) {
-      toast.error(e?.message || String(e));
+      toast.error(userMessage(e));
     }
   };
 
@@ -214,7 +233,7 @@ export function ScriptsPage() {
         const r = await window.krypt.scripts.contextPack();
         setPackText(r.text);
       } catch (e: any) {
-        toast.error(e?.message || String(e));
+        toast.error(userMessage(e));
       }
     }
   };
@@ -261,10 +280,9 @@ export function ScriptsPage() {
             <Toggle
               checked={!!config?.scriptsLiveEnabled}
               onChange={(v) => {
-                if (v && !config?.scriptsPaperMode && !window.confirm(
+                if (v && !config?.scriptsPaperMode && config?.accountMode === 'live' && !window.confirm(
                   'Arm scripts? Every ENABLED script will start placing REAL orders on your '
-                  + `${config?.kalshiEnv === 'production' ? 'PRODUCTION' : 'demo'} account `
-                  + '(turn on Paper mode first to simulate instead).',
+                  + 'Kalshi account (turn on Paper mode first to simulate instead).',
                 )) return;
                 void window.krypt.config.update({ scriptsLiveEnabled: v });
               }}
@@ -279,7 +297,10 @@ export function ScriptsPage() {
           <div className="flex items-center gap-3">
             <Toggle
               checked={!!config?.scriptsPaperMode}
-              onChange={(v) => void window.krypt.config.update({ scriptsPaperMode: v })}
+              onChange={(v) => {
+                if (!v && !confirmLeavePaperMode(config)) return;
+                void window.krypt.config.update({ scriptsPaperMode: v });
+              }}
             />
             <div>
               <div className="text-sm font-semibold text-white">Paper mode</div>
@@ -734,6 +755,15 @@ function Rail({ label, value, suffix, onCommit }: {
       />
       {suffix && <span>{suffix}</span>}
     </label>
+  );
+}
+
+export function confirmLeavePaperMode(config: Partial<TraderConfig> | null | undefined): boolean {
+  if (!config?.scriptsLiveEnabled) return true;
+  if (config.accountMode !== 'live') return true;
+  return window.confirm(
+    'Leave Paper mode? Scripts live is ON: every ENABLED script will start placing REAL orders on your '
+    + 'Kalshi account.',
   );
 }
 

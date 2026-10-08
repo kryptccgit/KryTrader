@@ -1,3 +1,16 @@
+"""Backfill the trend/VWAP tick fields for HISTORICAL crypto15m_ticks.
+
+The new indicator columns (priceVsVwapPct, change5mPct, ema12VsSma20Pct, …) are
+NULL on every row recorded before they existed, so a rule over them fails closed
+in replay (0 trades). This recomputes them by re-fetching Hyperliquid 1-minute
+candles ending at each tick's observation time — the SAME source and math the
+live path uses — and writes them back.
+
+Efficient + resumable: only rows still missing the fields are processed, grouped
+by (asset, minute) so one candle fetch serves every tick in that minute; a
+bounded `--limit` lets it run in chunks. Read-mostly on the DB (additive UPDATE
+of the new columns only). Never touches trades/positions.
+"""
 from __future__ import annotations
 
 import argparse
@@ -39,6 +52,7 @@ def _epoch_ms(observed_at: str) -> Optional[int]:
 
 
 async def _fetch_candles(asset: str, client: httpx.AsyncClient, end_ms: int) -> tuple[list[float], list[float]]:
+    """(closes, volumes) for the 90 minutes ending at end_ms, oldest→newest."""
     body = {"type": "candleSnapshot", "req": {
         "coin": asset, "interval": "1m",
         "startTime": end_ms - _LOOKBACK_MIN * 60_000, "endTime": end_ms}}
@@ -63,6 +77,7 @@ async def _fetch_candles(asset: str, client: httpx.AsyncClient, end_ms: int) -> 
 
 
 def _pending_groups(env: str, since_days: int, limit: int) -> dict[tuple[str, str], list[int]]:
+    """(asset, minute) -> [tick ids] for rows still missing the fields."""
     with dbmod.get_db() as conn:
         rows = conn.execute(
             f"""SELECT id, asset, observed_at FROM crypto15m_ticks

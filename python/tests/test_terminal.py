@@ -1,6 +1,17 @@
+"""Unit tests for the manual terminal's provider layer.
+
+Offline and pure: no network, no clock dependence beyond "now". The live
+counterpart is `python/live_terminal_check.py`, which is run by hand and pins
+Kalshi's side of the contract; this file pins ours.
+
+Almost every test here exists because the honest-null rule has a specific,
+non-obvious consequence somewhere — a 0 that means "empty", a skip that must
+not become a zero, a score that must refuse to print.
+"""
 from __future__ import annotations
 
 import terminal
+
 
 
 def test_price_cents_accepts_the_tradeable_range():
@@ -37,11 +48,13 @@ def test_dollar_strings_are_the_live_wire_format():
     assert terminal._dollar_price(None) is None
 
 
+
 def test_zero_volume_is_a_real_zero_but_missing_volume_is_unknown():
     assert terminal._count(0) == 0
     assert terminal._count("0.00") == 0
     assert terminal._count(None) is None
     assert terminal._count("") is None
+
 
 
 LIVE_MARKET = {
@@ -120,6 +133,7 @@ def test_sourced_fields_match_the_typescript_contract():
     )
 
 
+
 def test_candles_are_sorted_and_deduplicated():
     raw = [
         {"end_period_ts": 300, "price": {"close": "0.50"}},
@@ -154,6 +168,7 @@ def test_candles_read_both_tier_shapes():
 def test_candles_without_a_usable_timestamp_are_dropped():
     raw = [{"price": {"close": "0.40"}}, {"end_period_ts": 0}, {"end_period_ts": 5}]
     assert [c["ts"] for c in terminal.normalize_candles(raw)] == [5]
+
 
 
 def _row(**kw):
@@ -197,6 +212,10 @@ def test_closing_soon_skips_a_market_with_no_close_time():
 
 
 def test_closing_soon_drops_a_one_sided_phantom_quote_nobody_has_traded():
+    """The bug this column shipped with. A deep out-of-the-money ladder rung
+    carries no_bid=99c, which market_row mirrors into a 1c YES ask. The old
+    "is EITHER side quoted" test passed it, so all 60 rows were untraded
+    NASDAQ-100 rungs: no bid, a phantom 1c ask, no last, volume 0."""
     rows = [
         _row(ticker="REAL", minutesToClose=5),
         _row(ticker="RUNG", minutesToClose=1, yesBid=None, yesAsk=1.0,
@@ -209,6 +228,8 @@ def test_closing_soon_drops_a_one_sided_phantom_quote_nobody_has_traded():
 
 
 def test_a_one_sided_market_survives_if_somebody_actually_traded_it():
+    """The exclusion targets phantom quotes, not thin markets. Real volume or
+    real open interest is evidence a one-sided book is worth showing."""
     traded = _row(ticker="T1", minutesToClose=2, yesBid=None, yesAsk=97.0,
                   volume=140, openInterest=0)
     held = _row(ticker="H1", minutesToClose=3, yesBid=None, yesAsk=97.0,
@@ -219,6 +240,8 @@ def test_a_one_sided_market_survives_if_somebody_actually_traded_it():
 
 
 def test_unknown_volume_is_not_treated_as_evidence_of_trading():
+    """None is UNKNOWN, not zero — but it is also not proof the market trades,
+    so it cannot buy a one-sided book its way into the column."""
     r = _row(ticker="U", minutesToClose=2, yesBid=None, yesAsk=1.0,
              volume=None, openInterest=None)
     ranked, _, dropped = terminal._rank([r], "closing", 10)
@@ -227,6 +250,9 @@ def test_unknown_volume_is_not_treated_as_evidence_of_trading():
 
 
 def test_one_event_cannot_fill_the_whole_column():
+    """774 of the 999 markets closing within 6h on 2026-08-25 were rungs of two
+    NASDAQ-100 ladders, and every rung shares a close time — so ranking by
+    time to close handed all 60 slots to one event."""
     ladder = [_row(ticker=f"KXNDX-T{i}", eventTicker="KXNDX-H1400",
                    minutesToClose=260.3) for i in range(50)]
     other = _row(ticker="OTHER", eventTicker="EV-OTHER", minutesToClose=300.0)
@@ -238,13 +264,19 @@ def test_one_event_cannot_fill_the_whole_column():
 
 
 def test_markets_with_no_event_ticker_are_not_collapsed_together():
+    """An unknown event is not evidence that two markets share one."""
     rows = [_row(ticker=f"M{i}", eventTicker=None, minutesToClose=5 + i)
             for i in range(10)]
     kept, collapsed = terminal._cap_per_event(rows, 3)
     assert len(kept) == 10
     assert collapsed == 0
 
+
 def test_candle_volume_and_open_interest_read_the_fixed_point_fields():
+    """Live candles carry volume_fp/open_interest_fp and no legacy names, so
+    reading only the legacy ones left every candle with volume=None while the
+    prices parsed fine — 0/14 on live data, and the chart tooltip dropped its
+    contracts line without anything looking broken."""
     raw = [{
         "end_period_ts": 1787666340,
         "volume_fp": "243864.78",
@@ -258,6 +290,7 @@ def test_candle_volume_and_open_interest_read_the_fixed_point_fields():
 
 
 def test_a_candle_that_genuinely_traded_nothing_still_reports_zero_not_none():
+    """0 is a real count here — only a MISSING field is unknown."""
     raw = [{"end_period_ts": 1, "volume_fp": "0.00", "open_interest_fp": "0.00"}]
     c = terminal.normalize_candles(raw)[0]
     assert c["volume"] == 0 and c["openInterest"] == 0
@@ -270,6 +303,8 @@ def test_a_candle_with_no_volume_field_at_all_is_unknown():
 
 
 def test_settlement_value_is_read_from_the_dollar_field_and_reported_in_cents():
+    """The legacy cent field is gone from the live API, so reading only it left
+    settlementValue permanently null on settled markets."""
     row = terminal.market_row({"ticker": "X", "settlement_value_dollars": "1.0000"})
     assert row["settlementValue"] == 100.0
     legacy = terminal.market_row({"ticker": "X", "settlement_value": 100})
@@ -279,6 +314,10 @@ def test_settlement_value_is_read_from_the_dollar_field_and_reported_in_cents():
 
 
 def test_a_live_quote_that_omits_volume_cannot_zero_out_the_rest_volume():
+    """kalshi_ws._fp answers 0.0 for an absent field, which is right for a book
+    delta and wrong for a published count: _apply_live_quote overwrites on any
+    non-None, so a ticker message without volume_fp would have replaced a real
+    REST volume with a confident 0 attributed to our own websocket."""
     import kalshi_ws
     assert kalshi_ws._fp_or_none(None) is None
     assert kalshi_ws._fp_or_none("0.00") == 0.0
@@ -313,6 +352,7 @@ def test_a_live_quote_that_omits_volume_cannot_zero_out_the_rest_volume():
     assert out["yesBid"] == 41.0
 
 
+
 def test_the_tape_labels_a_block_trade_rather_than_hiding_it():
     row = terminal._tape_row(
         {"trade_id": "t1", "ticker": "X", "taker_side": "yes",
@@ -325,6 +365,7 @@ def test_the_tape_labels_a_block_trade_rather_than_hiding_it():
         {"trade_id": "t2", "ticker": "X", "taker_side": "yes",
          "count_fp": "5", "yes_price_dollars": "0.4000"}, "kalshi-rest")
     assert normal["isBlockTrade"] is False
+
 
 def test_ladder_is_best_first_with_a_running_cumulative():
     levels, depth = terminal._ladder([[40, 10], [42, 5], [41, 20]])
@@ -342,6 +383,7 @@ def test_ladder_discards_unusable_levels_rather_than_zeroing_them():
 def test_empty_ladder_reports_unknown_depth_not_zero_depth():
     levels, depth = terminal._ladder([])
     assert levels == [] and depth is None
+
 
 
 FULL_MARKET = {
@@ -452,6 +494,7 @@ def test_the_venue_is_stated_rather_than_implied():
     assert "CFTC" in r["venueNote"]
 
 
+
 MARK = {"midCents": 60.0, "title": "Test", "eventTicker": "E", "status": "active",
         "closeTime": None, "lastPrice": 59.0}
 
@@ -492,6 +535,7 @@ def test_an_unpriceable_market_leaves_the_mark_unknown():
     assert r["marketValueUsd"] is None
     assert r["unrealizedUsd"] is None
     assert r["costBasisUsd"] == 4.70
+
 
 
 CFG = {"terminal_max_contracts": 1000, "terminal_max_notional_usd": 500.0}
@@ -613,6 +657,7 @@ def test_no_book_is_a_warning_rather_than_a_silent_pass():
     assert any("order book has not loaded" in w for w in pv["warnings"])
 
 
+
 def test_interest_expires_so_the_recorder_is_not_an_unbounded_leak():
     terminal._ws_interest.clear()
     terminal.note_interest("KXA-1")
@@ -626,6 +671,7 @@ def test_interest_normalises_the_ticker_and_ignores_blanks():
     terminal.note_interest(" kxa-1 ")
     terminal.note_interest("")
     assert terminal.subscribed_tickers() == {"KXA-1"}
+
 
 
 def test_the_order_book_wins_over_the_market_record_and_the_drift_is_reported():
@@ -663,7 +709,13 @@ def test_a_one_sided_book_only_overwrites_the_side_it_has():
     assert merged["yesAsk"] == 48.0
 
 
+
 def test_known_tickers_are_fetched_in_batches_not_one_request_each(monkeypatch):
+    """The per-ticker path cost 86 public requests for one Discover refresh —
+    153 with a filter — and earned an HTTP 429 mid-pass. Worse, it fanned out
+    inside a gather, slipping past the per-host gate whose whole job is to stop
+    that. Batching took the same refresh to 3 requests with the same coverage.
+    """
     import asyncio
     import kalshi_api
 
@@ -710,7 +762,14 @@ def test_a_batch_that_returns_nothing_yields_no_rows_rather_than_raising(monkeyp
     assert asyncio.run(kalshi_api.fetch_markets_by_tickers(["A"])) == {}
 
 
+
 def test_the_caps_never_block_selling_a_position_you_hold():
+    """A stop loss on a position worth more than the notional cap would be
+    refused at exactly the moment it mattered, and the rule marked 'error' —
+    silently disarming the protection the user set. You cannot fat-finger past
+    your own position (the sell blockers clamp to it), so the cap has nothing
+    left to catch, and blocking an exit is strictly more dangerous than
+    allowing one."""
     pos = {"contracts": 900, "side": "yes", "avgCostCents": 50.0}
     pv = terminal.preview(
         {"ticker": "T", "side": "yes", "action": "sell",

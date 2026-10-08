@@ -1,3 +1,40 @@
+"""Kalshi WebSocket client — low-latency real-time market data + account events.
+
+A single persistent, multiplexed connection to Kalshi's WebSocket API
+(`/trade-api/ws/v2`) that the rest of the bot reads from to avoid REST polling
+on the latency-critical paths. It is a STRICT ACCELERATOR: every consumer falls
+back to REST when the socket is down or a given market isn't subscribed yet, so
+the bot is never *more* fragile than the pure-REST version — only faster.
+
+Channels (https://docs.kalshi.com/websockets):
+  * orderbook_delta — one subscription PER held ticker (clean per-sid `seq`
+    stream), maintained into a local book; powers the 15m stop-loss/TP chase
+    and limit pricing. On a `seq` gap we drop the book and re-snapshot, and
+    `orderbook()` returns None meanwhile so the caller transparently REST-falls-
+    back rather than acting on a stale book.
+  * ticker — one sub, many markets; latest yes bid/ask/last per market.
+  * trade — one sub, ALL markets; a recent-trade ring buffer feeding the
+    whale/momentum scanner (no 1000-row REST cap, no missed bursts).
+  * fill — account fills, pushed instantly → wakes an immediate order re-poll
+    (REST stays the accounting source of truth; WS only removes the latency).
+  * market_lifecycle_v2 — `determined`/`settled` → wakes an immediate resolution
+    check instead of waiting for the 5-min timer.
+  * market_positions — account position deltas (kept for stats; cash balance has
+    no WS channel and stays on REST).
+
+Auth: the handshake reuses the REST RSA-PSS signing verbatim — sign
+`timestamp + "GET" + "/trade-api/ws/v2"` via ``kalshi_auth.sign_headers`` and
+send the KALSHI-ACCESS-* headers on the upgrade. The same clock-drift resync
+(``now_ms``) that protects REST protects the handshake.
+
+Wire format note: Kalshi WS payloads are DOLLAR strings (``yes_price_dollars``)
+and fixed-point quantity strings (``count_fp``), not 1–99 cents. Prices are
+converted to DECI-CENT floats here (94.7 = $0.9470; whole-cent markets come out
+as x.0) so the book matches what REST callers expect — see ``_cents``.
+
+Opt out entirely with ``KRYPT_KALSHI_WS=0`` (or off/false/no); override the URL
+with ``KRYPT_KALSHI_WS_URL``.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -23,7 +60,6 @@ except Exception:
     _WS_IMPORT_OK = False
 
 _WS_BASES = {
-    "demo": "wss://external-api-ws.demo.kalshi.co/trade-api/ws/v2",
     "production": "wss://external-api-ws.kalshi.com/trade-api/ws/v2",
 }
 _WS_PATH = "/trade-api/ws/v2"
@@ -51,6 +87,11 @@ _RECONCILE_MIN_INTERVAL_SEC = 1.0
 
 
 def _fp_or_none(v) -> Optional[float]:
+    """Kalshi fixed-point count, or None when the field is absent/unreadable.
+
+    The None-preserving sibling of `_fp`. Use it anywhere the value is
+    PUBLISHED rather than accumulated: downstream, 0 and "not sent" mean very
+    different things, and only this one can tell them apart."""
     if v is None:
         return None
     try:
@@ -60,29 +101,16 @@ def _fp_or_none(v) -> Optional[float]:
 
 
 def _cents(price_dollars) -> Optional[float]:
+    """Dollars → cents at DECI-CENT resolution (1 decimal). The 15m crypto
+    series use tapered_deci_cent pricing (0.1c ticks below 10c and above 90c —
+    exactly the band the settlement sniper trades); quantizing to whole cents
+    made a resting stop-loss look 'at the bid' while the true bid sat 0.1-0.5c
+    lower, so the exit never filled (live-verified 2026-07-16). Whole-cent
+    markets simply come out as x.0."""
     try:
         return round(float(price_dollars) * 100, 1)
     except (TypeError, ValueError):
         return None
-
-
-def taker_outcome_side(t: dict) -> str:
-    """'yes' / 'no' for a public trade's taker, or '' when Kalshi didn't say.
-
-    `taker_side` was deprecated on 2026-05-06 ("not removed before May 28,
-    2026" -- that date has passed). Its replacements carry the same bit:
-    taker_outcome_side yes|no, taker_book_side bid|ask (bid == yes). Without
-    a direction the scanner skips the trade, so dropping the old field would
-    blind whale detection on every path that read it.
-    """
-    v = str(t.get("taker_outcome_side") or "").lower()
-    if v in ("yes", "no"):
-        return v
-    b = str(t.get("taker_book_side") or "").lower()
-    if b in ("bid", "ask"):
-        return "yes" if b == "bid" else "no"
-    v = str(t.get("taker_side") or "").lower()
-    return v if v in ("yes", "no") else ""
 
 
 def _fp(v) -> float:
@@ -128,12 +156,13 @@ class _Client:
         self.on_trade: Optional[TradeCb] = None
         self.want_cf: bool = False
 
+
     def start(self, env: str, *, on_fill=None, on_lifecycle=None, on_trade=None) -> None:
         if _DISABLED or not _WS_IMPORT_OK:
             if not _WS_IMPORT_OK and not _DISABLED:
                 logger.warning("kalshi_ws: `websockets` not installed — staying on REST")
             return
-        self.env = env if env in _WS_BASES else "production"
+        self.env = env if (env in _WS_BASES or env == "paper") else "production"
         self.on_fill = on_fill
         self.on_lifecycle = on_lifecycle
         self.on_trade = on_trade
@@ -158,13 +187,17 @@ class _Client:
         self.connected = False
 
     def set_env(self, env: str) -> None:
-        env = env if env in _WS_BASES else "production"
+        env = env if (env in _WS_BASES or env == "paper") else "production"
         if env != self.env:
             self.env = env
             self._gen += 1
             logger.info(f"kalshi_ws: env → {env}, reconnecting")
 
     def set_cf_enabled(self, enabled: bool) -> None:
+        """Toggle the cfbenchmarks_value channel (the exact settlement index
+        feed consumed by cf_ws). Retried by _subscribe_account when turned on
+        mid-connection; turning OFF forces a reconnect so the server stops
+        streaming ~1 msg/sec/index we'd just discard."""
         enabled = bool(enabled)
         if enabled == self.want_cf:
             return
@@ -184,6 +217,7 @@ class _Client:
                 await ws.close()
             except Exception:
                 pass
+
 
     async def _run(self) -> None:
         attempt = 0
@@ -209,7 +243,7 @@ class _Client:
                     raise
 
     async def _connect_once(self, gen: int) -> None:
-        if not kalshi_auth.credentials_present(self.env):
+        if self.env == "paper" or not kalshi_auth.credentials_present(self.env):
             await asyncio.sleep(5)
             return
         url = os.environ.get("KRYPT_KALSHI_WS_URL") or _WS_BASES[self.env]
@@ -270,6 +304,7 @@ class _Client:
         self.trades.clear()
         self.last_trade_msg_t = 0.0
 
+
     def _next_id(self) -> int:
         self._id += 1
         return self._id
@@ -301,6 +336,7 @@ class _Client:
                                   "params": params})
 
     async def _reconcile(self, ws) -> None:
+        """Bring live subscriptions in line with the desired market sets."""
         await self._subscribe_account(ws)
         for t in self.want_orderbook - set(self._ob_sids):
             cid = self._next_id()
@@ -362,6 +398,7 @@ class _Client:
                                              "action": "delete_markets"}})
         if add or rem:
             self._multi_have[channel] = set(want)
+
 
     def _handle(self, m: dict) -> None:
         t = m.get("type")
@@ -484,12 +521,10 @@ class _Client:
         trade = {
             "trade_id": msg.get("trade_id", ""),
             "ticker": t,
-            # Absent stays absent: a "0" default here read downstream as a
-            # real zero-size or zero-price trade.
-            "count_fp": msg.get("count_fp"),
-            "yes_price_dollars": msg.get("yes_price_dollars"),
-            "no_price_dollars": msg.get("no_price_dollars"),
-            "taker_side": taker_outcome_side(msg),
+            "count_fp": msg.get("count_fp", "0"),
+            "yes_price_dollars": msg.get("yes_price_dollars", "0"),
+            "no_price_dollars": msg.get("no_price_dollars", "0"),
+            "taker_side": msg.get("taker_side", ""),
             "is_block_trade": bool(msg.get("is_block_trade")),
             "created_time": msg.get("ts_ms") or msg.get("ts") or "",
             "observed_ms": int(time.time() * 1000),
@@ -521,6 +556,7 @@ class _Client:
         except Exception as e:
             logger.debug(f"kalshi_ws: on_lifecycle cb error: {e}")
 
+
     def set_orderbook_markets(self, tickers) -> None:
         self.want_orderbook = {t for t in tickers if t}
 
@@ -528,15 +564,28 @@ class _Client:
         self.want_ticker = {t for t in tickers if t}
 
     def add_ticker_markets(self, tickers) -> None:
+        """UNION extra tickers into the ticker set without clobbering what the
+        main loop already wants — so a secondary consumer (e.g. the HF recorder)
+        can ensure its markets are subscribed without dropping held tickers.
+        The main loop's periodic set_ticker_markets still owns the baseline."""
         self.want_ticker |= {t for t in tickers if t}
 
     def add_orderbook_markets(self, tickers) -> None:
+        """UNION extra tickers into the orderbook set — same contract as
+        add_ticker_markets. The terminal's open market page uses this so
+        watching a market does not clobber the executor's held tickers; the
+        main loop's periodic set_orderbook_markets still owns the baseline
+        (and re-unions the terminal's set every pass)."""
         self.want_orderbook |= {t for t in tickers if t}
 
     def set_lifecycle_markets(self, tickers) -> None:
         self.want_lifecycle = {t for t in tickers if t}
 
+
     def orderbook(self, ticker: str) -> Optional[dict]:
+        """Live book as {"yes":[[cents,size]...],"no":[[cents,size]...]} or None
+        when not connected / not subscribed / invalidated by a gap — callers
+        then REST-fall-back. Best bid on a side = max price (matches REST)."""
         if not self.connected or not self._book_valid.get(ticker):
             return None
         b = self.books.get(ticker)
@@ -559,6 +608,11 @@ class _Client:
         return self.quotes.get(ticker) if self.connected else None
 
     def recent_trades(self, limit: int = 1000) -> Optional[list]:
+        """Newest-first recent trades in the REST /markets/trades shape, or None
+        when the buffer is cold OR stale — so the scanner REST-falls-back on
+        startup and whenever the `trade` channel has gone quiet on the socket
+        (dropped/NAK'd sub, half-dead channel) even though we're still
+        'connected'. Never serve a stale buffer as if it were live."""
         if not self.connected or not self.trades:
             return None
         if self._loop_time() - self.last_trade_msg_t > _TRADE_STALE_SEC:

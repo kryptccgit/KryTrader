@@ -18,10 +18,7 @@ export async function openKalshiReferral(): Promise<void> {
   await window.krypt.app.openExternal(await getKalshiReferralUrl());
 }
 
-export const KALSHI_DEMO_URL = 'https://demo.kalshi.co';
-export const KALSHI_DEMO_SIGNUP = 'https://demo.kalshi.co/sign-up';
-export const KALSHI_DEMO_GUIDE =
-  'https://help.kalshi.com/en/articles/13823775-creating-and-using-a-demo-account';
+export const KALSHI_API_KEYS_URL = 'https://kalshi.com/account/profile';
 
 export const GUIDE_VIDEO_URL = 'https://www.youtube.com/watch?v=TI1jwNCAOkw';
 

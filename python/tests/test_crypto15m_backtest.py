@@ -95,7 +95,7 @@ def test_signal_db_roundtrip(fresh_db):
         "ticker": "KXBTC15M-X", "asset": "BTC", "series": "KXBTC15M",
         "close_time": "2026-06-08T02:45:00Z", "mins_left": 7.0,
         "favorite": "down", "favorite_price": 0.64, "entry_cost": 0.66,
-        "up_prob": 0.36, "delta_pct": 0.001, "kalshi_env": "demo",
+        "up_prob": 0.36, "delta_pct": 0.001, "kalshi_env": "paper",
     }
     with db.get_db() as conn:
         assert db.insert_crypto15m_signal(conn, row) is True

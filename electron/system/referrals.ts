@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from '
 import { join } from 'node:path';
 import { REFERRAL_POOL_ENC } from './referral-pool.gen';
 
+
 const POOL_KEY_HEX =
   'c1b7e69a4d20f3585b8e17d2a94c6e0f7d31a8c25e94b06fd8427c1a90e5b3f6';
 

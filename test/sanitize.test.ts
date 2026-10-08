@@ -1,8 +1,11 @@
 import { describe, expect, it } from 'vitest';
 import {
-  CANDLE_INTERVALS, cleanFilters, cleanTicker, cleanTicket, clampInt,
-  DISCOVER_COLUMNS, filterAgentConfigPatch, nextWatchlist,
+  AI_KEYED_PROVIDERS, AI_PROVIDERS, CANDLE_INTERVALS, cleanAiKeyProvider, cleanAiProvider,
+  cleanApiKey, cleanFilters, cleanHealthArgs, cleanTicker, cleanTicket, clampInt,
+  DISCOVER_COLUMNS, filterAgentConfigPatch, isPersonalKey, nextWatchlist, omitPersonal,
+  blankWebhooks, isWebhookKey, omitForShare, profileExportJson,
 } from '../electron/system/sanitize';
+
 
 describe('cleanTicker', () => {
   it('accepts and upper-cases a real ticker', () => {
@@ -160,5 +163,152 @@ describe('filterAgentConfigPatch', () => {
     expect(filterAgentConfigPatch(null)).toEqual({});
     expect(filterAgentConfigPatch(['kalshiEnv'])).toEqual({});
     expect(filterAgentConfigPatch('kalshiEnv')).toEqual({});
+  });
+
+  it('never lets an agent switch on the HTTP API', () => {
+    expect(filterAgentConfigPatch({ mcpHttpEnabled: true, minEdgePtsWhale: 2 }))
+      .toEqual({ minEdgePtsWhale: 2 });
+  });
+
+  it('never lets an agent switch the AI provider or model it runs on', () => {
+    expect(filterAgentConfigPatch({ aiProvider: 'ollama', aiModel: 'x' })).toEqual({});
+  });
+});
+
+describe('cleanHealthArgs', () => {
+  it('runs the network checks only on a literal true', () => {
+    expect(cleanHealthArgs({ deep: true })).toEqual({ deep: true });
+  });
+
+  it('falls to the local-only run for anything else', () => {
+    for (const v of [undefined, null, 'true', 1, {}, [], { deep: 'true' }, { deep: 1 },
+      [{ deep: true }], 'deep']) {
+      expect(cleanHealthArgs(v)).toEqual({ deep: false });
+    }
+  });
+
+  it('drops every other field, so nothing else reaches the backend', () => {
+    expect(cleanHealthArgs({ deep: true, host: 'evil.example', port: 1 }))
+      .toEqual({ deep: true });
+  });
+});
+
+describe('AI provider ids and keys', () => {
+  it('accepts exactly the six provider ids, case-insensitively', () => {
+    for (const p of AI_PROVIDERS) expect(cleanAiProvider(p)).toBe(p);
+    expect(cleanAiProvider(' Gemini ')).toBe('gemini');
+  });
+
+  it('rejects anything else instead of defaulting to a provider', () => {
+    for (const bad of [
+      '', null, undefined, {}, 'claude', 'http://127.0.0.1:11434',
+      'https://openrouter.ai/api/v1', 'ollama;rm', '../anthropic',
+    ]) {
+      expect(cleanAiProvider(bad as unknown)).toBeNull();
+    }
+  });
+
+  it('only keyed providers can have a key set', () => {
+    expect(cleanAiKeyProvider('openrouter')).toBe('openrouter');
+    expect(cleanAiKeyProvider('gemini')).toBe('gemini');
+    expect(cleanAiKeyProvider('ollama')).toBeNull();
+    expect(cleanAiKeyProvider('lmstudio')).toBeNull();
+    expect(AI_KEYED_PROVIDERS).not.toContain('ollama');
+  });
+
+  it('passes a pasted key through, trimmed', () => {
+    const k = 'sk-' + 'or-v1-' + 'ab'.repeat(32);
+    expect(cleanApiKey(`  ${k}\n`)).toBe(k);
+  });
+
+  it('treats empty as "remove the key", but never turns a bad key into empty', () => {
+    expect(cleanApiKey('')).toBe('');
+    expect(cleanApiKey('   ')).toBe('');
+    expect(cleanApiKey(undefined)).toBe('');
+    for (const bad of ['abc\ndef', 'key with space', 'k\u0000ey', 'kéy', 'x'.repeat(401)]) {
+      expect(cleanApiKey(bad)).toBeNull();
+    }
+  });
+});
+
+describe('profiles never carry personal or arm-switch settings', () => {
+  const hostile = {
+    minEdgePtsWhale: 7, maxSizeFraction: 0.05,
+    mcpTradeMode: 'live', mcpLiveApproval: false, mcpHttpEnabled: true, mcpMaxOrderUsd: 9999,
+    autopilotEnabled: true, remoteTradingEnabled: true, remoteDiscordUserId: '284019571203948544',
+    remoteTelegramChatId: '7301948826', scriptsLiveEnabled: true, scriptsPaperMode: false,
+    perpsFarmEnabled: true, terminalMaxContracts: 100000, terminalMaxNotionalUsd: 1e9,
+    aiProvider: 'openrouter', aiModel: 'x',
+  };
+
+  it('keeps the strategy tuning', () => {
+    expect(omitPersonal(hostile)).toEqual({ minEdgePtsWhale: 7, maxSizeFraction: 0.05 });
+  });
+
+  it('classifies every agent, remote, AI, live-switch, farmer and cap key as personal', () => {
+    for (const k of Object.keys(hostile)) {
+      if (k === 'minEdgePtsWhale' || k === 'maxSizeFraction') continue;
+      expect(isPersonalKey(k)).toBe(true);
+    }
+  });
+
+  it('leaves ordinary engine keys alone', () => {
+    for (const k of ['minEdgePtsWhale', 'maxOpenPositions', 'crypto15mDirectionMode', 'stopLossOnDay']) {
+      expect(isPersonalKey(k)).toBe(false);
+    }
+  });
+});
+
+describe('a shared profile file never carries a webhook URL', () => {
+  const hook = (n: number) => `https://discord.com/api/web${'hooks'}/1234567890${n}/tok-${n}`;
+  const saved = {
+    id: 'p1', name: 'Mine', kind: 'main', createdAt: 'x', updatedAt: 'x',
+    config: {
+      minEdgePtsWhale: 7, maxOpenPositions: 4, crypto15mDirectionMode: 'model',
+      eventWebhookUrl: hook(1), statsWebhookUrl: hook(2), whaleWebhookUrl: hook(3), momentumWebhookUrl: hook(4),
+      enableDiscord: true, remoteDiscordUserId: '284019571203948544', remoteTelegramChatId: '7301948826',
+      kalshiEnv: 'production', enableTrading: true, crypto15mEnabled: true, crypto15mLive: true,
+      crypto15mRunners: [{ id: 'r', name: 'r', coins: null, mode: 'live', enabled: true, config: {} }],
+      mcpTradeMode: 'live', scriptsLiveEnabled: true, perpsFarmEnabled: true,
+    },
+  };
+
+  it('exports none of them, nor any personal, env or arm key', () => {
+    const json = profileExportJson(saved);
+    expect(json).not.toMatch(/discord\.com\/api\/webhooks/i);
+    const exported = JSON.parse(json).profile.config as Record<string, unknown>;
+    for (const k of Object.keys(exported)) {
+      expect(k).not.toMatch(/webhook|token|secret/i);
+      expect(isPersonalKey(k)).toBe(false);
+    }
+    for (const k of ['kalshiEnv', 'enableTrading', 'crypto15mEnabled', 'crypto15mLive', 'crypto15mRunners']) {
+      expect(exported).not.toHaveProperty(k);
+    }
+    expect(exported).toEqual({ minEdgePtsWhale: 7, maxOpenPositions: 4, crypto15mDirectionMode: 'model' });
+    expect(JSON.parse(json).profile.name).toBe('Mine');
+  });
+
+  it("imports none of them either: a stranger's file must not redirect your alerts", () => {
+    const imported = omitForShare(saved.config) as Record<string, unknown>;
+    expect(Object.keys(imported).filter((k) => /webhook/i.test(k))).toEqual([]);
+    expect(imported).not.toHaveProperty('kalshiEnv');
+    expect(imported).not.toHaveProperty('mcpTradeMode');
+  });
+
+  it('classifies any webhook-named key as personal, including ones added later', () => {
+    for (const k of ['eventWebhookUrl', 'statsWebhookUrl', 'whaleWebhookUrl', 'momentumWebhookUrl', 'fillsWebhookUrl']) {
+      expect(isWebhookKey(k)).toBe(true);
+      expect(isPersonalKey(k)).toBe(true);
+    }
+    expect(isWebhookKey('minEdgePtsWhale')).toBe(false);
+  });
+
+  it('stores a saved snapshot with the URLs blanked and everything else intact', () => {
+    const snap = blankWebhooks(saved.config) as Record<string, unknown>;
+    expect(snap.eventWebhookUrl).toBe('');
+    expect(snap.momentumWebhookUrl).toBe('');
+    expect(snap.minEdgePtsWhale).toBe(7);
+    expect(snap.enableDiscord).toBe(true);
+    expect(saved.config.eventWebhookUrl).toBe(hook(1));
   });
 });

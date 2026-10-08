@@ -9,33 +9,38 @@ import { Calibration, ManualScorecard } from '../components/terminal/Calibration
 import { ShardBalances } from '../components/terminal/ShardBalances';
 import { RuleList } from '../components/terminal/StandingRules';
 import { useTerminal, usePoll } from '../state/TerminalProvider';
+import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
 import { cls } from '../utils/format';
+import { publishActivity } from '../state/activity';
+import { userMessage } from '../utils/errors';
 
 export function TerminalPortfolioPage() {
   const { openMarket } = useTerminal();
+  const { config } = useApp();
   const toast = useToast();
   const [cancelling, setCancelling] = useState<string | null>(null);
+  const acctMode = config?.accountMode ?? 'paper';
 
   const pf = usePoll<TerminalPortfolio>(
     () => window.krypt.terminal.portfolio(),
     10_000,
-    [],
+    [acctMode],
   );
   const orders = usePoll<{ orders: RestingOrder[]; note: string | null }>(
     () => window.krypt.terminal.orders(),
     10_000,
-    [],
+    [acctMode],
   );
   const rules = usePoll<RuleListT>(
     () => window.krypt.terminal.rules({ limit: 300 }),
     8_000,
-    [],
+    [acctMode],
   );
   const hist = usePoll<ManualHistory>(
     () => window.krypt.terminal.history({ limit: 400 }),
     60_000,
-    [],
+    [acctMode],
   );
 
   const data = pf.data;
@@ -46,10 +51,17 @@ export function TerminalPortfolioPage() {
     setCancelling(id);
     try {
       const res = await window.krypt.terminal.cancel({ orderId: id });
+      publishActivity(() => {
+        const o = orders.data?.orders.find((x) => x.orderId === id);
+        return {
+          kind: 'manualOrder', op: 'cancel', ok: res.ok, ticker: o?.ticker ?? null, side: o?.side ?? null,
+          action: o?.action ?? null, status: res.status, filled: null, avgCents: null, message: res.message,
+        };
+      });
       toast.push(res.message, res.ok ? 'success' : 'error');
       if (res.ok) orders.reload();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     } finally {
       setCancelling(null);
     }
@@ -57,8 +69,10 @@ export function TerminalPortfolioPage() {
 
   return (
     <Page
-      title="Terminal portfolio"
-      subtitle="Every position in the connected Kalshi account, priced off its own ledger."
+      title="My Book"
+      subtitle={data?.env === 'paper'
+        ? 'PAPER: every position in the paper account — real Kalshi prices, imaginary money.'
+        : 'Every position in the connected Kalshi account, priced off its own ledger.'}
       actions={
         <button
           onClick={() => { pf.reload(); orders.reload(); hist.reload(); rules.reload(); }}
@@ -113,7 +127,7 @@ export function TerminalPortfolioPage() {
               ? Object.values(data.shardCash)
                 .map((sh) => `${sh.name} $${sh.cashUsd.toFixed(0)}`)
                 .join(' · ')
-              : data ? `${data.env} environment` : undefined
+              : data ? (data.env === 'paper' ? 'paper account' : 'your Kalshi account') : undefined
           }
         />
         <StatCard
@@ -137,7 +151,7 @@ export function TerminalPortfolioPage() {
         <StatCard
           label="Realised"
           value={<Pnl value={data?.totalRealizedUsd ?? null} />}
-          hint="settled and closed, per Kalshi"
+          hint={data?.env === 'paper' ? 'settled and closed, paper ledger' : 'settled and closed, per Kalshi'}
         />
       </div>
 
@@ -156,7 +170,7 @@ export function TerminalPortfolioPage() {
             title="No open positions"
             description={
               data?.note
-                ?? 'Nothing is held in this environment. Open a market from the Terminal and trade it by hand.'
+                ?? 'Nothing is held in this account. Open a market from the Terminal and trade it by hand.'
             }
           />
         ) : (
@@ -289,7 +303,7 @@ export function TerminalPortfolioPage() {
                       </button>
                     </td>
                     <td className="krypt-td"><SidePill side={o.side} /></td>
-                    <td className="krypt-td text-krypt-muted">{o.action ?? <Unknown />}</td>
+                    <td className="krypt-td text-krypt-muted">{o.action}</td>
                     <td className="krypt-td text-right">
                       {o.remaining ?? o.count ?? <Unknown why="Kalshi reported no remaining count for this order." />}
                     </td>

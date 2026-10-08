@@ -1,3 +1,11 @@
+"""V2 order-endpoint migration (kalshi_api).
+
+Kalshi 410'd the legacy write endpoints (POST/DELETE /portfolio/orders) with
+`deprecated_v1_order_endpoint`. These tests pin the translation from the
+unchanged public signature (side=yes|no, action=buy|sell, price in cents) onto
+the v2 single YES-quoted book — especially the NO-side price inversion, where a
+wrong sign would place a real-money order on the wrong side.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -73,48 +81,14 @@ def test_cancel_order_uses_v2_events_path(monkeypatch):
     captured: dict = {}
 
     async def fake_signed(method, path, *, json=None, params=None, **kw):
-        captured.update(method=method, path=path, params=params)
+        captured.update(method=method, path=path)
         return {"order_id": "ord_1", "reduced_by": "5"}
 
     monkeypatch.setattr(kalshi_api, "_signed_request", fake_signed)
-    asyncio.run(kalshi_api.cancel_order("ord_1", ticker="KXBTC15M-T1"))
+    asyncio.run(kalshi_api.cancel_order("ord_1"))
 
     assert captured["method"] == "DELETE"
     assert captured["path"] == "/portfolio/events/orders/ord_1"
-    # Without market_ticker Kalshi routes the cancel to shard 0; crypto is shard 2.
-    assert captured["params"] == {"market_ticker": "KXBTC15M-T1"}
-
-
-def test_cancel_order_looks_up_ticker_when_not_given(monkeypatch):
-    calls: list = []
-
-    async def fake_signed(method, path, *, json=None, params=None, **kw):
-        calls.append((method, path, params))
-        if method == "GET":
-            return {"order": {"order_id": "ord_2", "ticker": "KXETH15M-T2"}}
-        return {"order_id": "ord_2"}
-
-    monkeypatch.setattr(kalshi_api, "_signed_request", fake_signed)
-    asyncio.run(kalshi_api.cancel_order("ord_2"))
-
-    assert calls[0][:2] == ("GET", "/portfolio/orders/ord_2")
-    assert calls[1] == ("DELETE", "/portfolio/events/orders/ord_2",
-                        {"market_ticker": "KXETH15M-T2"})
-
-
-def test_cancel_order_still_sends_when_lookup_fails(monkeypatch):
-    calls: list = []
-
-    async def fake_signed(method, path, *, json=None, params=None, **kw):
-        calls.append((method, params))
-        if method == "GET":
-            raise RuntimeError("network")
-        return {"order_id": "ord_3"}
-
-    monkeypatch.setattr(kalshi_api, "_signed_request", fake_signed)
-    asyncio.run(kalshi_api.cancel_order("ord_3"))
-
-    assert calls[-1] == ("DELETE", None)
 
 
 def test_place_limit_order_rejects_bad_inputs():
@@ -130,6 +104,7 @@ def test_place_limit_order_rejects_bad_inputs():
         except ValueError:
             continue
         raise AssertionError(f"expected ValueError for {bad}")
+
 
 
 

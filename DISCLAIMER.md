@@ -49,11 +49,13 @@ You are solely responsible for:
 - The security of your own Kalshi API keys and the machine you run this on.
 - Every order the software places on your behalf.
 
-## Start on demo, keep the live switches off
-Krypt Trader ships defaulted to Kalshi's **demo** environment with
-**auto-trading off** (and every per-feature live switch off). Keep it that way
-until you fully understand the software and the risks. Going live requires
-deliberately switching to production **and** arming the trader.
+## Start on paper, keep the live switches off
+Krypt Trader ships in **Paper** mode — Kalshi's real prices with imaginary
+money — with **auto-trading off** (and every per-feature live switch off).
+Keep it that way until you fully understand the software and the risks.
+Paper results are a rehearsal, not a promise: paper fills do not move the
+market and do not model queue position. Going live requires adding a Kalshi
+key, deliberately switching the app to **Live**, **and** arming the trader.
 
 ## No telemetry
 Krypt Trader has no backend and sends **nothing** about you or your trading to

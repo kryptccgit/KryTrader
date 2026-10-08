@@ -1,12 +1,19 @@
 name: Build Installers
 
+# Builds native installers on each OS and attaches them to a GitHub RELEASE
+# named after the package.json version (v<version>). Release assets do NOT
+# count against the Actions artifact-storage quota (which the old
+# upload-artifact approach exhausted). Runs ONLY on a version tag push or on
+# demand — never on ordinary branch pushes, so a doc commit to main can't
+# silently rebuild and replace the installers of a release users are already
+# downloading.
 on:
   push:
     tags: ['v*']
   workflow_dispatch: {}
 
 permissions:
-  contents: write
+  contents: write   # create the release + upload assets
 
 jobs:
   build:
@@ -15,13 +22,22 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            name: linux
+            name: linux            # AppImage + deb
           - os: windows-latest
-            name: windows
-          - os: macos-13
-            name: mac-intel
+            name: windows          # nsis .exe
+          # A NATIVE Intel runner, not a cross-build from arm64: PyInstaller
+          # freezes the Python it runs under, so the backend's architecture
+          # is the runner's. electron-builder targets the host arch too, and
+          # artifactName carries ${arch}, so the two mac .dmg files never
+          # collide on the release. macos-13 was retired on 2025-12-04 and a
+          # job on it queues forever, so the v6 release would have shipped
+          # with no x64 dmg (fail-fast is off). macos-15-intel is GitHub's
+          # x86_64 label until the macOS 15 image retires (announced for
+          # August 2027); after that there is no hosted Intel mac runner.
+          - os: macos-15-intel
+            name: mac-intel        # x64 .dmg
           - os: macos-latest
-            name: mac-apple-silicon
+            name: mac-apple-silicon # arm64 .dmg
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -31,19 +47,48 @@ jobs:
         with:
           node-version: '20'
 
+      # The release step below names the release after package.json, not the
+      # tag. A new tag pushed without bumping package.json would therefore
+      # attach its build to the PREVIOUS version's release and overwrite the
+      # installers users are already downloading (overwrite_files is on).
+      # Refuse that before spending a matrix of builds on it.
+      - name: Check tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          want="v$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_REF_NAME" != "$want" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match package.json version ($want). Bump package.json or re-tag."
+            exit 1
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
+      # npm ci installs exactly what package-lock.json records (and fails if
+      # it disagrees with package.json), so a release is built from the
+      # dependency tree that was tested, not whatever resolved that morning.
       - name: Install Node dependencies
-        run: npm install
+        run: npm ci
 
       - name: Build app, bundle backend, package installer
         run: npm run dist
         env:
+          # Build the macOS app without an Apple Developer cert. This does NOT
+          # mean unsigned: packaging invalidates the signature Electron ships
+          # with, and a bundle whose seal is broken is refused outright on
+          # Apple Silicon ("is damaged and can't be opened" — which no amount
+          # of `xattr -dr com.apple.quarantine` can fix, because quarantine was
+          # never the cause). scripts/mac-adhoc-sign.cjs runs as an afterPack
+          # hook and re-signs the finished bundle ad-hoc, backend binaries
+          # first; it fails the build if the result doesn't verify.
+          # No-op on Linux/Windows.
           CSC_IDENTITY_AUTO_DISCOVERY: false
 
+      # Cheap tripwire: catches a bundle that the DMG step or a future config
+      # change re-broke after the afterPack hook signed it.
       - name: Verify macOS signature
         if: startsWith(matrix.os, 'macos')
         run: |
@@ -60,6 +105,8 @@ jobs:
         with:
           tag_name: v${{ steps.ver.outputs.version }}
           name: Krypt Trader v${{ steps.ver.outputs.version }}
+          # Four matrix jobs race to the same release; each only adds its own
+          # OS's files. overwrite_files lets a re-run replace stale assets.
           overwrite_files: true
           files: |
             release/*.AppImage

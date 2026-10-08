@@ -1,7 +1,9 @@
 import { useState } from 'react';
 import { Gem, Play, X, AlertTriangle, CalendarClock, Check } from 'lucide-react';
 import { cls } from '../utils/format';
+import { optimizerEvent, publishActivity } from '../state/activity';
 import type { CoinOptimizeResult, CoinOptimizeAgg, Crypto15mRunner, Crypto15mScheduleSlot } from '@shared/types';
+import { userMessage } from '../utils/errors';
 
 const COINS = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'HYPE', 'BNB'];
 const BUCKETS = [1, 2, 3, 4, 6, 8, 12, 24];
@@ -56,8 +58,9 @@ export function CoinOptimizer({ onClose, onSaveRunner }: {
       const r = await window.krypt?.turbine?.optimize({ coin, granularityH: gran, sinceDays: days });
       if (r) setRes(r);
       else setErr('Backend not running — start the app to run the optimizer.');
+      publishActivity(() => optimizerEvent(r));
     } catch (e) {
-      setErr(String(e).slice(0, 160));
+      setErr(userMessage(e).slice(0, 160));
     } finally {
       setRunning(false);
     }

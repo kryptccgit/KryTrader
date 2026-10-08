@@ -1,9 +1,41 @@
+"""Krypt Terminal — the manual half of the app.
+
+The bot answers "should I act, right now, on this one thing I am watching?".
+The terminal answers "what is going on, and what should I do about it?" — for
+ANY market the user names, not just the ones a scanner happened to observe.
+
+Three rules govern everything in this module:
+
+1. **A value nobody could produce is None.**  It is never coerced to 0, to a
+   default, or to a "safe" assumption. Kalshi's REST shapes make this a live
+   hazard rather than a style point: ``yes_bid: 0`` means the book side is
+   EMPTY (quotes live in 1..99), ``yes_ask: 100`` likewise, and
+   ``last_price: 0`` means the market has never traded. Coerced to numbers,
+   each of those is a specific, confident lie a user would trade on.
+
+2. **Per-field provenance.**  Every assembled row carries which source produced
+   which number — our own websocket, a REST read this second, or a cached one.
+   A terminal that shows a price without saying where it came from is asking
+   for trust, which is exactly what it is trying not to require.
+
+3. **A cost budget.**  A bot makes a handful of requests; a terminal polls
+   four columns, a chart, a book and a portfolio forever. Everything public
+   goes through a per-host serial gate with a minimum gap and a 429 park, and
+   everything is TTL-cached at a horizon tuned to how fast that data actually
+   changes.
+
+Nothing here accepts a URL or a host from its caller. The renderer names an
+ENTITY (a ticker), a COLUMN, an INTERVAL; this module decides which of
+kalshi_api's hardcoded hosts to contact. That is the structural fix for SSRF —
+a URL validator in the middle would be the fragile one.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
 import math
 import re
+import secrets
 import time
 import uuid
 from collections import deque
@@ -49,10 +81,36 @@ SOURCED_FIELDS = (
 
 
 class ProviderParked(Exception):
-    pass
+    """The public API is in 429 backoff. Raised INSTEAD of queueing, so a burst
+    of doomed low-value calls cannot starve a high-value one behind them — the
+    failure mode that once blanked the chart while a plain curl to the same
+    endpoint returned 200."""
+
 
 
 def price_cents(v: Any) -> Optional[float]:
+    """A Kalshi price in cents, or None when there is no price.
+
+    Only the SENTINELS are absent — 0, 100, None, "", a non-number. They mean
+    ABSENT, not "cheap" and not "expensive":
+
+      * ``yes_bid == 0``    → nobody is bidding for YES
+      * ``yes_ask == 100``  → nobody is offering YES (yes_ask = 100 - no_bid,
+                              and no_bid == 0 means the NO side is empty)
+      * ``last_price == 0`` → this market has never traded
+
+    Deci-cent series (the tapered 15m crypto books) keep their 0.1c
+    resolution; whole-cent markets come back as x.0.
+
+    The bound used to be 1..99, which threw away REAL levels: the tapered
+    series tick in 0.1c below 10c and above 90c, so 99.4c and 0.6c are valid
+    quotes — kalshi_api.place_limit_order accepts 0.1..99.9 as tick-valid, and
+    the repo's own recorded history (300,441 15m-crypto candles) has 6.7% of
+    candles closing with a top of book inside the discarded band. The effect
+    was not a missing number but a WRONG one: with bids at 99.4/99.2/98.0 the
+    first two were dropped and 98.0 was reported as the best bid, so a stop
+    armed "below 99" sold into a bid that did not exist.
+    """
     if v is None or isinstance(v, bool):
         return None
     try:
@@ -68,6 +126,8 @@ def price_cents(v: Any) -> Optional[float]:
 
 
 def _count(v: Any) -> Optional[int]:
+    """A contract count. Unlike a price, 0 IS a real value here — a market can
+    genuinely have traded nothing. Only a missing/unreadable field is None."""
     if v is None or isinstance(v, bool):
         return None
     try:
@@ -90,6 +150,9 @@ def _num(v: Any) -> Optional[float]:
 
 
 def _dollar_price(v: Any) -> Optional[float]:
+    """Kalshi's current wire format quotes DOLLAR strings — ``"0.9400"`` is
+    94c, ``"0.0000"`` is an empty book side. Same 1..99 honesty rule as
+    `price_cents`, applied after the conversion."""
     n = _num(v)
     if n is None:
         return None
@@ -129,7 +192,15 @@ def _minutes_until(v: Any) -> Optional[float]:
     return round((dt - datetime.now(timezone.utc)).total_seconds() / 60.0, 1)
 
 
+
 class _HostGate:
+    """Serial queue for one host, with a minimum gap between requests and a
+    park on repeated failure.
+
+    Not a global limiter — per host, so a slow public sweep never delays a
+    signed portfolio read.
+    """
+
     def __init__(self, min_gap: float) -> None:
         self._lock = asyncio.Lock()
         self._min_gap = min_gap
@@ -156,6 +227,8 @@ class _HostGate:
             )
 
     async def run(self, fn, *args, **kwargs):
+        """Fail fast while parked — WITHOUT taking the lock, so doomed calls do
+        not hold the queue."""
         parked = self.parked_sec()
         if parked > 0:
             raise ProviderParked(
@@ -223,6 +296,8 @@ def note_interest(ticker: str) -> None:
 
 
 def subscribed_tickers() -> set[str]:
+    """Tickers the terminal currently wants on the websocket. service.py unions
+    this into the main loop's subscription set every pass."""
     now = time.monotonic()
     dead = [t for t, at in _ws_interest.items() if now - at > WS_SUBSCRIPTION_TTL]
     for t in dead:
@@ -230,7 +305,10 @@ def subscribed_tickers() -> set[str]:
     return set(_ws_interest)
 
 
+
 def _spread_mid(bid: Optional[float], ask: Optional[float]) -> tuple[Optional[float], Optional[float]]:
+    """A one-sided book has no spread — it has an UNKNOWN one. Both or
+    neither."""
     if bid is None or ask is None:
         return None, None
     return round(ask - bid, 1), round((ask + bid) / 2.0, 1)
@@ -238,6 +316,19 @@ def _spread_mid(bid: Optional[float], ask: Optional[float]) -> tuple[Optional[fl
 
 def market_row(m: dict, source: str = "kalshi-rest",
                ctx: Optional[dict] = None) -> dict:
+    """One Kalshi market record → the terminal's MarketSummary shape.
+
+    Kalshi quotes DOLLAR strings (``yes_bid_dollars: "0.9400"``) and fixed-point
+    counts (``volume_fp: "345.67"``). The legacy cent integers (``yes_bid: 94``)
+    are GONE — re-probed 2026-08-25, production no longer returns them —
+    so the legacy reads below are a fallback for old
+    recorded data, not a live path. Reading only the legacy names produced a
+    universe of markets with no prices and no volume that still rendered without
+    error, which is why every count and price here is read both ways.
+
+    `ctx` carries what the market record itself does not have: category,
+    series and mutual-exclusivity all live on the parent EVENT.
+    """
     ctx = ctx or {}
     yes_bid = price_cents(m.get("yes_bid")) or _dollar_price(m.get("yes_bid_dollars"))
     yes_ask = price_cents(m.get("yes_ask")) or _dollar_price(m.get("yes_ask_dollars"))
@@ -326,6 +417,10 @@ def market_row(m: dict, source: str = "kalshi-rest",
 
 
 def _copy_row(r: dict) -> dict:
+    """A row copy whose `sources` is also a copy.
+
+    The sweep cache hands out the same row objects for 45s, so anything that
+    mutates provenance has to own its own dict or it edits the cache."""
     out = dict(r)
     src = out.get("sources")
     if isinstance(src, dict):
@@ -334,6 +429,13 @@ def _copy_row(r: dict) -> dict:
 
 
 def _apply_live_quote(row: dict) -> dict:
+    """Overlay our OWN websocket quote when we have one, and say so.
+
+    Priority is the guide's: our own authoritative read, then our own live feed,
+    then the best third party, then None. A provider that has nothing to say
+    must never erase one that does — so this patches field by field rather than
+    spreading one dict over another.
+    """
     q = kalshi_ws.ticker_quote(row.get("ticker") or "")
     if not q:
         return row
@@ -366,6 +468,22 @@ def _apply_live_quote(row: dict) -> dict:
 
 
 def _apply_book_quote(row: dict, book: Optional[dict]) -> tuple[dict, Optional[float]]:
+    """Overlay the ORDER BOOK's top of book onto a market row, and report how
+    far the two disagreed.
+
+    The market record and the order book are separate reads. On a slow market
+    they agree exactly (measured: 0.0c drift across every market with more than
+    a day to run). On a 15-minute crypto market seconds from settlement they
+    routinely differ by 6-7c — which is real movement, not an error, but it
+    put three different asks on one screen: the header's, the ladder's, and the
+    ticket's.
+
+    The book wins, because it is both the more granular read (deci-cent levels,
+    and the live websocket book when this market is subscribed) and the thing
+    an order actually executes against. The drift is returned rather than
+    swallowed, so the page can say "this market is moving faster than one page
+    load" instead of leaving the user to notice two numbers and guess.
+    """
     if not book:
         return row, None
     bid, ask = book.get("yesBid"), book.get("yesAsk")
@@ -391,7 +509,21 @@ def _apply_book_quote(row: dict, book: Optional[dict]) -> tuple[dict, Optional[f
     return row, (round(max(drifts), 1) if drifts else None)
 
 
+
 async def _sweep(refresh: bool = False) -> dict:
+    """The open universe, cached — swept over EVENTS, not markets.
+
+    ``/markets?status=open`` is not the listing view any more. Measured
+    2026-08-24, 7,999 of the first 8,000 rows were auto-generated multivariate
+    "parlay shard" markets (``KXMVECROSSCATEGORY-…``) with no volume and no
+    real event page, and the cursor was still going. Any ranking over that list
+    ranks combinatorial noise, and — worse — it *looks* like it worked.
+
+    ``/events?with_nested_markets=true`` is the real listing view: it returns
+    none of the shards, carries the category / series / mutual-exclusivity that
+    a market record does not have, and covers ~8 markets per row, so ~20,000
+    real markets arrive in about 3 seconds.
+    """
     if not refresh:
         hit = _cache.get("sweep", SWEEP_TTL)
         if hit:
@@ -446,6 +578,24 @@ async def _sweep(refresh: bool = False) -> dict:
 
 
 def apply_filters(rows: list[dict], f: Optional[dict]) -> tuple[list[dict], int, int]:
+    """Filter a row set. Returns (kept, skipped, excluded).
+
+    The asymmetry here is deliberate and is the honest-null rule applied to
+    filtering:
+
+      * A NUMERIC filter ("volume ≥ 500", "closing within 6h") is a threshold on
+        a quantity. If that quantity has not arrived for a row, the threshold
+        has not been evaluated — so the row is SKIPPED and counted, and the UI
+        says how many. It is not a low score; it is an unmeasured one.
+
+      * A CATEGORICAL filter ("category = Politics") is the user naming a set.
+        "I don't know" is not a member of that set, so a row with no category is
+        EXCLUDED — a definite non-match, not an unmeasured one, and not counted
+        as skipped.
+
+    Both behaviours are pinned by tests, because the difference is exactly the
+    kind of thing a later refactor flattens into one branch.
+    """
     if not f:
         return rows, 0, 0
 
@@ -516,6 +666,20 @@ EVENT_CAP = 3
 
 
 def _cap_per_event(rows: list[dict], cap: int) -> tuple[list[dict], int]:
+    """Keep at most `cap` markets from any one event, preserving order.
+
+    `KXNASDAQ100U-26AUG25H1400` is not a market, it is ~400 rungs of one
+    ladder that share a title, a close time and an auto-quoter. Ranked by
+    anything those rungs tie on — and every rung closes at the same instant —
+    a single event fills the column and every other event in the window
+    becomes unreachable. Measured 2026-08-25: 774 of the 999 markets closing
+    within 6h were rungs of just two NASDAQ-100 ladders, and all 60 rows this
+    column returned came from one of them.
+
+    A row with no event ticker is NOT collapsed with other such rows: an
+    unknown event is not evidence that two markets share one. Each falls back
+    to its own ticker and is kept.
+    """
     seen: dict[tuple, int] = {}
     kept: list[dict] = []
     collapsed = 0
@@ -532,6 +696,22 @@ def _cap_per_event(rows: list[dict], cap: int) -> tuple[list[dict], int]:
 
 
 def _actionable_before_close(r: dict) -> bool:
+    """Is there something a user could actually DO about this market?
+
+    A two-sided book means yes: a price to buy at and a price to sell into.
+
+    A one-sided book usually does not, and on a strike ladder it is an
+    artifact rather than an offer. A market maker quotes every rung, so a deep
+    out-of-the-money rung carries `no_bid: 0.99` — which `market_row` mirrors
+    into a 1c YES ask — while nobody has ever traded it and nobody holds it.
+    The old test here was "is EITHER side quoted", and that 1c phantom passed
+    it, which is how this column came to show 60 untraded ladder rungs.
+
+    So a one-sided market has to earn its place with evidence that it is real:
+    somebody has traded it, or somebody is holding it. A `volume` or
+    `openInterest` of None is UNKNOWN — it is not that evidence, but it is not
+    held against the market either; it simply is not a reason to include it.
+    """
     if r.get("yesBid") is not None and r.get("yesAsk") is not None:
         return True
     vol = r.get("volume")
@@ -540,6 +720,17 @@ def _actionable_before_close(r: dict) -> bool:
 
 def _rank(rows: list[dict], column: str,
           limit: int) -> tuple[list[dict], int, dict]:
+    """Rank a sweep for one column, returning (rows, skipped, dropped).
+
+    Numeric columns SKIP rows whose metric has not arrived — a threshold on a
+    quantity nobody has produced yet is not a judgement about that row, so it is
+    left out of the ranking and counted, not silently sorted to the bottom as if
+    it were a zero.
+
+    `dropped` counts the two things removed AFTER a row was judged rankable, so
+    the caller can say so rather than silently returning a short column:
+    `untradeable` (closing only) and `collapsed` (the per-event cap).
+    """
     skipped = 0
     untradeable = 0
     keyed: list[tuple[float, dict]] = []
@@ -578,6 +769,15 @@ def _rank(rows: list[dict], column: str,
 
 
 async def _trending(limit: int) -> dict:
+    """Rank by what is ACTUALLY trading right now, from the public tape.
+
+    Not by a `volume_24h` field: a 24h counter makes this morning's finished
+    event look as busy as the market printing trades this second, and it is the
+    field most likely to be stale or absent. One request to the tape gives real
+    activity, we aggregate the notional ourselves, and then we price only the
+    handful of tickers that won — computing the metric rather than trusting a
+    sort we did not define.
+    """
     trades = await _public_gate.run(kalshi_api.fetch_recent_trades, 1000)
     if trades is None:
         raise RuntimeError("Kalshi's public trade tape did not answer.")
@@ -644,6 +844,9 @@ async def _trending(limit: int) -> dict:
 
 
 async def _closing(limit: int) -> dict:
+    """Server-side window query. Kalshi honours max_close_ts/min_close_ts
+    (verified 2026-08-24) and the filtered result is free of parlay shards, so
+    this is a query rather than a rank over a sweep."""
     now = int(time.time())
     horizon_h = 6
     raw: list = []
@@ -831,7 +1034,9 @@ async def search(query: str, limit: int = 60) -> dict:
     }
 
 
+
 def _ladder(levels: list, limit: int = 12) -> tuple[list[dict], Optional[int]]:
+    """Raw [[price, size], …] → best-first levels with a running cumulative."""
     clean: list[tuple[float, int]] = []
     for lvl in levels or []:
         try:
@@ -905,10 +1110,13 @@ async def book(ticker: str) -> dict:
     return out
 
 
+
 _CANDLE_GROUPS = (("price", ""), ("yes_bid", "yesBid"), ("yes_ask", "yesAsk"))
 
 
 def _candle_field(c: dict, group: str, key: str) -> Optional[float]:
+    """Historical tier: {"yes_bid": {"close": "0.94"}}. Live tier:
+    {"yes_bid": {"close_dollars": "0.9400"}}. Both are dollars."""
     d = c.get(group)
     if not isinstance(d, dict):
         return None
@@ -923,6 +1131,10 @@ def _candle_field(c: dict, group: str, key: str) -> Optional[float]:
 
 
 def normalize_candles(raw: list[dict]) -> list[dict]:
+    """Providers emit duplicate period stamps (the same bucket twice in one
+    response), and a chart library throws on a non-ascending series. Sort and
+    collapse at the source — the LAST record for a stamp wins, since a repeat
+    is a correction rather than a second period."""
     by_ts: dict[int, dict] = {}
     for c in raw or []:
         if not isinstance(c, dict):
@@ -1005,6 +1217,7 @@ async def candles(ticker: str, interval_min: int = 1, lookback_min: int = 240) -
     return _cache.put(key, out)
 
 
+
 def _tape_row(t: dict, source: str) -> dict:
     yes = price_cents(t.get("yes_price"))
     if yes is None:
@@ -1019,7 +1232,8 @@ def _tape_row(t: dict, source: str) -> dict:
     n = _count(t.get("count"))
     if n is None:
         n = _count(t.get("count_fp"))
-    side = kalshi_ws.taker_outcome_side(t) or None
+    side = _text(t.get("taker_side"))
+    side = side.lower() if side in ("yes", "no", "YES", "NO") else None
 
     observed = None
     ms = _count(t.get("observed_ms"))
@@ -1096,6 +1310,7 @@ async def tape(ticker: str, limit: int = 50) -> dict:
     return _cache.put(f"tape:{ticker}", out)
 
 
+
 _HEDGE_TERMS = (
     "at the discretion", "sole discretion", "reasonable", "reasonably",
     "approximately", "substantially", "may determine", "as determined by",
@@ -1115,6 +1330,14 @@ def resolution_risk(
     event: Optional[dict] = None, book_snapshot: Optional[dict] = None,
     siblings: Optional[list[dict]] = None,
 ) -> dict:
+    """Resolution risk, not price risk.
+
+    In crypto the equivalent panel asks "can this rug". Here the question is
+    "will this settle the way the wording implies" — who resolves it, on what
+    source, how ambiguous the wording is, how long after close it settles, and
+    whether a related market's price contradicts this one. Almost nobody
+    surfaces it, and it is where a prediction-market terminal earns its keep.
+    """
     checks: list[dict] = []
     m = market or {}
 
@@ -1393,7 +1616,18 @@ def resolution_risk(
     }
 
 
+
 def _position_row(p: dict, mark: Optional[dict]) -> dict:
+    """One /portfolio/positions record → a TerminalPosition.
+
+    Cost basis comes from Kalshi's OWN ledger (`market_exposure_dollars`), never
+    from what we asked to pay: the real cost of a fill includes the taker fee
+    and any partial fill at a worse price, and every one of those makes a
+    naive number wrong in the user's favour on every single row.
+
+    A row whose exposure could not be read is marked unreconciled, its derived
+    figures are None, and it is excluded from every total.
+    """
     ticker = _text(p.get("ticker")) or ""
     qty = _num(p.get("position_fp"))
     if qty is None:
@@ -1465,9 +1699,10 @@ async def portfolio(authed: bool) -> dict:
             "totalUnrealizedUsd": None, "totalRealizedUsd": None,
             "cashUsd": None, "env": env, "fetchedAt": _now_iso(),
             "note": (
-                f"No verified Kalshi credentials for the {env} environment. Add "
-                f"a key in API Keys and the terminal will read your real "
-                f"positions — it shows nothing rather than showing zeros."
+                "No verified Kalshi credentials. Add a key in API Keys and the "
+                "terminal will read your real positions — it shows nothing "
+                "rather than showing zeros. Or switch to Paper, which needs no "
+                "key."
             ),
         }
 
@@ -1489,6 +1724,10 @@ async def portfolio(authed: bool) -> dict:
     unreconciled = len(rows) - len(good)
 
     def _tot(field: str) -> Optional[float]:
+        """Sum the reconciled rows. With no positions at all the total is a real
+        zero; with positions whose value nobody could produce it is None — the
+        difference between "you hold nothing" and "we could not price what you
+        hold" is the whole point of this module."""
         if not rows:
             return 0.0
         vals = [r[field] for r in good if r[field] is not None]
@@ -1556,6 +1795,11 @@ async def portfolio(authed: bool) -> dict:
 
 
 def _first_count(o: dict, *keys: str) -> Optional[int]:
+    """First readable count among `keys`, or None if none of them parse.
+
+    `is not None` rather than `or`, because 0 is a real count — a fully filled
+    order genuinely has 0 remaining, and truthiness would skip past it to the
+    next name and report a stale one."""
     for k in keys:
         v = _count(o.get(k))
         if v is not None:
@@ -1563,19 +1807,15 @@ def _first_count(o: dict, *keys: str) -> Optional[int]:
     return None
 
 
-def _order_row(
-    o: dict, title: Optional[str] = None, held_side: Optional[str] = None,
-) -> dict:
-    # A missing side/action used to default to "buy YES"; once Kalshi drops
-    # the deprecated fields that turned every resting sell into a buy, and
-    # the stop rules stopped seeing the exits already working.
-    action, side = kalshi_api.order_direction(o, held_side=held_side)
-    px = None
-    if side is not None:
-        px = price_cents(o.get("yes_price") if side == "yes" else o.get("no_price"))
-        if px is None:
-            d = _num(o.get("yes_price_dollars") if side == "yes" else o.get("no_price_dollars"))
-            px = price_cents(d * 100) if d is not None else None
+def _order_row(o: dict, title: Optional[str] = None) -> dict:
+    side = _text(o.get("side"))
+    side = side.lower() if side in ("yes", "no", "YES", "NO") else "yes"
+    action = _text(o.get("action")) or ""
+    action = action.lower() if action.lower() in ("buy", "sell") else "buy"
+    px = price_cents(o.get("yes_price") if side == "yes" else o.get("no_price"))
+    if px is None:
+        d = _num(o.get("yes_price_dollars") if side == "yes" else o.get("no_price_dollars"))
+        px = price_cents(d * 100) if d is not None else None
     if px is None:
         d = _num(o.get("price"))
         px = price_cents(d * 100 if d is not None and d <= 1.5 else d)
@@ -1600,8 +1840,7 @@ async def resting_orders(authed: bool, ticker: str = "") -> dict:
     if not authed:
         return {"orders": [], "note": "No verified credentials for this environment."}
     raw = await kalshi_api.fetch_orders(status="resting", ticker=ticker or "")
-    held = await _held_sides(raw)
-    orders = [_order_row(o, held_side=held.get(str(o.get("ticker") or ""))) for o in raw]
+    orders = [_order_row(o) for o in raw]
     note = None
     if len(raw) >= 1000:
         note = (
@@ -1611,29 +1850,33 @@ async def resting_orders(authed: bool, ticker: str = "") -> dict:
     return {"orders": orders, "note": note}
 
 
-async def _held_sides(raw: list) -> dict[str, str]:
-    # Only needed once Kalshi stops sending action/side: then the position is
-    # what tells a sell of YES from a buy of NO (see order_direction).
-    if all(o.get("action") and o.get("side") for o in raw):
-        return {}
-    try:
-        positions = await kalshi_api.get_positions()
-    except Exception as e:
-        logger.info("terminal: positions read for order direction failed: %s", e)
-        return {}
-    out: dict[str, str] = {}
-    for p in positions:
-        q = _num(p.get("position_fp"))
-        if q is None:
-            q = _num(p.get("position"))
-        if q:
-            out[str(p.get("ticker") or "")] = "yes" if q > 0 else "no"
-    return out
-
 
 def _fee_usd(price_c: float, contracts: int) -> float:
+    """Kalshi's trading fee for this order, in dollars — the exchange's own
+    formula (0.07·p·(1−p) per contract, rounded UP per order to the next cent),
+    reused from the backtester rather than re-derived, so the ticket and the
+    P&L maths can never drift apart."""
     p = max(0.01, min(0.99, price_c / 100.0))
     return round(_bt.kalshi_fee_per_contract(p, contracts=max(1, contracts)) * contracts, 2)
+
+
+def mode_mismatch(req: dict, scope: str) -> Optional[str]:
+    """Why a ticket must not go out in `scope`, or None.
+
+    The ticket names the account mode it was filled in (`expectMode`:
+    'paper' | 'live'). Paper and Live trade the same tickers at the same
+    prices, so a ticket priced while the app said PAPER and sent after a
+    switch to Live would look identical — and spend real money. Absent means
+    the caller did not say (an older renderer, a rule, a phone order), and
+    the scope in force decides, as before."""
+    want = str((req or {}).get("expectMode") or "").strip().lower()
+    if want not in ("paper", "live"):
+        return None
+    have = "paper" if scope == kalshi_auth.PAPER else "live"
+    if want == have:
+        return None
+    return (f"Not sent: this ticket was filled in on {want.upper()}, but the app "
+            f"is now on {have.upper()}. Check the ticket and send it again.")
 
 
 def preview(
@@ -1641,6 +1884,9 @@ def preview(
     book_snapshot: Optional[dict], position: Optional[dict],
     exchange_status: Optional[dict] = None,
 ) -> dict:
+    """Price and vet a manual ticket. Everything here runs in the backend: the
+    renderer never computes what an order costs and hands the number back, and
+    every rail below is enforced again at submit time."""
     ticker = (req.get("ticker") or "").strip().upper()
     side = (req.get("side") or "yes").lower()
     action = (req.get("action") or "buy").lower()
@@ -1651,10 +1897,13 @@ def preview(
     blockers: list[str] = []
 
     env = kalshi_auth.get_env()
+    mismatch = mode_mismatch(req, env)
+    if mismatch:
+        blockers.append(mismatch)
     if not authed:
         blockers.append(
-            f"No verified Kalshi credentials for the {env} environment. "
-            f"Add a key in API Keys before trading."
+            "No verified Kalshi credentials. Add a key in API Keys before "
+            "trading live, or switch to Paper, which needs no key."
         )
     if side not in ("yes", "no"):
         blockers.append("Side must be YES or NO.")
@@ -1818,7 +2067,10 @@ def preview(
             logger.debug("terminal: bot-ownership check failed for %s: %s", ticker, e)
 
     if env == "production" and not blockers:
-        warnings.append("PRODUCTION — this spends real money.")
+        warnings.append("LIVE — this spends real money.")
+    elif env == kalshi_auth.PAPER and not blockers:
+        warnings.append("PAPER — real prices, imaginary money. Nothing is sent "
+                        "to Kalshi.")
 
     return {
         "ticker": ticker, "side": side, "action": action,
@@ -1833,12 +2085,35 @@ def preview(
     }
 
 
-async def submit(req: dict, *, cfg: dict, authed: bool) -> dict:
+async def submit(req: dict, *, cfg: dict, authed: bool,
+                 scope: Optional[str] = None) -> dict:
+    """Place a manual order, then RECONCILE it against Kalshi's own fills
+    ledger before reporting what it cost.
+
+    Every rail from `preview` is re-run here. The renderer's preview is a
+    convenience; this is the gate. Assume the renderer is hostile.
+    """
     ticker = (req.get("ticker") or "").strip().upper()
     side = (req.get("side") or "yes").lower()
     action = (req.get("action") or "buy").lower()
     count = _count(req.get("count")) or 0
     px = price_cents(req.get("priceCents"))
+    scope = scope or kalshi_auth.get_env()
+    if scope != kalshi_auth.get_env():
+        return {
+            "ok": False, "orderId": None, "clientOrderId": "", "status": None,
+            "filledContracts": None, "avgFillCents": None, "feesUsd": None,
+            "reconciled": False,
+            "message": ("Not sent: the app switched between Paper and Live after "
+                        "this order was decided."),
+        }
+    mismatch = mode_mismatch(req, scope)
+    if mismatch:
+        return {
+            "ok": False, "orderId": None, "clientOrderId": "", "status": None,
+            "filledContracts": None, "avgFillCents": None, "feesUsd": None,
+            "reconciled": False, "message": mismatch,
+        }
 
     market = None
     book_snapshot = None
@@ -1880,12 +2155,21 @@ async def submit(req: dict, *, cfg: dict, authed: bool) -> dict:
         resp = await kalshi_api.place_limit_order(
             ticker=ticker, side=side, action=action, count=count,
             price_cents=px, client_order_id=client_order_id,
+            pin_env=scope,
         )
     except Exception as e:
+        if kalshi_api.is_scope_changed(e):
+            return {
+                "ok": False, "message": f"Not sent: {e.body.get('error', {}).get('message')}",
+                "orderId": None, "clientOrderId": client_order_id, "status": None,
+                "filledContracts": None, "avgFillCents": None, "feesUsd": None,
+                "reconciled": False,
+            }
         found = None
         lookup_ok = False
         try:
-            found = await kalshi_api.find_order_by_client_id(client_order_id, ticker=ticker)
+            found = await kalshi_api.find_order_by_client_id(
+                client_order_id, ticker=ticker, pin_env=scope)
             lookup_ok = True
         except Exception as le:
             logger.warning(
@@ -1899,7 +2183,7 @@ async def submit(req: dict, *, cfg: dict, authed: bool) -> dict:
                     ticker=ticker, side=side, count=count, price_cents=px,
                     client_order_id=client_order_id, order_id=None,
                     status="unconfirmed", filled=None, avg_cents=None,
-                    fees_usd=None,
+                    fees_usd=None, env=scope,
                     title=(market or {}).get("title") or "",
                     event_ticker=(market or {}).get("eventTicker") or "",
                     category=(market or {}).get("category") or "",
@@ -1923,7 +2207,7 @@ async def submit(req: dict, *, cfg: dict, authed: bool) -> dict:
                 "Kalshi — recovered by client_order_id", e, client_order_id,
             )
         else:
-            why = str(e)
+            why = kalshi_api.rejection_text(e)
             if kalshi_api.is_user_not_found(e):
                 try:
                     why = await kalshi_api.explain_order_rejection(
@@ -1948,7 +2232,7 @@ async def submit(req: dict, *, cfg: dict, authed: bool) -> dict:
     if order_id:
         await asyncio.sleep(0.4)
         try:
-            fills = await kalshi_api.get_fills_for_order(order_id)
+            fills = await kalshi_api.get_fills_for_order(order_id, pin_env=scope)
             mine = [f for f in fills if str(f.get("order_id") or "") == str(order_id)]
             import trader as _trader
             total_n = 0
@@ -1974,7 +2258,7 @@ async def submit(req: dict, *, cfg: dict, authed: bool) -> dict:
         record_manual_buy(
             ticker=ticker, side=side, count=count, price_cents=px,
             client_order_id=client_order_id, order_id=order_id, status=status,
-            filled=filled, avg_cents=avg, fees_usd=fees,
+            filled=filled, avg_cents=avg, fees_usd=fees, env=scope,
             title=(market or {}).get("title") or "",
             event_ticker=(market or {}).get("eventTicker") or "",
             category=(market or {}).get("category") or "",
@@ -1982,19 +2266,26 @@ async def submit(req: dict, *, cfg: dict, authed: bool) -> dict:
     else:
         await record_manual_sell(
             ticker=ticker, side=side, count=count, price_cents=px,
-            order_id=order_id, status=status, filled=filled,
+            order_id=order_id, status=status, filled=filled, env=scope,
         )
 
+    paper = scope == kalshi_auth.PAPER
     if reconciled and filled:
-        msg = f"Filled {filled} at {avg:g}c average (Kalshi's ledger, fees ${fees:.2f})."
+        msg = (f"PAPER: filled {filled} at {avg:g}c average against the real book "
+               f"(paper ledger, fees ${fees:.2f})." if paper else
+               f"Filled {filled} at {avg:g}c average (Kalshi's ledger, fees ${fees:.2f}).")
     elif reconciled:
-        msg = f"Order resting at {px:g}c — no fills yet."
+        msg = (f"PAPER: order resting at {px:g}c — it fills only if the real book "
+               f"crosses it." if paper else f"Order resting at {px:g}c — no fills yet.")
     else:
         msg = (
             f"Order accepted ({status or 'unknown status'}), but Kalshi's fills "
             f"ledger could not be read. It is recorded as unreconciled and "
             f"excluded from portfolio figures until it can be."
         )
+    shard_note = resp.get("krypt_shard_note") if isinstance(resp, dict) else None
+    if shard_note:
+        msg = f"{msg} The app {shard_note}." if shard_note.startswith("moved") else f"{msg} Note: {shard_note}."
 
     _cache.drop(f"book:{ticker}")
     return {
@@ -2020,11 +2311,20 @@ async def cancel(order_id: str, *, authed: bool) -> dict:
             "clientOrderId": "", "status": None, "filledContracts": None,
             "avgFillCents": None, "feesUsd": None, "reconciled": False,
         }
+    ticker = None
     try:
-        await kalshi_api.cancel_order(oid)
+        for o in (await resting_orders(authed)).get("orders") or []:
+            if str(o.get("orderId") or "") == oid:
+                ticker = o.get("ticker")
+                break
     except Exception as e:
+        logger.info("terminal cancel: could not look up %s's market: %s", oid, e)
+    try:
+        await kalshi_api.cancel_order(oid, ticker=ticker)
+    except Exception as e:
+        logger.warning("terminal cancel %s refused: %s", oid, e)
         return {
-            "ok": False, "message": f"Kalshi refused the cancel: {e}",
+            "ok": False, "message": f"Kalshi refused the cancel: {kalshi_api.rejection_text(e)}",
             "orderId": oid, "clientOrderId": "", "status": None,
             "filledContracts": None, "avgFillCents": None, "feesUsd": None,
             "reconciled": False,
@@ -2052,18 +2352,33 @@ async def cancel(order_id: str, *, authed: bool) -> dict:
 
 
 
+
 def _manual_signal_id(ticker: str, side: str) -> int:
-    return abs(hash((ticker, side, time.time_ns()))) % 2_000_000_000
+    """bot_positions is UNIQUE(signal_source, signal_id, kalshi_env) — manual
+    rows have no upstream signal, so synthesise a collision-resistant id.
+
+    Random, not clock-derived: it used to hash time.time_ns(), which on Windows
+    under Python < 3.13 ticks every 15.6 ms — the Python the installers are
+    frozen with — so two manual buys of one ticker+side inside a tick got the
+    same id and the second hit the UNIQUE constraint."""
+    return secrets.randbelow(2_000_000_000)
 
 
 async def _reconcile_fills(
-    order_id: Optional[str], side: str,
+    order_id: Optional[str], side: str, pin_env: Optional[str] = None,
 ) -> tuple[Optional[int], Optional[float]]:
+    """(contracts, average price in cents) for one order, from Kalshi's fills.
+
+    (None, None) when the ledger could not be read — which every caller must
+    treat as "unknown", never as zero. This is the only source of truth for
+    what a trade cost or made: the limit price is what we asked for, and the
+    difference is fees and partial fills at worse prices, every one of which
+    is wrong in the user's favour."""
     if not order_id:
         return None, None
     try:
         import trader as _trader
-        fills = await kalshi_api.get_fills_for_order(order_id)
+        fills = await kalshi_api.get_fills_for_order(order_id, pin_env=pin_env)
         mine = [f for f in fills if str(f.get("order_id") or "") == str(order_id)]
         total_n = 0
         total_c = 0.0
@@ -2082,6 +2397,13 @@ async def _reconcile_fills(
 
 
 def _manual_entry_fee_share(ticker: str, side: str, count: int) -> float:
+    """The entry fee already paid on `count` of the contracts being sold.
+
+    Read from OUR manual ledger row, which records what the entry actually
+    cost in fees. Returns 0.0 when there is no such row — a bot- or
+    web-opened position has no manual entry fee for the user to have paid, and
+    guessing one would understate the quote instead of overstating it.
+    """
     import db
     try:
         with db.get_db() as conn:
@@ -2100,6 +2422,14 @@ def _manual_entry_fee_share(ticker: str, side: str, count: int) -> float:
 
 
 def _manual_status(filled: Optional[int], target: Optional[int]) -> str:
+    """DB status for a manual order, matching trader._db_status_from_order.
+
+    The distinction is load-bearing rather than cosmetic: 'filled' tells the
+    rest of the app that nothing is still working on the book, and three
+    separate systems act on that — the exposure cap, the pending-order poll,
+    and Cancel All. A row born 'filled' with a live remainder is invisible to
+    all three, and nothing demotes it later.
+    """
     f = int(filled or 0)
     t = int(target or 0)
     if f <= 0:
@@ -2114,9 +2444,18 @@ def record_manual_buy(
     client_order_id: str, order_id: Optional[str], status: str,
     filled: Optional[int], avg_cents: Optional[float], fees_usd: Optional[float],
     title: str = "", event_ticker: str = "", category: str = "",
+    env: Optional[str] = None,
 ) -> Optional[int]:
+    """Book a hand-placed BUY. Returns the position row id.
+
+    A second buy on the same side ADDS to the existing row rather than
+    inserting a duplicate: Kalshi reports one aggregate position per
+    (ticker, side) and the reconcile pass overwrites filled/cost from that
+    aggregate, so two local rows would make the reconciler pick between them
+    and would double-count the exposure.
+    """
     import db
-    env = kalshi_auth.get_env()
+    env = env or kalshi_auth.get_env()
     try:
         with db.get_db() as conn:
             existing = db.find_open_manual_position(conn, ticker, side, env)
@@ -2191,9 +2530,33 @@ def record_manual_buy(
 async def record_manual_sell(
     *, ticker: str, side: str, count: int, price_cents: float,
     order_id: Optional[str], status: str, filled: Optional[int],
+    env: Optional[str] = None,
 ) -> None:
+    """Book a hand-placed SELL against the position it reduces — including the
+    money.
+
+    A sale is not a new position, so it is recorded on the row it closes rather
+    than as a second row. But it must actually book its PROCEEDS, and it must
+    reconcile them from Kalshi's fills rather than from the limit price we
+    asked for: the limit is what we hoped to get, the fills are what we got.
+
+    Getting this wrong was a real, silent bug. Writing only `closed_early=1`
+    left the row `resolved=0, filled_contracts=100, cost_usd=40` while the
+    position was gone from Kalshi. The engine's own passes then finished the
+    job on stale data — the orphan-close path (trader.py) books
+    `settlement_usd=0, pnl_usd=0` on a market that is still active, so a +$40
+    winning trade reported as $0.00; or, if the market settled first,
+    mark_resolved_positions settled the FULL original size and fabricated a win
+    or a loss on contracts the user no longer held.
+
+    A full exit therefore resolves the row here and now. A partial exit reduces
+    the position's size and basis (average cost, the convention this app
+    states) so the remainder settles on its own. If the proceeds cannot be
+    reconciled, P&L stays NULL — an em dash — rather than a number nobody
+    earned.
+    """
     import db
-    env = kalshi_auth.get_env()
+    env = env or kalshi_auth.get_env()
     try:
         with db.get_db() as conn:
             row = db.find_open_manual_position(conn, ticker, side, env)
@@ -2209,7 +2572,7 @@ async def record_manual_sell(
         cost_usd = _num(row["cost_usd"]) or 0.0
         entry_fees = _num(row["fees_usd"]) or 0.0
 
-        sold, avg_exit_cents = await _reconcile_fills(order_id, side)
+        sold, avg_exit_cents = await _reconcile_fills(order_id, side, pin_env=env)
         if sold is None:
             sold = _count(filled)
 
@@ -2317,6 +2680,18 @@ async def record_manual_sell(
 
 
 def manual_history(limit: int = 300) -> dict:
+    """Closed and open hand-placed trades, plus calibration.
+
+    Calibration is the question a prediction-market terminal can answer that
+    almost nothing else can: **when you paid 70c for a side, did that side win
+    70% of the time?** These contracts settle to exactly 0 or 1, so there is no
+    mark-to-model anywhere in it — the answer is arithmetic on closed trades.
+
+    It is also the easiest place in the app to lie. A bucket with three trades
+    in it produces a hit rate that looks exactly like one computed from three
+    hundred, so a bucket under the minimum reports `hitRate: None` and says how
+    many more trades it needs, rather than printing a number.
+    """
     import db
     env = kalshi_auth.get_env()
     with db.get_db() as conn:
@@ -2400,6 +2775,7 @@ def manual_history(limit: int = 300) -> dict:
             "outcome to score."
         ),
     }
+
 
 
 RULE_KINDS = ("stop", "take", "alert")
@@ -2508,6 +2884,13 @@ RULE_FIRING_STALE_SEC = 120.0
 
 
 def _recover_stranded_rules(conn, env: str) -> None:
+    """Deal with rules left mid-fire by a crash.
+
+    A rule is claimed ('firing') before any money moves, so a process killed
+    inside submit() leaves one stranded. It must NOT be re-armed: we do not
+    know whether the order landed, and an unattended duplicate sell is a worse
+    outcome than a lapsed instruction. So it is marked `error` and says exactly
+    what to check — the user decides whether to re-arm."""
     import db as _db
     rows = conn.execute(
         "SELECT id, ticker FROM terminal_rules "
@@ -2532,6 +2915,14 @@ def _recover_stranded_rules(conn, env: str) -> None:
 
 
 def _exit_price_for(book_snapshot: Optional[dict], side: str) -> tuple[Optional[float], Optional[str]]:
+    """What this side could actually be SOLD into right now, and where that
+    number came from.
+
+    Deliberately the best BID on the held side, not the mid and not the last
+    print: a stop loss is a promise about getting out, and the mid is a price
+    at which nobody has offered to buy anything. Triggering on a mid that no
+    bid supports is how a stop 'fires' into a book that cannot fill it.
+    """
     if not book_snapshot:
         return None, None
     if side == "yes":
@@ -2545,6 +2936,14 @@ def _rule_fires(direction: str, price: float, threshold: float) -> bool:
 
 
 async def evaluate_rules(cfg: dict, *, authed: bool, on_event=None) -> list[dict]:
+    """One pass over the armed rules. Returns the ones that changed state.
+
+    Failure policy is the whole design: a rule that cannot be priced does
+    NOTHING and records why. It is never treated as "not triggered" quietly and
+    never as "triggered" defensively — an unknown price is an unknown price,
+    and the panel shows the rule as armed-but-unevaluable so the user can see
+    that their protection is not currently protecting anything.
+    """
     import db
     env = kalshi_auth.get_env()
     with db.get_db() as conn:
@@ -2738,7 +3137,7 @@ async def evaluate_rules(cfg: dict, *, authed: bool, on_event=None) -> list[dict
         res = await submit({
             "ticker": ticker, "side": side, "action": "sell",
             "count": want, "priceCents": limit,
-        }, cfg=cfg, authed=True)
+        }, cfg=cfg, authed=True, scope=env)
 
         with db.get_db() as conn:
             if res.get("ok"):
@@ -2779,6 +3178,7 @@ async def evaluate_rules(cfg: dict, *, authed: bool, on_event=None) -> list[dict
     return changed
 
 
+
 MICRO_MAX_SAMPLES = 900
 MICRO_SAMPLE_SEC = 1.0
 
@@ -2787,6 +3187,11 @@ _micro_last_sample = 0.0
 
 
 def sample_microstructure() -> int:
+    """Take one top-of-book sample for every market a screen currently has
+    open. Cheap and synchronous: it reads the local websocket book, and records
+    NOTHING when the socket is not live — a gap in this series means "we were
+    not watching", which is a fact, whereas a REST-filled point would be a
+    different measurement wearing the same shape."""
     global _micro_last_sample
     now = time.monotonic()
     if now - _micro_last_sample < MICRO_SAMPLE_SEC:
@@ -2907,22 +3312,17 @@ def microstructure(ticker: str, probe_cents: Optional[float] = None) -> dict:
     }
 
 
+
 HOSTS: list[dict] = [
     {
         "host": "api.elections.kalshi.com",
         "purpose": "Kalshi's production API — market data, and your account "
-                   "when the production environment is selected.",
+                   "in Live mode. In Paper mode only the unauthenticated "
+                   "market reads are made.",
         "when": "constantly while the Terminal or the bot is open",
-        "sends": "your API key signature on account calls; market reads are "
+        "sends": "your API key signature on account calls (Live mode only, "
+                 "plus the key test you click); market reads are "
                  "unauthenticated",
-        "required": True,
-        "optional_off": None,
-    },
-    {
-        "host": "demo-api.kalshi.co",
-        "purpose": "Kalshi's demo (paper) API — the same thing for play money.",
-        "when": "while the demo environment is selected",
-        "sends": "your demo API key signature",
         "required": True,
         "optional_off": None,
     },
@@ -2931,16 +3331,9 @@ HOSTS: list[dict] = [
         "purpose": "Kalshi's production websocket — live quotes, order book "
                    "and fills. This is the feed the Terminal's own "
                    "microstructure view is built from.",
-        "when": "one persistent connection while the backend runs",
+        "when": "one persistent connection while the backend runs in Live "
+                "mode (never in Paper: its handshake is signed)",
         "sends": "your API key signature on the handshake",
-        "required": True,
-        "optional_off": "KRYPT_KALSHI_WS=0",
-    },
-    {
-        "host": "external-api-ws.demo.kalshi.co",
-        "purpose": "The same websocket for the demo environment.",
-        "when": "one persistent connection while the backend runs on demo",
-        "sends": "your demo API key signature on the handshake",
         "required": True,
         "optional_off": "KRYPT_KALSHI_WS=0",
     },
@@ -2950,14 +3343,6 @@ HOSTS: list[dict] = [
                    "volume farmer.",
         "when": "only while the perps farmer is switched on",
         "sends": "your API key signature on the handshake",
-        "required": False,
-        "optional_off": "turn off Perpetuals",
-    },
-    {
-        "host": "external-api-margin-ws.demo.kalshi.co",
-        "purpose": "The perpetual-futures websocket on demo.",
-        "when": "only while the perps farmer is switched on, on demo",
-        "sends": "your demo API key signature on the handshake",
         "required": False,
         "optional_off": "turn off Perpetuals",
     },
@@ -3076,18 +3461,88 @@ HOSTS: list[dict] = [
         "optional_off": "stay off the Perpetuals page and leave the farmer off",
     },
     {
-        "host": "external-api.demo.kalshi.co",
-        "purpose": "The perpetual-futures REST API on demo.",
-        "when": "while the Perpetuals page is open on demo, and while the "
-                "farmer runs",
-        "sends": "your demo API key signature",
+        "host": "api.anthropic.com",
+        "purpose": "Anthropic's API, when Claude is your AI provider: market "
+                   "analysis, Autopilot, and the free model listing behind "
+                   "Test connection.",
+        "when": "only when you press Analyse or Test connection, or while "
+                "Autopilot is on, with Anthropic selected",
+        "sends": "your Anthropic API key, and the market data shown on the "
+                 "page you analysed (prices, rules, your position in it). "
+                 "Autopilot also sends the results of the tools it calls.",
         "required": False,
-        "optional_off": "stay off the Perpetuals page and leave the farmer off",
+        "optional_off": "pick another AI provider, or do not use AI analysis",
+    },
+    {
+        "host": "api.openai.com",
+        "purpose": "OpenAI's API, when OpenAI is your AI provider: market "
+                   "analysis, Autopilot, and the free model listing behind "
+                   "Test connection.",
+        "when": "only when you press Analyse or Test connection, or while "
+                "Autopilot is on, with OpenAI selected",
+        "sends": "your OpenAI API key, and the market data shown on the page "
+                 "you analysed. Autopilot also sends its tool results.",
+        "required": False,
+        "optional_off": "pick another AI provider, or do not use AI analysis",
+    },
+    {
+        "host": "openrouter.ai",
+        "purpose": "OpenRouter, when it is your AI provider: one key routed to "
+                   "the model you picked, which OpenRouter forwards to that "
+                   "model's own company. Also the public model list.",
+        "when": "only when you press Analyse or Test connection, or while "
+                "Autopilot is on, with OpenRouter selected",
+        "sends": "your OpenRouter key, and the market data you analysed — "
+                 "which OpenRouter passes on to the model's provider. No app "
+                 "name or referrer header is sent.",
+        "required": False,
+        "optional_off": "pick another AI provider, or do not use AI analysis",
+    },
+    {
+        "host": "generativelanguage.googleapis.com",
+        "purpose": "Google's Gemini API, when Gemini is your AI provider: "
+                   "market analysis (optionally grounded with Google Search), "
+                   "Autopilot, and the free model listing.",
+        "when": "only when you press Analyse or Test connection, or while "
+                "Autopilot is on, with Gemini selected",
+        "sends": "your Gemini API key (in a header, never the URL), and the "
+                 "market data you analysed. On Google's free tier, Google may "
+                 "use what you send to improve its products.",
+        "required": False,
+        "optional_off": "pick another AI provider, or do not use AI analysis",
+    },
+    {
+        "host": "127.0.0.1:11434",
+        "purpose": "Ollama, on this machine, when it is your AI provider. The "
+                   "model runs locally; nothing goes over the internet.",
+        "when": "only when you press Analyse or Test connection, or while "
+                "Autopilot is on, with Ollama selected",
+        "sends": "the market data you analysed — to a program on this "
+                 "machine, not to anyone else. No key.",
+        "required": False,
+        "optional_off": "pick another AI provider, or do not use AI analysis",
+    },
+    {
+        "host": "127.0.0.1:1234",
+        "purpose": "LM Studio's local server, on this machine, when it is your "
+                   "AI provider. The model runs locally; nothing goes over the "
+                   "internet.",
+        "when": "only when you press Analyse or Test connection, or while "
+                "Autopilot is on, with LM Studio selected",
+        "sends": "the market data you analysed — to a program on this "
+                 "machine, not to anyone else. No key.",
+        "required": False,
+        "optional_off": "pick another AI provider, or do not use AI analysis",
     },
 ]
 
 
 def network_report() -> dict:
+    """The Privacy panel's payload: the catalogue above, joined to live counts.
+
+    A host with zero calls is still listed — the point is what the app CAN
+    contact, not only what it happened to contact since launch.
+    """
     stats = kalshi_api.net_stats()
     rows = []
     for h in HOSTS:
@@ -3134,7 +3589,14 @@ def network_report() -> dict:
     }
 
 
+
 async def market_detail(ticker: str, *, authed: bool) -> dict:
+    """Assemble one entity page.
+
+    Every panel is fetched concurrently and failures are collected per panel
+    rather than raised: a dead order book must not hold the whole page shut,
+    and the same on-chain-style read must not fire once per assembler.
+    """
     ticker = (ticker or "").strip().upper()
     note_interest(ticker)
     errors: list[dict] = []
@@ -3146,11 +3608,26 @@ async def market_detail(ticker: str, *, authed: bool) -> dict:
             errors.append({"panel": panel, "message": str(e)})
             return None
 
-    raw_market, book_snapshot = await asyncio.gather(
-        _safe("market", _public_gate.run(kalshi_api.fetch_market, ticker)),
+    async def _market_checked(t: str):
+        m, status = await kalshi_api.fetch_market_checked(t)
+        if status == "unreachable":
+            return None
+        if m:
+            kalshi_api._note_shard(m)
+        return (m, status)
+
+    checked, book_snapshot = await asyncio.gather(
+        _safe("market", _public_gate.run(_market_checked, ticker)),
         _safe("book", book(ticker)),
     )
-    if not raw_market:
+    if checked is None:
+        why = next((e["message"] for e in errors if e["panel"] == "market"), None)
+        raise RuntimeError(why or (
+            f"Could not reach Kalshi to load {ticker} just now (network, or "
+            f"Kalshi's rate limit). The ticker may be fine — try again in a "
+            f"moment."))
+    raw_market, found = checked
+    if found != "found" or not raw_market:
         raise RuntimeError(
             f"Kalshi has no market called {ticker}. Check the ticker — the "
             f"terminal will not invent a page for a market that does not exist."

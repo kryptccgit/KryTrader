@@ -1,3 +1,23 @@
+"""LIVE check of the AI analysis path. Run by hand. SPENDS YOUR MONEY.
+
+The unit suite (`tests/test_ai_analyst.py`) covers everything that can be
+checked offline: what we hand the model, and what we accept back. It cannot
+cover the half that only exists on the wire -- whether the model id is real,
+whether the web-search tool type is accepted for it, what an SDK exception is
+actually called when a key is wrong, and whether a real model returns the JSON
+the panel expects. That is what this does.
+
+It is deliberately not part of pytest. It hits the provider, and each run is a
+billed request against the key in YOUR credential store.
+
+    python/.venv/Scripts/python.exe python/live_ai_check.py [TICKER] [--search]
+
+With no ticker it uses whatever Kalshi is currently trending, so the market is
+real, open, and has an event with siblings -- the shape the prompt is built for.
+--search adds the web-search tool regardless of the saved setting, because that
+is the request shape most likely to be rejected and least likely to be
+exercised by accident.
+"""
 import asyncio
 import json
 import os

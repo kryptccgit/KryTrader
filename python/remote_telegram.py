@@ -1,3 +1,20 @@
+"""Telegram transport: long polling.
+
+Simpler than Discord in every way — plain HTTPS, no gateway, no intents, and
+`getUpdates` blocks server-side so idle costs one held request rather than a
+poll loop. httpx is already a dependency, so this adds nothing to the build.
+
+── Pairing ─────────────────────────────────────────────────────────────────
+Discord has a stable user id you can read off your own profile and type into
+the app. Telegram does not really: the number you need is a CHAT id, most
+people cannot find it, and the obvious workaround — "accept the first person
+who messages the bot" — hands control to whoever finds the bot first.
+
+So the app shows a short code, you send `pair <code>` to your bot, and the chat
+id that used the code is bound. The code is single-use and expires in ten
+minutes; until one is claimed, the bot answers nothing to anyone. After
+pairing, every message from any other chat is dropped.
+"""
 from __future__ import annotations
 
 import asyncio

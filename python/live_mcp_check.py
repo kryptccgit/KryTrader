@@ -1,3 +1,21 @@
+"""LIVE check for the MCP server. Run by hand.
+
+Unit tests pin the rails with Kalshi stubbed out; this drives the real thing
+end to end, the way Claude Desktop or Codex would: it launches
+`service.py --mcp-stdio` as a child process (proving the early dispatch in
+service.py, the bridge, and the loopback listener), and calls the tools against
+LIVE Kalshi public data.
+
+It never places an order, paper or live. It records one forecast — into a
+scratch data directory, not your real one — and previews an order against it,
+expecting the edge gate to refuse a forecast that merely agrees with the market.
+
+The workbench phase runs the research, backtest and script tools against a
+COPY of your collected data (the installed app's database if there is one,
+else the dev one), so the numbers are real and nothing of yours is written.
+
+    python/.venv/Scripts/python.exe python/live_mcp_check.py
+"""
 from __future__ import annotations
 
 import asyncio
@@ -22,6 +40,8 @@ os.environ["KRYPT_TRADER_USERDATA"] = tempfile.mkdtemp(prefix="krypt-mcp-live-")
 
 
 def _copy_real_db() -> str:
+    """sqlite's backup API, not a file copy: the live app keeps the database in
+    WAL mode and a raw copy can miss the newest pages."""
     import sqlite3
     cands = [Path(os.environ.get("APPDATA", "")) / "Krypt Trader" / "data" / "krypt-trader.db",
              PY / "data" / "krypt-trader.db"]
@@ -61,6 +81,10 @@ def _free_port() -> int:
 
 
 class Bridge:
+    """The child process an MCP client would launch. Set KRYPT_BRIDGE_EXE to a
+    built krypt-trader-backend executable to test the PACKAGED bridge — the
+    path Claude Desktop actually launches."""
+
     def __init__(self, port: int, token: str):
         exe = os.environ.get("KRYPT_BRIDGE_EXE")
         cmd = ([exe] if exe else [sys.executable, str(PY / "service.py")])
@@ -134,7 +158,7 @@ async def main() -> int:
 
             err, st = b.tool("get_status")
             rec("get_status", not err and st.get("tradeMode") == "paper",
-                f"mode={st.get('tradeMode')} env={st.get('kalshiEnvironment')}")
+                f"mode={st.get('tradeMode')} account={st.get('accountMode')}")
 
             err, disc = b.tool("discover_markets", {"column": "closing", "limit": 15})
             rows = [] if err else disc["markets"]
@@ -217,6 +241,46 @@ async def main() -> int:
 
     try:
         await asyncio.to_thread(drive)
+    finally:
+        await mcp_server.stop()
+
+    cfg["mcp_http_enabled"] = True
+
+    def api(method: str, path: str, body: dict | None = None, tok: str | None = token):
+        import urllib.request
+        import urllib.error
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/v1{path}", method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={**({"Authorization": f"Bearer {tok}"} if tok else {}),
+                     "User-Agent": "live-check/1", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                return r.status, json.loads(r.read() or b"null")
+        except urllib.error.HTTPError as e:
+            return e.code, json.loads(e.read() or b"null")
+
+    await mcp_server.start(port)
+    try:
+        st, tl = await asyncio.to_thread(api, "GET", "/tools")
+        rec("http GET /tools", st == 200 and len(tl.get("tools", [])) > 5,
+            f"{st}, {len(tl.get('tools', [])) if isinstance(tl, dict) else tl} tools")
+        st, spec = await asyncio.to_thread(api, "GET", "/openapi.json")
+        rec("http openapi.json", st == 200 and "/api/v1/tools/place_order" in spec.get("paths", {}),
+            f"{st}, {len(spec.get('paths', {}))} paths")
+        st, disc = await asyncio.to_thread(api, "POST", "/tools/discover_markets",
+                                           {"column": "closing", "limit": 5})
+        rec("http discover_markets (live)", st == 200 and disc["ok"],
+            f"{st}, {len(disc.get('result', {}).get('markets', []))} markets")
+        t = (disc.get("result", {}).get("markets") or [{}])[0].get("ticker") or "KXNONE-1"
+        st, buy = await asyncio.to_thread(api, "POST", "/tools/place_order", {
+            "ticker": t, "side": "yes", "action": "buy", "count": 1, "price_cents": 50})
+        rec("http buy without forecast refused", st == 422 and "forecast_id" in buy.get("error", ""),
+            f"{st} {str(buy.get('error'))[:50]}")
+        st, _ = await asyncio.to_thread(api, "GET", "/tools", None, "kt_wrong")
+        rec("http wrong token refused", st == 401, str(st))
+        st, _ = await asyncio.to_thread(api, "POST", "/tools/no_such_tool", {})
+        rec("http unknown tool 404", st == 404, str(st))
     finally:
         await mcp_server.stop()
 

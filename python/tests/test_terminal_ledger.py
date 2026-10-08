@@ -1,3 +1,12 @@
+"""The manual ledger, and the wall between the operator and the bot.
+
+Before this, a hand-placed trade was invisible to the app: the 30s reconcile
+pass adopted it as an anonymous 'external' position, its P&L landed in the
+bot's win rate, and its mark-to-market bleed fed the bot's daily stop-loss —
+so a losing manual trade could halt the automation with nothing on screen
+saying why. These tests pin the fix from both sides: manual trades ARE
+recorded, and they are NOT counted as the bot's.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -12,9 +21,16 @@ import terminal
 
 @pytest.fixture()
 def conn(tmp_path, monkeypatch):
+    """A real schema on a throwaway file — these are SQL-shape assertions, so a
+    fake would only test the fake.
+
+    `db.db_path` is redirected (the project's convention) so the functions that
+    open their own connection via `get_db()` hit this file too, not the
+    developer's real trading database.
+    """
     path = tmp_path / "t.sqlite"
     monkeypatch.setattr(db, "db_path", lambda: path)
-    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "demo")
+    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "paper")
 
     c = sqlite3.connect(path)
     c.row_factory = sqlite3.Row
@@ -33,17 +49,18 @@ def _pos(conn, **over) -> int:
         "avg_fill_price_cents": 40.0, "cost_usd": 4.0,
         "client_order_id": f"c{over.get('signal_id', 1)}-{over.get('signal_source', 'whale')}",
         "kalshi_order_id": None, "status": "filled", "confidence": 0.0,
-        "edge_pts": 0.0, "signal_price": 0.0, "kalshi_env": "demo",
+        "edge_pts": 0.0, "signal_price": 0.0, "kalshi_env": "paper",
     }
     row.update(over)
     return db.insert_bot_position(conn, row)
+
 
 
 def test_manual_positions_do_not_eat_the_bots_open_slots(conn):
     _pos(conn, signal_source="whale", signal_id=1)
     _pos(conn, signal_source="manual", signal_id=2, ticker="KXT-2")
     _pos(conn, signal_source="external", signal_id=3, ticker="KXT-3")
-    assert db.count_open_bot_positions(conn, "demo") == 1
+    assert db.count_open_bot_positions(conn, "paper") == 1
 
 
 def test_manual_pnl_stays_out_of_the_bots_win_rate(conn):
@@ -56,7 +73,7 @@ def test_manual_pnl_stays_out_of_the_bots_win_rate(conn):
         "UPDATE bot_positions SET resolved=1, outcome_correct=0, pnl_usd=-99.0, "
         "resolved_at=datetime('now') WHERE signal_source='manual'")
 
-    stats = db.aggregate_stats(conn, "demo")
+    stats = db.aggregate_stats(conn, "paper")
     assert stats["wins"] == 1 and stats["losses"] == 0
     assert stats["realized_pnl"] == 6.0
     assert stats["today_pnl"] == 6.0
@@ -65,48 +82,50 @@ def test_manual_pnl_stays_out_of_the_bots_win_rate(conn):
 def test_a_losing_manual_trade_cannot_trip_the_bots_daily_stop(conn):
     _pos(conn, signal_source="manual", signal_id=1, cost_usd=50.0)
     conn.execute("UPDATE bot_positions SET mark_price_cents=1.0")
-    assert db.open_unrealized_pnl_usd(conn, "demo") == 0.0
+    assert db.open_unrealized_pnl_usd(conn, "paper") == 0.0
 
     _pos(conn, signal_source="momentum", signal_id=2, ticker="KXT-2", cost_usd=4.0)
     conn.execute(
         "UPDATE bot_positions SET mark_price_cents=10.0 WHERE signal_source='momentum'")
-    assert db.open_unrealized_pnl_usd(conn, "demo") == pytest.approx(-3.0)
+    assert db.open_unrealized_pnl_usd(conn, "paper") == pytest.approx(-3.0)
 
 
 def test_manual_money_still_counts_as_committed_capital(conn):
     _pos(conn, signal_source="manual", signal_id=1, cost_usd=25.0)
-    assert db.current_total_exposure_usd(conn, "demo") == pytest.approx(25.0)
+    assert db.current_total_exposure_usd(conn, "paper") == pytest.approx(25.0)
+
 
 
 def test_manual_positions_query_is_scoped_to_source_and_env(conn):
     _pos(conn, signal_source="manual", signal_id=1, ticker="KXA")
     _pos(conn, signal_source="manual", signal_id=2, ticker="KXB", kalshi_env="production")
     _pos(conn, signal_source="whale", signal_id=3, ticker="KXC")
-    rows = db.manual_positions(conn, "demo")
+    rows = db.manual_positions(conn, "paper")
     assert [r["ticker"] for r in rows] == ["KXA"]
 
 
 def test_finding_the_open_manual_row_is_what_stops_duplicate_positions(conn):
     _pos(conn, signal_source="manual", signal_id=1, ticker="KXA", direction="yes")
-    assert db.find_open_manual_position(conn, "KXA", "yes", "demo") is not None
-    assert db.find_open_manual_position(conn, "KXA", "no", "demo") is None
+    assert db.find_open_manual_position(conn, "KXA", "yes", "paper") is not None
+    assert db.find_open_manual_position(conn, "KXA", "no", "paper") is None
     assert db.find_open_manual_position(conn, "KXA", "yes", "production") is None
 
 
 def test_a_resolved_manual_row_is_not_reused_by_a_later_buy(conn):
     _pos(conn, signal_source="manual", signal_id=1, ticker="KXA")
     conn.execute("UPDATE bot_positions SET resolved=1")
-    assert db.find_open_manual_position(conn, "KXA", "yes", "demo") is None
+    assert db.find_open_manual_position(conn, "KXA", "yes", "paper") is None
 
 
 def test_bot_ownership_detects_only_the_engines_own_positions(conn):
     _pos(conn, signal_source="whale", signal_id=1, ticker="KXA", direction="yes")
     _pos(conn, signal_source="manual", signal_id=2, ticker="KXB", direction="yes")
     _pos(conn, signal_source="external", signal_id=3, ticker="KXC", direction="yes")
-    assert db.bot_owns_position(conn, "KXA", "yes", "demo") is True
-    assert db.bot_owns_position(conn, "KXB", "yes", "demo") is False
-    assert db.bot_owns_position(conn, "KXC", "yes", "demo") is False
-    assert db.bot_owns_position(conn, "KXA", "no", "demo") is False
+    assert db.bot_owns_position(conn, "KXA", "yes", "paper") is True
+    assert db.bot_owns_position(conn, "KXB", "yes", "paper") is False
+    assert db.bot_owns_position(conn, "KXC", "yes", "paper") is False
+    assert db.bot_owns_position(conn, "KXA", "no", "paper") is False
+
 
 
 def _trade(cents: float, won: bool, *, early: bool = False, pnl: float = 1.0) -> dict:
@@ -120,6 +139,7 @@ def _trade(cents: float, won: bool, *, early: bool = False, pnl: float = 1.0) ->
 
 
 def _buckets(trades: list[dict]) -> dict:
+    """Run just the bucketing half of manual_history over supplied trades."""
     calibratable = [t for t in trades if not t["closedEarly"]]
     out = {}
     for lo in range(0, 100, 10):
@@ -166,6 +186,7 @@ def test_the_manual_signal_id_is_collision_resistant():
     assert all(0 <= i < 2_000_000_000 for i in ids)
 
 
+
 def _buy(**over) -> int | None:
     args = dict(
         ticker="KXA-1", side="yes", count=10, price_cents=40.0,
@@ -180,7 +201,7 @@ def _buy(**over) -> int | None:
 def test_a_manual_buy_claims_the_ticker_so_the_reconciler_leaves_it_alone(conn):
     pid = _buy()
     assert pid is not None
-    assert db.find_open_manual_position(conn, "KXA-1", "yes", "demo") is not None
+    assert db.find_open_manual_position(conn, "KXA-1", "yes", "paper") is not None
 
     row = db.fetch_position_by_id(conn, pid)
     assert row["signal_source"] == "manual"
@@ -194,7 +215,7 @@ def test_a_second_buy_on_the_same_side_adds_to_the_row_rather_than_duplicating(c
     first = _buy()
     second = _buy(client_order_id="krypt-term-def", order_id="ord-2", count=5, filled=5)
     assert first == second
-    rows = db.manual_positions(conn, "demo")
+    rows = db.manual_positions(conn, "paper")
     assert len(rows) == 1
     assert rows[0]["target_contracts"] == 15
     assert rows[0]["filled_contracts"] == 15
@@ -204,7 +225,7 @@ def test_the_other_side_of_the_same_market_is_a_separate_position(conn):
     _buy(side="yes")
     other = _buy(side="no", client_order_id="krypt-term-no", order_id="ord-3")
     assert other is not None
-    assert len(db.manual_positions(conn, "demo")) == 2
+    assert len(db.manual_positions(conn, "paper")) == 2
 
 
 def test_a_sub_cent_limit_is_preserved_somewhere_readable(conn):
@@ -227,7 +248,8 @@ def test_an_unfilled_buy_is_recorded_as_resting_not_as_filled(conn):
 
 
 def _sell(monkeypatch, *, sold, avg_cents, **over):
-    async def fake_fills(order_id, side):
+    """Run a manual sell with the venue's fill ledger stubbed."""
+    async def fake_fills(order_id, side, pin_env=None):
         return sold, avg_cents
     monkeypatch.setattr(terminal, "_reconcile_fills", fake_fills)
     args = dict(ticker="KXA-1", side="yes", count=sold or 0, price_cents=55.0,
@@ -278,7 +300,7 @@ def test_a_partial_sale_shrinks_the_position_and_its_basis(conn, monkeypatch):
 
 def test_selling_something_the_terminal_never_bought_is_not_an_error(conn, monkeypatch):
     _sell(monkeypatch, sold=1, avg_cents=50.0, ticker="KXZ-9")
-    assert db.manual_positions(conn, "demo") == []
+    assert db.manual_positions(conn, "paper") == []
 
 
 def test_a_sold_out_position_is_invisible_to_the_bots_orphan_close(conn, monkeypatch):

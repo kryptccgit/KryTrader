@@ -35,6 +35,7 @@ def _value_msg(index_id="BRTI", value="68000.12", *, settle=None):
 
 
 
+
 def test_index_mapping():
     assert cf_ws._index_to_asset("BRTI") == "BTC"
     assert cf_ws._index_to_asset("ETHUSD_RTI") == "ETH"
@@ -75,6 +76,7 @@ def test_stale_values_not_served():
     c.values["BTC"] = (time.time() - 60.0, 68000.0)
     assert c.spot("BTC") is None
     assert c.fresh_spots() == {}
+
 
 
 
@@ -119,6 +121,7 @@ def test_kalshi_ws_omits_cf_channel_when_disabled():
 
 
 
+
 def test_settle_partial_matches_window_and_returns_sum_count():
     c = _fresh_client()
     close = time.time() + 30
@@ -139,6 +142,7 @@ def test_settle_partial_goes_stale():
     close = time.time() + 30
     c.settle["BTC"] = (time.time() - 30.0, 68010.5, 30, (close - 30) * 1000)
     assert c.settle_partial("BTC", close) == (0.0, 0)
+
 
 
 
@@ -197,6 +201,7 @@ def test_active_tickers_reads_snapshot_cache(monkeypatch):
     assert crypto15m.active_tickers() == {"KXBTC15M-A", "KXETH15M-B"}
     monkeypatch.setitem(crypto15m._snapshot_cache, "data", None)
     assert crypto15m.active_tickers() == set()
+
 
 
 

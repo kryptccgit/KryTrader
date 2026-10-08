@@ -53,7 +53,7 @@ export function MultiRunPanel({ onClose }: { onClose: () => void }) {
       try {
         const s = await window.krypt?.crypto15m?.status();
         if (alive && s) setStatus(s);
-      } catch {  }
+      } catch {}
     };
     tick();
     const iv = setInterval(tick, 4000);
@@ -73,6 +73,20 @@ export function MultiRunPanel({ onClose }: { onClose: () => void }) {
 
   const patch = (id: string, p: Partial<Crypto15mRunner>) =>
     persist(runners.map((r) => (r.id === id ? { ...r, ...p } : r)));
+
+  const realNow = !!config?.crypto15mEnabled && !!config?.crypto15mLive
+    && config?.accountMode === 'live';
+
+  const patchGuarded = (r: Crypto15mRunner, p: Partial<Crypto15mRunner>) => {
+    const next = { ...r, ...p };
+    const goesReal = realNow && next.enabled && next.mode === 'live'
+      && !(r.enabled && r.mode === 'live');
+    if (goesReal && !window.confirm(
+      `Runner "${next.name}" will place REAL orders with your Kalshi `
+      + 'balance as soon as it sees a signal. Continue?',
+    )) return;
+    patch(r.id, p);
+  };
 
   const addRunner = (seed?: Partial<Crypto15mRunner>) => {
     const id = newId();
@@ -102,7 +116,8 @@ export function MultiRunPanel({ onClose }: { onClose: () => void }) {
   };
 
   const masterOn = !!config?.crypto15mEnabled;
-  const anyLiveEnabled = runners.some((r) => r.enabled && r.mode === 'live');
+  const liveEnabled = runners.filter((r) => r.enabled && r.mode === 'live');
+  const paperMode = config?.accountMode !== 'live';
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/70 p-6 backdrop-blur-sm" onClick={onClose}>
@@ -152,12 +167,26 @@ export function MultiRunPanel({ onClose }: { onClose: () => void }) {
               </button>
             </div>
           )}
-          {anyLiveEnabled && (
-            <div className="flex items-center gap-2 rounded-lg border border-krypt-win/40 bg-krypt-win/10 px-4 py-2.5 text-sm text-krypt-win">
+          {liveEnabled.length > 0 && (realNow ? (
+            <div className="flex items-center gap-2 rounded-lg border border-krypt-loss/40 bg-krypt-loss/10 px-4 py-2.5 text-sm text-krypt-loss">
               <AlertTriangle className="h-4 w-4 shrink-0" />
-              At least one runner is LIVE — it can place real orders on your {config?.kalshiEnv ?? 'demo'} account.
+              {liveEnabled.length} runner{liveEnabled.length === 1 ? ' is' : 's are'} LIVE — placing real
+              orders on your real Kalshi account. Turning off 15m &ldquo;Real orders (LIVE)&rdquo; (or Stop 15m
+              in the banner) stops every one of them.
             </div>
-          )}
+          ) : (
+            <div className="flex items-center gap-2 rounded-lg border border-krypt-warn/40 bg-krypt-warn/10 px-4 py-2.5 text-sm text-krypt-warn">
+              <AlertTriangle className="h-4 w-4 shrink-0" />
+              {paperMode
+                ? `${liveEnabled.length} runner${liveEnabled.length === 1 ? ' is' : 's are'} set to LIVE. The app is in Paper, so ${liveEnabled.length === 1 ? 'it trades' : 'they trade'} the paper simulation until you Go live.`
+                : `${liveEnabled.length} runner${liveEnabled.length === 1 ? ' is' : 's are'} set to LIVE but place nothing (not even paper) `}
+              {paperMode
+                ? null
+                : !config?.crypto15mLive
+                  ? '— the 15m “Real orders (LIVE)” switch is off. Arm it on the 15m Crypto page to let them trade.'
+                  : '— the 15m engine is off.'}
+            </div>
+          ))}
 
           {runners.length === 0 && (
             <div className="rounded-xl border border-dashed border-krypt-border bg-krypt-surface/40 px-5 py-8 text-center">
@@ -204,7 +233,7 @@ export function MultiRunPanel({ onClose }: { onClose: () => void }) {
                     {(['paper', 'live'] as const).map((m) => (
                       <button
                         key={m}
-                        onClick={() => patch(r.id, { mode: m })}
+                        onClick={() => patchGuarded(r, { mode: m })}
                         className={cls(
                           'px-3 py-1.5 uppercase tracking-wide transition-colors',
                           r.mode === m
@@ -216,7 +245,22 @@ export function MultiRunPanel({ onClose }: { onClose: () => void }) {
                       </button>
                     ))}
                   </div>
-                  <Switch checked={r.enabled} onChange={(v) => patch(r.id, { enabled: v })} />
+                  {r.enabled && r.mode === 'live' && (
+                    <span
+                      className={cls(
+                        'rounded px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide',
+                        realNow ? 'bg-krypt-loss/15 text-krypt-loss' : 'bg-krypt-warn/10 text-krypt-warn',
+                      )}
+                      title={realNow
+                        ? 'This runner places real orders on your real Kalshi account.'
+                        : paperMode
+                          ? 'The app is in Paper: this runner trades the paper simulation until you Go live.'
+                          : 'Set to live, but the 15m master switch or engine means it places nothing.'}
+                    >
+                      {realNow ? 'Real orders' : paperMode ? 'Paper (app in Paper)' : 'Waiting for 15m LIVE'}
+                    </span>
+                  )}
+                  <Switch checked={r.enabled} onChange={(v) => patchGuarded(r, { enabled: v })} />
                   <button onClick={() => toggleExpanded(r.id)} title="Bet size, stop-loss, take-profit…" className={cls('rounded-lg p-1.5 hover:bg-white/5 hover:text-white', expanded.has(r.id) ? 'text-krypt-purple' : 'text-krypt-muted')}><SlidersHorizontal className="h-4 w-4" /></button>
                   <button onClick={() => duplicate(r)} title="Duplicate" className="rounded-lg p-1.5 text-krypt-muted hover:bg-white/5 hover:text-white"><Copy className="h-4 w-4" /></button>
                   <button onClick={() => remove(r.id)} title="Remove" className="rounded-lg p-1.5 text-krypt-muted hover:bg-white/5 hover:text-krypt-loss"><Trash2 className="h-4 w-4" /></button>
@@ -328,7 +372,7 @@ export function MultiRunPanel({ onClose }: { onClose: () => void }) {
         </div>
 
         <div className="border-t border-krypt-border px-5 py-3 text-[11px] text-krypt-dim">
-          Paper runners simulate fills against live quotes through the same gates as live — a zero-risk preview. The account-wide daily stop-loss / take-profit still governs every live runner together.
+          Paper runners simulate fills against live quotes through the same gates as live — a zero-risk preview. A LIVE runner places real orders only while the 15m &ldquo;Real orders (LIVE)&rdquo; switch is on, with the app in Live; that switch stops every runner at once, and in Paper every runner trades paper. The account-wide daily stop-loss / take-profit still governs every live runner together.
         </div>
       </div>
       {showLibrary && <TurbineLibrary onClose={() => setShowLibrary(false)} onAdd={addFromLibrary} />}

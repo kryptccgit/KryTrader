@@ -2,9 +2,9 @@ import { contextBridge, ipcRenderer } from 'electron';
 import type {
   AccountSnapshot, ActionResult, AppState, BackendInfo, BotPosition, CredentialsInput,
   CredentialsState, KryptApi, LogEntry, PnlPoint, PositionFilter, Profile,
-  ScannerStats, SignalFilter, SignalRow, StrategyPreset, TraderConfig,
+  ScannerStats, SignalFilter, SignalRow, TraderConfig,
 } from '../shared/types';
-import type { McpTradeMode } from '../shared/market';
+import type { McpToolCallEvent, McpTradeMode } from '../shared/market';
 
 const sub = <T>(channel: string, cb: (val: T) => void): (() => void) => {
   const handler = (_e: unknown, val: T) => cb(val);
@@ -16,11 +16,13 @@ const api: KryptApi = {
   app: {
     version: () => ipcRenderer.invoke('app:version'),
     openExternal: (url) => ipcRenderer.invoke('app:openExternal', url),
-    showItemInFolder: (p) => ipcRenderer.invoke('app:showItemInFolder', p),
+    openUserDataFolder: () => ipcRenderer.invoke('app:openUserDataFolder'),
     getUserDataPath: () => ipcRenderer.invoke('app:getUserDataPath'),
+    quit: () => ipcRenderer.invoke('app:quit'),
     getReferralUrl: () => ipcRenderer.invoke('app:getReferralUrl'),
     factoryReset: () => ipcRenderer.invoke('app:factoryReset'),
     onDataReset: (cb) => sub<unknown>('data:reset', cb),
+    onNavigate: (cb) => sub<string>('app:navigate', cb),
   },
   state: {
     get: (): Promise<AppState> => ipcRenderer.invoke('state:get'),
@@ -29,15 +31,12 @@ const api: KryptApi = {
     setStartWithWindows: (v) => ipcRenderer.invoke('state:setStartWithWindows', v),
     setEnableDiscordRpc: (v) => ipcRenderer.invoke('state:setEnableDiscordRpc', v),
     acceptDisclaimer: () => ipcRenderer.invoke('state:acceptDisclaimer'),
+    markOnboardingSeen: () => ipcRenderer.invoke('state:markOnboardingSeen'),
   },
   config: {
     get: (): Promise<TraderConfig> => ipcRenderer.invoke('config:get'),
     update: (patch) => ipcRenderer.invoke('config:update', patch),
-    replace: (cfg) => ipcRenderer.invoke('config:replace', cfg),
     reset: () => ipcRenderer.invoke('config:reset'),
-    listStrategies: (): Promise<StrategyPreset[]> =>
-      ipcRenderer.invoke('config:listStrategies'),
-    applyStrategy: (id) => ipcRenderer.invoke('config:applyStrategy', id),
   },
   profiles: {
     list: (): Promise<Profile[]> => ipcRenderer.invoke('profiles:list'),
@@ -54,9 +53,13 @@ const api: KryptApi = {
     status: (): Promise<CredentialsState> => ipcRenderer.invoke('credentials:status'),
     statusAll: () => ipcRenderer.invoke('credentials:statusAll'),
     save: (input: CredentialsInput) => ipcRenderer.invoke('credentials:save', input),
-    test: (env?: string) => ipcRenderer.invoke('credentials:test', env),
-    clear: (env?: string) => ipcRenderer.invoke('credentials:clear', env),
+    test: () => ipcRenderer.invoke('credentials:test'),
+    clear: () => ipcRenderer.invoke('credentials:clear'),
     onChanged: (cb) => sub<unknown>('credentials:changed', cb),
+  },
+  paper: {
+    status: () => ipcRenderer.invoke('paper:status'),
+    reset: () => ipcRenderer.invoke('paper:reset'),
   },
   backend: {
     info: (): Promise<BackendInfo> => ipcRenderer.invoke('backend:info'),
@@ -76,7 +79,7 @@ const api: KryptApi = {
     flatten: () => ipcRenderer.invoke('trading:flatten'),
   },
   data: {
-    account: (): Promise<AccountSnapshot> => ipcRenderer.invoke('data:account'),
+    account: (): Promise<AccountSnapshot | null> => ipcRenderer.invoke('data:account'),
     pnlSeries: (sinceHours?: number): Promise<PnlPoint[]> =>
       ipcRenderer.invoke('data:pnlSeries', sinceHours),
     positions: (filter?: PositionFilter): Promise<BotPosition[]> =>
@@ -154,17 +157,25 @@ const api: KryptApi = {
     setWatched: (args) => ipcRenderer.invoke('terminal:setWatched', args),
     aiStatus: () => ipcRenderer.invoke('ai:status'),
     aiSetKey: (args) => ipcRenderer.invoke('ai:setKey', args),
+    aiCheckProvider: (args) => ipcRenderer.invoke('ai:checkProvider', args),
     aiAnalyze: (args) => ipcRenderer.invoke('ai:analyze', args),
     aiScoreboard: () => ipcRenderer.invoke('ai:scoreboard'),
     mcpStatus: () => ipcRenderer.invoke('mcp:status'),
-    mcpRotateToken: () => ipcRenderer.invoke('mcp:rotateToken'),
+    mcpRotateToken: (args) => ipcRenderer.invoke('mcp:rotateToken', args),
     mcpCopyConfig: (args) => ipcRenderer.invoke('mcp:copyConfig', args),
+    mcpCopyHttpSnippet: (args) => ipcRenderer.invoke('mcp:copyHttpSnippet', args),
+    mcpInstallConfig: (args) => ipcRenderer.invoke('mcp:installConfig', args),
+    mcpOpenConfigFolder: (args) => ipcRenderer.invoke('mcp:openConfigFolder', args),
+    agentsClosePaper: (args) => ipcRenderer.invoke('agents:closePaper', args),
+    healthCheck: (args) => ipcRenderer.invoke('health:check', args),
     mcpActivity: (args) => ipcRenderer.invoke('mcp:activity', args),
     mcpPaperReset: () => ipcRenderer.invoke('mcp:paperReset'),
     mcpDecide: (args) => ipcRenderer.invoke('mcp:decide', args),
     autopilotStatus: () => ipcRenderer.invoke('autopilot:status'),
     autopilotRunNow: () => ipcRenderer.invoke('autopilot:runNow'),
     onMcpOrder: (cb) => sub<{ mode: McpTradeMode | 'action'; message: string }>('mcp:order', cb),
+    mcpSeen: () => ipcRenderer.invoke('mcp:seen'),
+    onMcpToolCall: (cb) => sub<McpToolCallEvent>('mcp:toolCall', cb),
   },
   logs: {
     tail: (limit?: number): Promise<LogEntry[]> => ipcRenderer.invoke('logs:tail', limit),
@@ -179,6 +190,8 @@ const api: KryptApi = {
     close: () => ipcRenderer.send('window:close'),
     isMaximized: () => ipcRenderer.invoke('window:isMaximized'),
     onMaximizeChange: (cb) => sub<boolean>('window:maximizeChange', cb),
+    isVisible: () => ipcRenderer.invoke('window:isVisible'),
+    onVisibility: (cb) => sub<boolean>('window:visibility', cb),
   },
 };
 

@@ -22,6 +22,8 @@ import { TradeTicket } from '../components/terminal/TradeTicket';
 import { useTerminal, usePoll } from '../state/TerminalProvider';
 import { useToast } from '../state/ToastProvider';
 import { cls } from '../utils/format';
+import { publishActivity } from '../state/activity';
+import { userMessage } from '../utils/errors';
 
 export function TerminalMarketPage({
   ticker, onNav,
@@ -74,10 +76,14 @@ export function TerminalMarketPage({
         count: position.contracts,
         priceCents: Math.max(1, exitBid - 1),
       });
+      publishActivity(() => ({
+        kind: 'manualOrder', op: 'close', ok: res.ok, ticker, side: position.side, action: 'sell',
+        status: res.status, filled: res.filledContracts, avgCents: res.avgFillCents, message: res.message,
+      }));
       toast.push(res.message, res.ok ? 'success' : 'error', 9000);
       if (res.ok) reload();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     } finally {
       setCloseBusy(false);
     }
@@ -155,7 +161,7 @@ export function TerminalMarketPage({
 
       {data.errors.length > 0 && (
         <Caveat className="mb-3">
-          {data.errors.map((e) => `The ${e.panel} panel failed: ${e.message}`).join(' ')}
+          {data.errors.map((e) => `The ${e.panel} panel failed: ${userMessage(e.message)}`).join(' ')}
           {' '}Everything else on this page loaded normally.
         </Caveat>
       )}
@@ -231,7 +237,7 @@ export function TerminalMarketPage({
             {tab === 'micro' && <MicrostructurePanel ticker={ticker} />}
             {tab === 'venues' && <CrossVenue ticker={ticker} />}
             {tab === 'siblings' && <Siblings detail={data} />}
-            {tab === 'ai' && <AiAnalysis ticker={ticker} onNav={onNav} />}
+            {tab === 'ai' && <AiAnalysis ticker={ticker} title={m.title} onNav={onNav} />}
           </Card>
         </div>
 
@@ -403,10 +409,17 @@ function RestingOrders({
     setBusy(id);
     try {
       const res = await window.krypt.terminal.cancel({ orderId: id });
+      publishActivity(() => {
+        const o = orders.find((x) => x.orderId === id);
+        return {
+          kind: 'manualOrder', op: 'cancel', ok: res.ok, ticker: o?.ticker ?? null, side: o?.side ?? null,
+          action: o?.action ?? null, status: res.status, filled: null, avgCents: null, message: res.message,
+        };
+      });
       toast.push(res.message, res.ok ? 'success' : 'error');
       if (res.ok) onChanged();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     } finally {
       setBusy(null);
     }
@@ -420,7 +433,7 @@ function RestingOrders({
           className="flex items-center gap-2 rounded-lg border border-krypt-border bg-krypt-surface2/40 px-2.5 py-2 text-[11px]"
         >
           <SidePill side={o.side} />
-          <span className="text-krypt-muted">{o.action ?? <Unknown />}</span>
+          <span className="text-krypt-muted">{o.action}</span>
           <span className="font-mono text-white">
             {o.remaining ?? o.count ?? <Unknown />}
           </span>

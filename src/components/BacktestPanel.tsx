@@ -2,6 +2,8 @@ import { useState } from 'react';
 import { FlaskConical } from 'lucide-react';
 import type { Crypto15mBacktest } from '@shared/types';
 import { cls, fmtUsd } from '../utils/format';
+import { backtestEvent, publishActivity } from '../state/activity';
+import { userMessage } from '../utils/errors';
 
 export function BacktestPanel() {
   const [busy, setBusy] = useState(false);
@@ -15,8 +17,9 @@ export function BacktestPanel() {
       const r = await window.krypt.crypto15m.backtest({ sinceDays: 60 });
       setRes(r);
       if (!r) setErr('Engine not running — start the app backend first.');
+      publishActivity(() => backtestEvent('15m', 'current settings', 60, r));
     } catch (e: any) {
-      setErr(e?.message || String(e));
+      setErr(userMessage(e));
     } finally {
       setBusy(false);
     }

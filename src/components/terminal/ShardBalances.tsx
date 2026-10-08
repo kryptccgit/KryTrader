@@ -3,9 +3,11 @@ import { createPortal } from 'react-dom';
 import {
   AlertTriangle, ArrowLeftRight, ArrowRight, ExternalLink, Wallet,
 } from 'lucide-react';
-import { ConfirmDialog } from '../common';
+import { ConfirmDialog, NumberInput } from '../common';
 import { useToast } from '../../state/ToastProvider';
+import { useApp } from '../../state/AppStateProvider';
 import { cls } from '../../utils/format';
+import { userMessage } from '../../utils/errors';
 
 export interface ShardCash {
   index: number;
@@ -52,7 +54,7 @@ function useShardTransfer(shards: ShardCash[], onDone?: () => void) {
       }
       onDone?.();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     } finally {
       setBusy(false);
     }
@@ -181,6 +183,38 @@ function TransferConfirm({ t }: { t: Transfer }) {
   ), document.body);
 }
 
+function AutoMoveRow() {
+  const { config, refresh } = useApp();
+  if (!config) return null;
+  const on = config.shardAutoMove !== false;
+  const cap = config.shardAutoMoveMaxUsdDay ?? 1000;
+  const save = (patch: Partial<typeof config>) =>
+    void window.krypt.config.update(patch as never).then(() => refresh.state());
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5 border-t border-krypt-border pt-2 text-[11px]">
+      <label className="flex cursor-pointer items-center gap-2">
+        <input type="checkbox" checked={on} onChange={(e) => save({ shardAutoMove: e.target.checked })} />
+        <span className="text-white">Move funds for live orders automatically</span>
+      </label>
+      {on && (
+        <span className="flex items-center gap-1.5 text-krypt-dim">
+          up to
+          <span className="w-24">
+            <NumberInput prefix="$" min={1} max={10_000_000} value={cap}
+              onChange={(v) => save({ shardAutoMoveMaxUsdDay: v })} />
+          </span>
+          a day, with your AI agents' moves
+        </span>
+      )}
+      <span className="basis-full text-[10px] leading-relaxed text-krypt-muted">
+        {on
+          ? "Before a live buy, if its market's exchange can't cover it, the app moves just the shortfall from the exchange with the most cash. The money stays in your account."
+          : 'Off: an order on an exchange without enough cash is refused by Kalshi until you move funds yourself.'}
+      </span>
+    </div>
+  );
+}
+
 export function ShardBalances({
   shards, transferUrl, onDone, className,
 }: {
@@ -189,6 +223,8 @@ export function ShardBalances({
   onDone?: () => void;
   className?: string;
 }) {
+  const { config } = useApp();
+  const autoMoveOn = config?.shardAutoMove !== false;
   const t = useShardTransfer(shards, onDone);
   const [open, setOpen] = useState(false);
   const { sorted } = t;
@@ -196,6 +232,7 @@ export function ShardBalances({
   if (sorted.length < 2) return null;
 
   const anyEmpty = sorted.some((s) => s.cashUsd <= 0);
+  const auto = autoMoveOn;
 
   return (
     <div className={cls('rounded-xl border border-krypt-border bg-krypt-surface px-3 py-2', className)}>
@@ -222,7 +259,7 @@ export function ShardBalances({
         </button>
       </div>
 
-      {anyEmpty && !open && (
+      {anyEmpty && !open && !auto && (
         <div className="mt-1.5 flex items-start gap-1.5 text-[10px] leading-relaxed text-krypt-muted">
           <AlertTriangle className="mt-px h-3 w-3 shrink-0 text-krypt-warn" />
           <span>
@@ -232,6 +269,8 @@ export function ShardBalances({
           </span>
         </div>
       )}
+
+      <AutoMoveRow />
 
       {open && (
         <div className="mt-2 border-t border-krypt-border pt-2">
@@ -311,7 +350,7 @@ export function ShardStrip({
       </button>
 
       {open && (
-        <div className="absolute right-0 top-full z-40 mt-2 w-[26rem] rounded-xl border border-krypt-border bg-krypt-surface p-3 shadow-krypt-soft">
+        <div className="absolute right-0 top-full z-40 mt-2 w-[26rem] rounded-2xl border border-white/10 bg-[rgba(17,16,28,0.96)] p-3 shadow-[inset_0_1px_0_rgba(255,255,255,0.08),0_24px_48px_-20px_rgba(0,0,0,0.9)]">
           <div className="mb-2 flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-krypt-muted">
             <Wallet className="h-3.5 w-3.5" />
             Move cash between exchanges

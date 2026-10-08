@@ -76,7 +76,7 @@ def test_credentials_encrypted_at_rest(tmp_path, monkeypatch):
 
     monkeypatch.setenv("KRYPT_TRADER_USERDATA", str(tmp_path))
     ka.reset_credential_cache()
-    ka.set_env("demo")
+    ka.set_env("production")
 
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     pem = key.private_bytes(
@@ -85,84 +85,14 @@ def test_credentials_encrypted_at_rest(tmp_path, monkeypatch):
         encryption_algorithm=serialization.NoEncryption(),
     ).decode("utf-8")
 
-    ka.save_credentials("my-api-key-uuid", pem, "demo")
+    ka.save_credentials("my-api-key-uuid", pem)
 
     assert ka._load_api_key() == "my-api-key-uuid"
     assert ka._load_private_key() is not None
 
-    raw = ka._env_api_key_file("demo").read_bytes()
+    raw = ka._env_api_key_file("production").read_bytes()
     if ka._dpapi_available():
         assert raw.startswith(ka._DPAPI_MARKER)
         assert b"my-api-key-uuid" not in raw
 
     ka.reset_credential_cache()
-
-
-def _pkcs8_pem(key) -> str:
-    from cryptography.hazmat.primitives import serialization
-    return key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    ).decode("utf-8")
-
-
-def test_ed25519_key_saves_and_signs(tmp_path, monkeypatch):
-    # Kalshi's web app has generated Ed25519 keys by default since 2026-10-01;
-    # an RSA-only loader refused every new user's key.
-    import base64
-    from cryptography.hazmat.primitives.asymmetric import ed25519
-
-    monkeypatch.setenv("KRYPT_TRADER_USERDATA", str(tmp_path))
-    ka.reset_credential_cache()
-    ka.set_env("demo")
-    monkeypatch.setattr(ka, "now_ms", lambda: 1700000000000)
-
-    key = ed25519.Ed25519PrivateKey.generate()
-    ka.save_credentials("ed-key-uuid", _pkcs8_pem(key), "demo")
-
-    h = ka.sign_headers("get", "/trade-api/v2/portfolio/balance")
-    assert h["KALSHI-ACCESS-KEY"] == "ed-key-uuid"
-    # Same pre-sign text as RSA, signed directly: verify() raises on mismatch.
-    key.public_key().verify(
-        base64.b64decode(h["KALSHI-ACCESS-SIGNATURE"]),
-        b"1700000000000GET/trade-api/v2/portfolio/balance",
-    )
-
-    st = ka.credentials_status("demo")
-    assert st["hasRsaKey"] and st["keyType"] == "ed25519"
-    assert len(st["fingerprint"]) == 8
-    ka.reset_credential_cache()
-
-
-def test_rsa_key_still_signs_pss(tmp_path, monkeypatch):
-    import base64
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import padding, rsa
-
-    monkeypatch.setenv("KRYPT_TRADER_USERDATA", str(tmp_path))
-    ka.reset_credential_cache()
-    ka.set_env("demo")
-    monkeypatch.setattr(ka, "now_ms", lambda: 1700000000000)
-
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    ka.save_credentials("rsa-key-uuid", _pkcs8_pem(key), "demo")
-    h = ka.sign_headers("GET", "/trade-api/v2/portfolio/balance")
-    key.public_key().verify(
-        base64.b64decode(h["KALSHI-ACCESS-SIGNATURE"]),
-        b"1700000000000GET/trade-api/v2/portfolio/balance",
-        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=hashes.SHA256().digest_size),
-        hashes.SHA256(),
-    )
-    assert ka.credentials_status("demo")["keyType"] == "rsa"
-    ka.reset_credential_cache()
-
-
-def test_other_key_types_are_refused(tmp_path, monkeypatch):
-    from cryptography.hazmat.primitives.asymmetric import ec
-
-    monkeypatch.setenv("KRYPT_TRADER_USERDATA", str(tmp_path))
-    ka.reset_credential_cache()
-    key = ec.generate_private_key(ec.SECP256R1())
-    with pytest.raises(ValueError, match="RSA or Ed25519"):
-        ka.save_credentials("x", _pkcs8_pem(key), "demo")

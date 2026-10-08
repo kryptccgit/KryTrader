@@ -3,6 +3,7 @@ import { HelpCircle } from 'lucide-react';
 import type { DataSource, MarketSummary, SourcedField } from '@shared/market';
 import { cls } from '../../utils/format';
 
+
 const SOURCE_LABEL: Record<DataSource, string> = {
   'kalshi-ws': 'our own websocket feed, timestamped when this machine received it',
   'kalshi-rest': 'a REST read from Kalshi, made for this view',
@@ -126,8 +127,7 @@ export function Caveat({ children, className }: { children: ReactNode; className
 
 export function SidePill({
   side, className,
-}: { side: 'yes' | 'no' | null; className?: string }) {
-  if (side === null) return <Unknown why="Kalshi did not say which side this order is on." className={className} />;
+}: { side: 'yes' | 'no'; className?: string }) {
   return (
     <span
       className={cls(

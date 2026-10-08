@@ -1,3 +1,19 @@
+"""Translate the scraped Turbine strategy library into KrypTrader configs.
+
+Each Turbine strategy (python/data/research/turbine_strategies.json) is mapped by
+ARCHETYPE into our directional rule vocabulary — YES-side rules (buy up) and
+NO-side rules (buy down) over the fields the recorder now computes
+(priceVsVwapPct, change5mPct/change15mPct, velocity1mPct, ema12VsSma20Pct,
+ema1VsSma5Pct, upAsk/downAsk, upProb/downProb). The result is a crypto15m config
+slice that `replay.replay` can backtest on OUR recorded data and that Multi-Run
+can run live.
+
+Honesty: this is a best-effort translation of Turbine's natural-language rules,
+not a bit-exact port. Turbine's mid-window sell-to-close exits are NOT modeled
+(our backtest holds to settlement), and price bands are applied as an ENTRY
+window on the bought side. Archetypes that need stateful entry tracking
+(panic_fade) or simultaneous both-side entries (dual_side) are skipped.
+"""
 from __future__ import annotations
 
 import json
@@ -26,11 +42,13 @@ def _lt(field: str, v: float) -> dict:
 
 
 def _change_field(lookback_min: Optional[float]) -> str:
+    """We only record change5mPct and change15mPct; snap a lookback to nearest."""
     lb = float(lookback_min or 5)
     return "change15mPct" if lb > 10 else "change5mPct"
 
 
 def _price_band_rules(side: str, band: Optional[list]) -> list[dict]:
+    """Gate the bought side's ask into Turbine's price window."""
     if not band or len(band) != 2:
         return []
     ask = "upAsk" if side == "up" else "downAsk"
@@ -39,6 +57,8 @@ def _price_band_rules(side: str, band: Optional[list]) -> list[dict]:
 
 
 def import_strategy(s: dict) -> Optional[dict]:
+    """Map one library entry to a crypto15m config slice, or None if the
+    archetype can't be expressed in our per-tick rule vocabulary."""
     arch = str(s.get("archetype") or "").lower()
     ind = s.get("indicators") or {}
     band = s.get("priceBand")
@@ -136,6 +156,9 @@ _HOUSE = [
 
 
 def import_all(path: str = _LIB_PATH) -> tuple[list[dict], list[dict]]:
+    """Returns (imported, skipped). Each imported item:
+    {name, asset, archetype, turbine, config}. House settlement-edge strategies
+    are prepended (the measured-edge class)."""
     imported: list[dict] = [dict(h) for h in _HOUSE]
     skipped: list[dict] = []
     for s in load_library(path):

@@ -1,3 +1,4 @@
+"""Generated parameter-sweep corpus for the Coin Optimizer."""
 from __future__ import annotations
 
 import strategy_generator as g

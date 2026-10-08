@@ -1,3 +1,6 @@
+"""perps_ws: wire-frame parsing into micro-units, drain semantics, sub
+ACK/NAK bookkeeping, buffer caps, reconnect state. Frames are driven as raw
+dicts through _handle (test_kalshi_ws pattern) — no sockets."""
 from __future__ import annotations
 
 import pytest

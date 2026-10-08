@@ -1,3 +1,33 @@
+"""CF Benchmarks value feed state — the EXACT settlement index, pushed live.
+
+Kalshi's crypto up/down markets settle on a 60-second average of the CF
+Benchmarks Real-Time Index, and Kalshi's own WebSocket exposes that index as
+the `cfbenchmarks_value` CHANNEL on the standard trade-api socket (see
+docs.kalshi.com/asyncapi.yaml). Each ~1/sec tick carries:
+
+  * the raw index frame (the true "spot" Kalshi settles against),
+  * `avg_60s_data`: the trailing 60s average, per tick, and
+  * `last_60s_windowed_average_15min`: the settlement value being computed
+    live, with its `window_size` = "how many settlement prints are already in".
+
+    OBSERVED (2026-07-15, 3 consecutive windows, all 7 assets, identical):
+    Kalshi does NOT publish this frame across the whole final minute — it
+    first appears only ~15s before the close and its `window_size` reaches
+    just ~15 by settlement (ramping +1/sec from ~1 at close-15s), NOT 60.
+    So this exact number is live for only the last ~15s of a window; before
+    that, `settle_partial` returns (0,0) and consumers fall through to the
+    spot_ws (Coinbase) sampler, which covers the fuller final minute. Treat
+    cf_ws as a last-~15s sharpener over the proxy, not a full-minute source.
+    (Kalshi still SETTLES on the 60s average — we just don't see all 60 of
+    its prints on this channel.)
+
+kalshi_ws owns the connection and subscription (set_cf_enabled) and forwards
+`cfbenchmarks_value` frames here; this module just parses and holds state for
+the 15m model. Freshness is timestamp-gated per record, so a dead socket
+simply ages the data out and consumers fall through to the next source
+(spot_ws → REST). It IS the exact settlement number in the last ~15s — but
+only there; the Coinbase sampler carries the rest of the final minute.
+"""
 from __future__ import annotations
 
 import json
@@ -37,6 +67,7 @@ class _State:
         self.values: dict[str, tuple[float, float]] = {}
         self.settle: dict[str, tuple[float, float, int, float]] = {}
 
+
     def handle_message(self, m: dict) -> None:
         if not isinstance(m, dict) or m.get("type") != "cfbenchmarks_value":
             return
@@ -75,6 +106,7 @@ class _State:
             if avg is not None and n > 0:
                 self.settle[asset] = (now, avg, n, end_ms)
 
+
     def spot(self, asset: str) -> Optional[float]:
         rec = self.values.get((asset or "").upper())
         if not rec:
@@ -91,6 +123,11 @@ class _State:
         }
 
     def settle_partial(self, asset: str, close_epoch: float) -> tuple[float, int]:
+        """(sum, count) of the settlement average Kalshi has ALREADY computed
+        for the window closing at `close_epoch` — i.e. avg × window_size from
+        the feed's final-minute message. (0, 0) when not in the final minute,
+        the feed is cold/stale, or the message belongs to a different window
+        (its end timestamp must fall inside this window's final minute)."""
         rec = self.settle.get((asset or "").upper())
         if not rec:
             return 0.0, 0

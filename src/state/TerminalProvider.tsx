@@ -1,6 +1,7 @@
 import {
   createContext, ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState,
 } from 'react';
+import { userMessage } from '../utils/errors';
 
 interface TerminalApi {
   activeTicker: string | null;
@@ -31,7 +32,7 @@ export function TerminalProvider({ children }: { children: ReactNode }) {
     void window.krypt.terminal
       .watchlist()
       .then(setWatchlist)
-      .catch(() => {  });
+      .catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -94,7 +95,7 @@ export function usePoll<T>(
       setError(null);
     } catch (e) {
       if (mine !== gen.current) return;
-      setError(e instanceof Error ? e.message : String(e));
+      setError(userMessage(e));
     } finally {
       if (inFlight.current === mine) inFlight.current = -1;
       if (mine === gen.current) setLoading(false);

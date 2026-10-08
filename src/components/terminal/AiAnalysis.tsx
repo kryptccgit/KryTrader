@@ -5,7 +5,10 @@ import {
 import type { AiAnalysis as AiAnalysisT, AiStatus, AiVerdict } from '@shared/market';
 import type { PageId } from '../../App';
 import { cls } from '../../utils/format';
+import { publishActivity } from '../../state/activity';
 import { Caveat, Cents, Unknown } from './atoms';
+import { userMessage } from '../../utils/errors';
+
 
 const VERDICT: Record<AiVerdict, { label: string; cls: string; note: string }> = {
   cheap: {
@@ -31,9 +34,10 @@ const VERDICT: Record<AiVerdict, { label: string; cls: string; note: string }> =
 };
 
 export function AiAnalysis({
-  ticker, onNav,
+  ticker, title, onNav,
 }: {
   ticker: string;
+  title?: string | null;
   onNav?: (p: PageId) => void;
 }) {
   const [status, setStatus] = useState<AiStatus | null>(null);
@@ -61,14 +65,26 @@ export function AiAnalysis({
       const res = await window.krypt.terminal.aiAnalyze({ ticker });
       if (res.ok) setAnalysis(res.analysis);
       else setError(res.error);
+      publishActivity(() => (res.ok ? {
+        kind: 'aiAnalysis', ticker: res.analysis.ticker || ticker, title: title ?? null,
+        provider: res.analysis.provider, verdict: res.analysis.verdict,
+        fairCents: res.analysis.fairValueCents, confidence: res.analysis.confidence,
+      } : null));
     } catch (e: any) {
-      setError(e?.message || 'The analysis failed.');
+      setError(userMessage(e, 'The analysis failed.'));
     } finally {
       setBusy(false);
     }
-  }, [ticker]);
+  }, [ticker, title]);
 
-  if (status && !status.hasKey) return <NeedsKey provider={status.provider} onNav={onNav} />;
+  if (status && !status.hasKey) {
+    return (
+      <NeedsKey
+        label={status.capabilities?.[status.provider]?.label ?? status.provider}
+        onNav={onNav}
+      />
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -129,8 +145,7 @@ export function AiAnalysis({
   );
 }
 
-function NeedsKey({ provider, onNav }: { provider: string; onNav?: (p: PageId) => void }) {
-  const label = provider === 'openai' ? 'OpenAI' : 'Anthropic';
+function NeedsKey({ label, onNav }: { label: string; onNav?: (p: PageId) => void }) {
   return (
     <div className="flex flex-col items-start gap-3 py-6">
       <div className="flex items-center gap-2 text-sm text-krypt-muted">

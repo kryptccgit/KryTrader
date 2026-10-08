@@ -11,7 +11,7 @@ export function PerpsPage() {
   const load = async () => {
     try {
       setSt(await window.krypt.perps.status());
-    } catch {  }
+    } catch {}
   };
 
   useEffect(() => {

@@ -7,6 +7,8 @@ import type { CollectionStats, Crypto15mBacktest, TraderConfig } from '@shared/t
 import { Card, Page, Switch } from '../components/common';
 import { useApp } from '../state/AppStateProvider';
 import { cls, fmtUsd } from '../utils/format';
+import { backtestEvent, publishActivity } from '../state/activity';
+import { userMessage } from '../utils/errors';
 
 type Engine = 'crypto15m' | 'main';
 
@@ -54,7 +56,7 @@ export function BacktestPage() {
   const loadCollection = async () => {
     try {
       setColl(await window.krypt.trading.collection());
-    } catch {  }
+    } catch {}
   };
   useEffect(() => { void loadCollection(); }, []);
 
@@ -101,6 +103,13 @@ export function BacktestPage() {
     return {};
   };
 
+  const selLabel = (): string => {
+    const sel = engine === 'crypto15m' ? stratSel : mainSel;
+    if (sel.startsWith('profile:')) return profiles.find((pr) => pr.id === sel.slice(8))?.name ?? 'a profile';
+    if (sel.startsWith('preset:')) return C15_STRATS.find((st) => st.id === sel.slice(7))?.name ?? 'a preset';
+    return 'current settings';
+  };
+
   const run = async () => {
     setBusy(true);
     setErr(null);
@@ -111,8 +120,9 @@ export function BacktestPage() {
         : await window.krypt.crypto15m.backtestMain({ sinceDays: days, config: patch });
       setRes(r);
       if (!r) setErr('Engine not running — start the app backend first.');
+      publishActivity(() => backtestEvent(engine === 'crypto15m' ? '15m' : 'main', selLabel(), days, r));
     } catch (e: any) {
-      setErr(e?.message || String(e));
+      setErr(userMessage(e));
     } finally {
       setBusy(false);
     }
@@ -308,7 +318,7 @@ export function BacktestPage() {
               This backtest runs on history YOUR bot collects while it runs. Leave the app open
               (monitor mode is enough — no live trading needed) and it records every
               {engine === 'crypto15m'
-                ? ' 15-minute market with its outcome. Make sure the 15m Crypto toggle is on and the environment is Live/production (demo 15m markets are frozen).'
+                ? ' 15-minute market with its outcome. Make sure the 15m Crypto toggle is on (Paper is fine: the markets and prices are the real ones).'
                 : ' whale and momentum signal it sees, with outcomes. Data starts accruing immediately.'}
               {' '}Check back after a few hours; the charts get sharper every day it runs.
             </p>

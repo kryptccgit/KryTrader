@@ -1,3 +1,6 @@
+"""User-script platform: sandbox validation/escape hardening, budget
+enforcement, the shared intent/manage/signal sanitizers, and the row-level
+tp/sl overrides the exit ladder honors for script positions."""
 from __future__ import annotations
 
 import pytest
@@ -19,6 +22,7 @@ def decide(ctx):
         return None
     return {"side": "up", "price": "ask"}
 """
+
 
 
 
@@ -83,6 +87,7 @@ def test_trusted_skips_sandbox_but_keeps_contract():
 
 
 
+
 def test_busy_loop_is_killed():
     code = (
         "def decide(ctx):\n"
@@ -123,6 +128,7 @@ def test_log_lines_captured_and_capped():
 
 
 
+
 def test_sanitize_intent():
     ok, err = script_backtest.sanitize_intent({"side": "up", "price": "ask"})
     assert err is None and ok == {"side": "up", "price": "ask"}
@@ -159,6 +165,7 @@ def test_sanitize_signal_action():
     assert err is None and ok["sizeUsd"] == 10.0
     _, err = script_backtest.sanitize_signal_action({"follow": True, "sizeUsd": 0})
     assert err
+
 
 
 

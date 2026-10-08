@@ -8,6 +8,7 @@ import { usePoll } from '../../state/TerminalProvider';
 import { cls } from '../../utils/format';
 import { Caveat } from './atoms';
 
+
 const RANGES: { label: string; intervalMin: CandleInterval; lookbackMin: number }[] = [
   { label: '1H', intervalMin: 1, lookbackMin: 60 },
   { label: '4H', intervalMin: 1, lookbackMin: 240 },

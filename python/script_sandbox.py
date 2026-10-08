@@ -1,3 +1,21 @@
+"""Sandboxed compile/exec for user strategy scripts.
+
+A user script is ordinary Python that defines `decide(ctx)` (plus optional
+`on_start(state)` / `on_fill(position, state)` / `on_settle(position, state)`
+hooks). In the default sandboxed mode the script is validated at the AST
+level BEFORE it is compiled: no imports, no dunder access, no classes, and
+every free name must resolve to something the sandbox injects (curated
+builtins, `math`, `statistics`, `state`, `log`, `ctx`). Execution is wrapped
+in a line-count + wall-clock budget (sys.settrace) so a busy-loop script is
+killed deterministically instead of wedging the engine loop.
+
+HONESTY: this is a guardrail against accidental damage and naive-malicious
+scripts, not a hard security boundary — CPython sandboxes are escapable by a
+determined attacker. Trusted mode ("full Python") skips the AST validation
+entirely and runs with the same privileges as the trading engine, in the
+process that holds the decrypted Kalshi API key. The UI says exactly that before
+letting a user flip a script to trusted.
+"""
 from __future__ import annotations
 
 import ast
@@ -18,11 +36,12 @@ MAX_TRACE_EVENTS = 200_000
 
 
 class ScriptError(Exception):
-    pass
+    """A script failed validation, compilation, or raised at runtime."""
 
 
 class ScriptBudgetExceeded(ScriptError):
-    pass
+    """A hook call exceeded its CPU/time budget (busy loop guard)."""
+
 
 
 SAFE_BUILTINS: dict[str, Any] = {
@@ -65,7 +84,11 @@ _FORBIDDEN_ATTRS = {
 
 
 
+
 def parse_header(code: str) -> dict:
+    """Read the `# krypt-script v1` metadata header from the top comment
+    block: name / description lines. Missing header is not fatal (the save
+    path fills defaults) but the AI import flow requires it."""
     meta = {"version": None, "name": "", "description": ""}
     for line in code.splitlines()[:15]:
         s = line.strip()
@@ -85,6 +108,9 @@ def parse_header(code: str) -> dict:
 
 
 def find_ctx_fields(code: str) -> list[str]:
+    """Static scan of the ctx fields a script reads (`ctx["x"]` and
+    `ctx.get("x")`), so validation can warn when a field isn't recorded in
+    ticks (it would be None in backtest — fail-closed, same as rules)."""
     fields: set[str] = set()
     try:
         tree = ast.parse(code)
@@ -107,7 +133,10 @@ def find_ctx_fields(code: str) -> list[str]:
 
 
 
+
 def _bound_names(tree: ast.Module) -> set[str]:
+    """Every name the script itself binds anywhere (coarse module-wide scope:
+    good enough to decide whether a loaded name is the script's own)."""
     bound: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -135,6 +164,9 @@ def _bound_names(tree: ast.Module) -> set[str]:
 
 
 def validate_sandboxed(code: str) -> list[str]:
+    """AST whitelist validation for sandboxed scripts. Returns a list of
+    human-readable errors (empty = valid). Whitelist-first: unknown free
+    names are rejected here, at save time, not at 3am mid-trade."""
     errors: list[str] = []
     if len(code.encode("utf-8", "replace")) > MAX_CODE_BYTES:
         return [f"script exceeds {MAX_CODE_BYTES // 1024}KB"]
@@ -201,6 +233,8 @@ def validate_sandboxed(code: str) -> list[str]:
 
 
 def validate(code: str, *, trusted: bool = False) -> list[str]:
+    """Full validation for a script in its declared mode. Trusted scripts get
+    syntax + contract checks only (they are full Python by design)."""
     if not trusted:
         return validate_sandboxed(code)
     if len(code.encode("utf-8", "replace")) > MAX_CODE_BYTES:
@@ -214,6 +248,7 @@ def validate(code: str, *, trusted: bool = False) -> list[str]:
         return ["script must define at least one of: decide(ctx), "
                 "manage(position, ctx), decide_signal(signal), supervise(app)"]
     return []
+
 
 
 
@@ -236,6 +271,9 @@ def _make_tracer(deadline: float, max_events: int):
 
 def call_budgeted(fn: Callable, *args: Any, budget_ms: float = 50.0,
                   traced: bool = True) -> Any:
+    """Call a script hook under the line/time budget. `traced=False` (trusted
+    mode) runs the hook bare — the caller is responsible for coarser
+    containment (thread timeouts live, wall caps in backtest)."""
     if not traced:
         return fn(*args)
     deadline = time.perf_counter() + budget_ms / 1000.0
@@ -249,6 +287,7 @@ def call_budgeted(fn: Callable, *args: Any, budget_ms: float = 50.0,
 
 
 
+
 def code_hash(code: str, trusted: bool) -> str:
     h = hashlib.sha256()
     h.update(b"trusted:" if trusted else b"sandboxed:")
@@ -257,6 +296,9 @@ def code_hash(code: str, trusted: bool) -> str:
 
 
 class CompiledScript:
+    """A compiled script module: its hooks, persistent state dict, and log
+    sink. One instance per (script, code-hash, trusted-flag)."""
+
     def __init__(self, script_id: str, code: str, *, trusted: bool,
                  log_sink: Optional[Callable[[str], None]] = None,
                  state: Optional[dict] = None):
@@ -318,6 +360,8 @@ class CompiledScript:
         return out
 
     def call(self, hook: str, *args: Any, budget_ms: float = 50.0) -> Any:
+        """Invoke a hook under budget. Raises ScriptError subclasses on any
+        failure — callers isolate (disable the script), never crash."""
         fn = self.hooks.get(hook)
         if fn is None:
             return None

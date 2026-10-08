@@ -1,3 +1,16 @@
+"""Replay recorded ticks through the LIVE entry gates.
+
+The old backtest harness reimplemented the gates and drifted (it could not
+even express the shipped sniper). This module builds a snapshot-shaped asset
+dict from each recorded tick and calls the real ``crypto15m_trader.
+should_enter`` — so what the backtest trades is, by construction, what the
+live engine would have traded under the same config.
+
+Honesty is part of the contract: fills are assumed at the recorded ask
+(taker), ticks are ~4-25s apart (the gate could have seen better/worse quotes
+between them), maker fills are not modeled, and everything is in-sample.
+Those caveats ship in the result payload, not a docstring.
+"""
 from __future__ import annotations
 
 import sqlite3
@@ -23,6 +36,9 @@ _DERIVABLE = {
 
 
 def tick_to_asset(row: dict, cfg: dict, close_iso: str) -> dict:
+    """Map a crypto15m_ticks row onto the exact snapshot field names the live
+    gates read. Missing-in-ticks fields (peersAgree, marketBias, arbEdgeCents)
+    are deliberately absent so rule evaluation fails closed, same as live."""
     up_prob = row.get("up_prob")
     yes_bid, yes_ask = row.get("yes_bid"), row.get("yes_ask")
     no_ask = row.get("no_ask")
@@ -109,6 +125,10 @@ def _missing_rule_fields(cfg: dict) -> list[str]:
 
 
 def load_windows(env: str, since_days: int) -> dict[str, list[dict]]:
+    """Load recorded ticks (joined to their settled outcome), grouped by window
+    ticker. Expensive (one big DB read) — the Coin Optimizer loads ONCE and
+    replays many strategies over the shared result instead of re-querying per
+    strategy (33 queries → 1)."""
     with dbmod.get_db() as conn:
         rows = conn.execute(
             """SELECT t.*, s.up_won, s.close_time AS sig_close
@@ -128,6 +148,9 @@ def load_windows(env: str, since_days: int) -> dict[str, list[dict]]:
 
 
 def replay_windows(by_window: dict[str, list[dict]], cfg: dict) -> tuple[list[dict], int]:
+    """Run the live entry gate over pre-loaded windows. Returns (trades,
+    n_windows). Pure CPU — no DB. cfg should already have the arm/autopause
+    overrides applied (see replay())."""
     contracts = max(1, int(cfg.get("crypto15m_order_size") or 1))
     trades: list[dict] = []
     n_windows = 0
@@ -169,6 +192,7 @@ def replay_windows(by_window: dict[str, list[dict]], cfg: dict) -> tuple[list[di
 
 
 def _replay_cfg(cfg: dict) -> dict:
+    """Apply the replay-only overrides (arm switches + autopause off)."""
     cfg = dict(cfg)
     cfg["crypto15m_enabled"] = True
     cfg["crypto15m_model_autopause"] = False
@@ -177,6 +201,9 @@ def _replay_cfg(cfg: dict) -> dict:
 
 def replay(cfg: dict, *, env: str = "production", since_days: int = 60,
            max_concurrent_ignored: bool = True) -> dict:
+    """Run the live entry gate over recorded ticks, one trade max per window,
+    entered at the first qualifying tick's executable ask, held to settlement.
+    Returns aggregate stats + per-asset breakdown + honesty caveats."""
     cfg = _replay_cfg(cfg)
     contracts = max(1, int(cfg.get("crypto15m_order_size") or 1))
     by_window = load_windows(env, since_days)
@@ -199,6 +226,10 @@ def replay(cfg: dict, *, env: str = "production", since_days: int = 60,
 
 
 def _held_bid(row: dict, side: str) -> Optional[float]:
+    """Held-side taker-sell price (bid) from a tick, 0..1. Up sells YES at
+    yes_bid; down sells NO at no_bid = 1 - yes_ask (single complementary book).
+    None when the quote needed isn't recorded, so the caller skips that tick
+    instead of marking to a fabricated price."""
     if side == "up":
         b = row.get("yes_bid")
         return float(b) if b and 0.0 < float(b) < 1.0 else None
@@ -211,6 +242,13 @@ def _held_bid(row: dict, side: str) -> Optional[float]:
 def _simulate_capturetrail(ticks: list[dict], entry_i: int, side: str,
                            cost: float, params: ct.CTParams,
                            contracts: int) -> Optional[dict]:
+    """Walk the ticks AFTER entry, marking the held side to its bid, and let
+    CaptureTrail decide the exit. Returns the exit leg {price, at, reason} or
+    None if it never fired (caller then holds to settlement).
+
+    entry_mark is the ask we PAID (cost); the mark each tick is the bid we
+    could SELL at — so the position is honestly down the spread from the first
+    tick, the trail tracks the bid, and the exit books at the bid."""
     state = ct.CTState.open(cost)
     for row in ticks[entry_i + 1:]:
         bid = _held_bid(row, side)
@@ -224,6 +262,17 @@ def _simulate_capturetrail(ticks: list[dict], entry_i: int, side: str,
 
 def replay_capturetrail(cfg: dict, *, env: str = "production",
                         since_days: int = 60) -> dict:
+    """Head-to-head: the SAME live entries, booked two ways.
+
+    baseline    — held to settlement (what the live 15m trader does today).
+    capturetrail — CaptureTrail's trailing exit walks the window's remaining
+                   ticks; if it fires, the trade books at the held-side bid
+                   with BOTH an entry and an exit fee; if not, it falls through
+                   to settlement identically to the baseline.
+
+    Returns {baseline, capturetrail, delta, params} so the UI/CLI can show the
+    difference on the user's own recorded ticks. Same honesty caveats as
+    replay() plus the exit-sim ones."""
     cfg = dict(cfg)
     cfg["crypto15m_enabled"] = True
     cfg["crypto15m_model_autopause"] = False
@@ -347,6 +396,10 @@ def replay_capturetrail(cfg: dict, *, env: str = "production",
 
 
 def _bucketize(trades: list[dict]) -> dict:
+    """Time anatomy: WHERE the profit lives. A strategy that prints in the
+    first 12 UTC hours and bleeds in the last 12, or made all its money on
+    one lucky day, looks identical in a single total - these buckets are how
+    users catch that before arming."""
     by_hour = {h: {"n": 0, "wins": 0, "pnlUsd": 0.0} for h in range(24)}
     by_day: dict[str, dict] = {}
     for t in trades:
@@ -414,6 +467,10 @@ def _summarize(trades: list[dict], contracts: int, n_windows: int,
 
 def replay_main(cfg: dict, *, since_days: int = 60,
                 slippage_cents: float = 1.0) -> dict:
+    """Replay recorded whale prints + momentum alerts through the LIVE
+    trader.should_trade gates with follower economics: entry at the signal
+    price + slippage, per-order rounded Kalshi fee, outcome from the recorded
+    resolution. One simulated trade per accepted signal."""
     import trader as trader_mod
     contracts = 5
     fixed_usd = float(cfg.get("fixed_trade_usd") or 5.0)

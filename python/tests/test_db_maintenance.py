@@ -81,6 +81,7 @@ def test_run_maintenance_compacts_when_forced(fresh_db):
 
 
 
+
 def test_unresolved_alerts_and_whales_age_out(fresh_db):
     with db.get_db() as conn:
         conn.execute(
@@ -132,15 +133,15 @@ def test_pnl_snapshots_query_downsamples(fresh_db):
             conn.execute(
                 """INSERT INTO pnl_snapshots (at, kalshi_env, cash_usd,
                                               portfolio_usd, total_usd)
-                   VALUES (datetime('now', ?), 'demo', 100, 0, ?)""",
+                   VALUES (datetime('now', ?), 'paper', 100, 0, ?)""",
                 (f"-{500 - i} minutes", 100.0 + i),
             )
     with db.get_db() as conn:
-        rows = db.get_pnl_snapshots(conn, since_hours=24, env="demo", max_points=100)
+        rows = db.get_pnl_snapshots(conn, since_hours=24, env="paper", max_points=100)
     assert 0 < len(rows) <= 101
     assert rows[-1]["total_usd"] == pytest.approx(599.0)
     with db.get_db() as conn:
-        rows_1h = db.get_pnl_snapshots(conn, since_hours=1, env="demo", max_points=0)
+        rows_1h = db.get_pnl_snapshots(conn, since_hours=1, env="paper", max_points=0)
     assert 55 <= len(rows_1h) <= 62
 
 
@@ -153,12 +154,12 @@ def test_pnl_prune_keeps_alltime_anchor_snapshot(fresh_db):
         ]:
             c.execute(
                 "INSERT INTO pnl_snapshots (at, kalshi_env, cash_usd, "
-                "portfolio_usd, total_usd) VALUES (datetime('now', ?), 'demo', ?, 0, ?)",
+                "portfolio_usd, total_usd) VALUES (datetime('now', ?), 'paper', ?, 0, ?)",
                 (at, total, total),
             )
         c.execute(
             "INSERT INTO pnl_snapshots (kalshi_env, cash_usd, portfolio_usd, "
-            "total_usd) VALUES ('demo', 120.0, 0, 120.0)",
+            "total_usd) VALUES ('paper', 120.0, 0, 120.0)",
         )
 
     db.cleanup_old_data()
@@ -168,6 +169,6 @@ def test_pnl_prune_keeps_alltime_anchor_snapshot(fresh_db):
             float(r["total_usd"])
             for r in c.execute("SELECT total_usd FROM pnl_snapshots ORDER BY id")
         ]
-        earliest = db.earliest_pnl_total(c, "demo")
+        earliest = db.earliest_pnl_total(c, "paper")
     assert totals == [200.0, 120.0]
     assert earliest == pytest.approx(200.0)

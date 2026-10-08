@@ -6,6 +6,7 @@ import { useApp } from '../state/AppStateProvider';
 import { usePoll } from '../state/TerminalProvider';
 import { useToast } from '../state/ToastProvider';
 import { cls } from '../utils/format';
+import { userMessage } from '../utils/errors';
 
 const NOT_COUNTED =
   'This host is contacted by a part of the app that does not yet count its '
@@ -26,7 +27,7 @@ export function PrivacyPage() {
       await window.krypt.backend.stop();
       toast.success('Backend stopped. Nothing in this app is contacting anything now.');
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     }
   };
 

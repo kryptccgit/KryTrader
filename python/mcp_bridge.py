@@ -1,3 +1,21 @@
+"""stdio <-> local HTTP bridge for MCP clients that only speak stdio.
+
+Claude Desktop and Codex launch an MCP server as a child process and talk
+JSON-RPC over its stdin/stdout. The trading engine cannot be that child — it is
+already a child of the Electron app, holding the decrypted Kalshi key, the
+websocket books and the rails. Starting a SECOND engine per AI client would
+mean two processes placing orders against one account, which is exactly the
+double-backend failure python-backend.ts exists to prevent.
+
+So the client launches this instead: the same frozen executable with
+`--mcp-stdio`, which forwards each line to the running app's loopback MCP
+endpoint and writes the reply back. It holds no state beyond the session id,
+imports nothing but the standard library, and never touches the engine.
+
+It is dispatched from the very top of service.py, BEFORE logging is set up and
+before any engine module is imported — the bridge must not open backend.log,
+read credentials, or take a second copy of anything.
+"""
 from __future__ import annotations
 
 import http.client

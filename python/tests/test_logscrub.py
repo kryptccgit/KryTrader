@@ -1,3 +1,10 @@
+"""Credentials must never reach a log.
+
+A beta user pasting their log into a chat window is the most likely way a
+secret escapes this app — and it escapes to exactly the people trying to help.
+So this tests the real logging path, not just the regexes: a record logged on a
+CHILD logger has to come out of the handler scrubbed.
+"""
 from __future__ import annotations
 
 import io
@@ -11,6 +18,7 @@ TELEGRAM = "1234567890" + ":" + "N0tAR3alT3l3gramBotTokenXXXXXXXXXX"
 
 def setup_function():
     logscrub.set_known_secrets([])
+
 
 
 def test_a_discord_token_is_redacted_even_if_never_registered():
@@ -45,6 +53,7 @@ def test_authorization_headers_are_redacted():
     assert "abcdef.ghijkl.mnopqr" not in out
 
 
+
 def test_a_registered_secret_is_redacted_in_any_context():
     key = "e1f2a3b4-c5d6-7890-abcd-ef1234567890"
     logscrub.set_known_secrets([key])
@@ -64,7 +73,11 @@ def test_trivially_short_values_are_not_registered():
     assert logscrub.scrub("running on demo env") == "running on demo env"
 
 
+
 def test_order_ids_survive():
+    """Kalshi order ids are UUIDs and are the single most useful thing in a
+    trading log. Blanket-redacting UUIDs would make every bug report
+    unreadable to protect nothing — the API key is caught by value."""
     line = "order 0720ec42-ea21-b6b6-87ac-c5b4e2732435 filled 10 @ 45c"
     assert logscrub.scrub(line) == line
 
@@ -79,7 +92,12 @@ def test_empty_and_none_are_safe():
     assert logscrub.scrub(None) is None
 
 
+
 def test_a_child_loggers_record_is_scrubbed_at_the_handler():
+    """The bug this pins: a Filter attached to the ROOT LOGGER only runs for
+    records created by that logger. Records from logging.getLogger("trader")
+    propagate straight to the root's handlers without passing it — so the
+    filter has to live on the HANDLERS."""
     stream = io.StringIO()
     handler = logging.StreamHandler(stream)
     handler.addFilter(logscrub.ScrubFilter())

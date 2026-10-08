@@ -1,3 +1,41 @@
+"""Remote control: one command engine, two chat transports.
+
+The point is to leave the terminal running on a desktop and check on it — or
+act — from a phone. That makes this the most dangerous surface in the app: a
+text message that can spend money, arriving over somebody else's network, from
+a device that lives in a pocket.
+
+So the design starts from what can go wrong, not from what is convenient.
+
+  1. **Bound to one person.** Discord replies only to a direct message from the
+     exact user id you paired; Telegram only to the chat id that completed a
+     one-time pairing code. Group and guild channels are ignored outright —
+     they have other members in them, and a bot that answers "what are my
+     positions" in a shared channel has already failed.
+
+  2. **Reading and trading are different permissions.** Trading is OFF by
+     default and has its own switch. Turning on alerts does not turn on
+     spending.
+
+  3. **No order fires from a single message.** Every trade is quoted first and
+     needs an explicit confirmation carrying a short code tied to that exact
+     order. A fat-fingered message, an autocorrect, or a message sent to the
+     wrong window cannot trade.
+
+  4. **The same rails as the desktop.** Orders run through terminal.preview and
+     terminal.submit, so the size cap, the notional cap, market status, and the
+     "you cannot sell what you do not hold" checks all apply identically. This
+     module adds rails; it never removes any.
+
+  5. **A leaked bot token is not a trading key.** Whoever holds the token can
+     read what the bot was told, but cannot command it without also being the
+     paired identity.
+
+What this cannot protect against, stated plainly rather than glossed: your
+positions, balance and orders travel through Discord's or Telegram's servers in
+plaintext-to-them. That is inherent to using a chat app as a terminal, it is
+named in the Privacy panel, and it is why this is off until you switch it on.
+"""
 from __future__ import annotations
 
 import logging
@@ -25,10 +63,12 @@ TRADE_COMMANDS = ("buy", "sell", "cancel", "confirm", "approve", "reject")
 
 @dataclass
 class Pending:
+    """A quoted order waiting for its confirmation code."""
     code: str
     req: dict
     summary: str
     created: float = field(default_factory=time.monotonic)
+    env: str = ""
 
     def expired(self) -> bool:
         return time.monotonic() - self.created > CONFIRM_TTL
@@ -50,6 +90,7 @@ def _now() -> str:
 
 
 def new_pair_code() -> str:
+    """A fresh Telegram pairing code. Regenerating invalidates the old one."""
     alphabet = string.ascii_uppercase + string.digits
     alphabet = "".join(c for c in alphabet if c not in "O0I1")
     STATE.telegram_code = "".join(secrets.choice(alphabet) for _ in range(PAIR_CODE_LEN))
@@ -66,6 +107,9 @@ def pair_code_valid() -> Optional[str]:
 
 
 def check_pair_code(supplied: str) -> bool:
+    """Constant-time compare against the live code, then burn it. A pairing
+    code is single-use: a code that still works after it was used is a code
+    somebody else can use."""
     live = pair_code_valid()
     if not live:
         return False
@@ -85,7 +129,10 @@ def rate_ok(sender: str) -> bool:
     return len(hits) <= RATE_MAX
 
 
+
 def _cents(v: Optional[float]) -> str:
+    """The em-dash rule reaches the phone too. An unknown price must not read
+    as zero just because the screen is small."""
     if v is None:
         return "—"
     return f"{v:g}c"
@@ -122,6 +169,10 @@ Prices are in cents, 1-99. Nothing trades without a confirm."""
 
 async def handle(text: str, sender: str, *, cfg: dict, authed: bool,
                  trading_enabled: bool) -> str:
+    """Run one command. Returns the reply text.
+
+    `sender` is already authenticated by the transport — this function is never
+    reached by a message from anyone but the paired user."""
     raw = (text or "").strip()
     if not raw:
         return HELP
@@ -173,15 +224,16 @@ async def handle(text: str, sender: str, *, cfg: dict, authed: bool,
     return f"Unknown command {cmd!r}. Send 'help' for the list."
 
 
+
 async def _status(authed: bool, trading_enabled: bool) -> str:
     import kalshi_auth
     import kalshi_ws
     import terminal
-    env = kalshi_auth.get_env()
+    paper = kalshi_auth.is_paper()
     ws = kalshi_ws.stats()
     lines = [
-        f"Environment: {env}",
-        f"Credentials: {'verified' if authed else 'MISSING'}",
+        f"Account: {'PAPER (imaginary money)' if paper else 'LIVE (real money)'}",
+        f"Credentials: {'not needed on paper' if paper else ('verified' if authed else 'MISSING')}",
         f"Remote trading: {'ON' if trading_enabled else 'off'}",
         f"Websocket: {'connected' if ws.get('connected') else 'off'}",
         f"Watching: {len(terminal.subscribed_tickers())} market(s)",
@@ -234,8 +286,8 @@ async def _orders(authed: bool) -> str:
     rows = res["orders"]
     if not rows:
         return res.get("note") or "Nothing resting."
-    out = [f"{o['orderId']}\n  {o['action'] or '--'} {o['remaining'] or o['count']} "
-           f"{(o['side'] or '--').upper()} {o['ticker']} @ {_cents(o['priceCents'])}"
+    out = [f"{o['orderId']}\n  {o['action']} {o['remaining'] or o['count']} "
+           f"{o['side'].upper()} {o['ticker']} @ {_cents(o['priceCents'])}"
            for o in rows[:20]]
     out.append("Cancel one with: cancel ORDER_ID")
     return "\n".join(out)
@@ -302,12 +354,14 @@ async def _history() -> str:
     return "\n".join(lines)
 
 
+
 def _order_code() -> str:
     return "".join(secrets.choice(string.digits) for _ in range(4))
 
 
 async def _stage_order(action: str, args: list[str], sender: str, *,
                        cfg: dict, authed: bool) -> str:
+    """Price the order and hold it. Nothing is sent until `confirm`."""
     import terminal
     if len(args) < 4:
         return (f"Usage: {action} TICKER yes|no COUNT PRICE\n"
@@ -371,7 +425,9 @@ async def _stage_order(action: str, args: list[str], sender: str, *,
         summary_lines.append(f"! {w}")
     summary = "\n".join(summary_lines)
 
-    STATE.pending[sender] = Pending(code=code, req=req, summary=summary)
+    import kalshi_auth
+    STATE.pending[sender] = Pending(code=code, req=req, summary=summary,
+                                    env=kalshi_auth.get_env())
     return (summary + f"\n\nReply:  confirm {code}\n"
             f"(expires in {int(CONFIRM_TTL // 60)} minutes; nothing has been sent)")
 
@@ -391,6 +447,11 @@ async def _confirm(args: list[str], sender: str, *, cfg: dict, authed: bool) -> 
         return "That code does not match the order waiting. Check and resend."
 
     STATE.pending.pop(sender, None)
+    import kalshi_auth
+    now = kalshi_auth.get_env()
+    if pending.env and pending.env != now:
+        return (f"Not sent: that order was quoted on {_mode_label(pending.env)} and the "
+                f"app is now {_mode_label(now)}. Quote it again if you still want it.")
     res = await terminal.submit(pending.req, cfg=cfg, authed=authed)
     logger.info("[remote] %s -> %s", pending.req, res.get("message"))
     return ("Sent.\n" + res["message"]) if res["ok"] else ("Rejected.\n" + res["message"])
@@ -405,12 +466,19 @@ async def _cancel(args: list[str], authed: bool) -> str:
     return res["message"]
 
 
+
+def _mode_label(env) -> str:
+    return {"paper": "PAPER", "production": "LIVE"}.get(str(env or ""), "?")
+
+
 def _agents() -> str:
     import mcp_server
     rows = mcp_server.pending()
     if not rows:
         return "No agent orders waiting."
-    out = [f"#{r['id']} {r['action']} {r['count']} {r['side'].upper()} {r['ticker']} "
+    out = [f"#{r['id']} [{_mode_label(r.get('env'))}] "
+           f"{(r.get('agentName') or 'agent')}: {r['action']} {r['count']} "
+           f"{r['side'].upper()} {r['ticker']} "
            f"@ {_cents(r['priceCents'])}  ({_usd(r['committedUsd'])})" for r in rows[:10]]
     out.append("Reply: approve N  or  reject N")
     return "\n".join(out)
@@ -424,6 +492,7 @@ async def _agent_decide(cmd: str, args: list[str]) -> str:
         return f"Usage: {cmd} N   (see: agents)"
     res = await mcp_server.decide(rid, cmd == "approve", via="phone")
     return res["message"]
+
 
 
 def format_rule_event(data: dict) -> str:

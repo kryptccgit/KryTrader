@@ -1,3 +1,22 @@
+"""LIVE end-to-end check of the standing-instructions engine. Run by hand.
+
+`live_terminal_check.py` pins the PROVIDERS; this pins the RUNTIME. It spawns
+service.py exactly as electron does — same stdin/stdout JSON-RPC, same env —
+arms a deliberately hostile spread of rules against real markets, lets the
+evaluator run several passes, and then reads backend.log for anything that
+threw.
+
+It earns its place: it found a defect that both static review and the unit
+suite missed. A rule armed on a ticker that does not exist was accepted, then
+reported "nobody is bidding for YES" forever and re-polled every few seconds,
+because `_pub_get` collapsed a 404 and an unreachable host into the same None
+and an empty book is indistinguishable from a missing market.
+
+Everything runs against a THROWAWAY user-data dir and never places an order:
+the exit rules trigger, find no credentials, and record that they sent nothing.
+
+    python/.venv/Scripts/python.exe python/live_rules_check.py <throwaway-dir>
+"""
 import json
 import os
 import re

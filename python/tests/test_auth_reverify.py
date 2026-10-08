@@ -21,7 +21,7 @@ def _base(monkeypatch):
         return None
 
     monkeypatch.setattr(service, "emit_event", _noop_emit)
-    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "demo")
+    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "paper")
     monkeypatch.setattr(kalshi_auth, "prime_credentials", lambda *a, **k: True)
     monkeypatch.setattr(kalshi_auth, "sync_server_time", lambda *a, **k: 0)
     yield

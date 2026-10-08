@@ -1,3 +1,39 @@
+"""The agent's workbench: collected data, backtests, strategy scripts, settings.
+
+mcp_server.py lets an agent trade one market at a time. This module gives it
+the rest of the app — the research corpus the recorders have been collecting,
+the same backtesters the Backtest page runs, the Scripts platform, and the
+engine's settings — each behind its OWN permission toggle that the user turns
+on (mcp_server.PERMISSIONS). Every toggle defaults off.
+
+The tools reuse the app's own RPC handlers through mcp_server.HOOKS.rpc, so an
+agent's backtest is the Backtest page's backtest and an agent's script save is
+the Scripts page's save. Nothing here is a second implementation of anything.
+
+Lines no toggle crosses, and why each one is fixed rather than a switch:
+
+  * **The account mode.** Paper -> Live turns every other setting into real
+    money in one write. That is a human decision at the desk. The paper
+    bankroll goes with it: an agent that could refill its own paper account
+    could make any paper record look like whatever it liked.
+  * **The agent's own permissions and rails** (every mcp_* key). An agent that
+    can raise its own caps or grant itself a permission has no caps.
+  * **Trusted scripts.** A trusted script is un-sandboxed Python inside the
+    process holding the decrypted Kalshi key. Agents read market text that
+    other people wrote; a prompt injection that reaches "save this as trusted"
+    is arbitrary code execution with the user's account. Agent scripts are
+    always sandboxed, and an agent cannot edit or run a script the user marked
+    trusted.
+  * **Credentials, webhooks, the remote bots, the AI provider, the terminal's
+    hand-ticket caps** (which are the second layer under every live agent
+    order), and the recorders that collect the evidence the scoreboard and
+    backtests stand on.
+
+Everything else is classified, key by key, into "settings" or "live switches &
+risk limits". An unclassified key is refused, and a test fails until a new
+config key is placed in one of the three sets — so adding a knob can never
+silently hand it to an agent.
+"""
 from __future__ import annotations
 
 import json
@@ -11,9 +47,11 @@ from mcp_server import HOOKS, Tool, ToolError, _obj, _s, register
 
 logger = logging.getLogger("mcp")
 
+
 PROTECTED_PREFIXES = ("mcp_", "remote_", "ai_", "autopilot_")
 PROTECTED = frozenset({
-    "kalshi_env",
+    "account_mode", "paper_bankroll_usd",
+    "shard_auto_move", "shard_auto_move_max_usd_day",
     "terminal_max_contracts", "terminal_max_notional_usd",
     "event_webhook_url", "stats_webhook_url", "whale_webhook_url",
     "momentum_webhook_url", "enable_discord", "stats_push_interval",
@@ -31,7 +69,6 @@ LIVE = frozenset({
     "crypto15m_enabled", "crypto15m_live", "crypto15m_runners",
     "crypto15m_pairs_enabled", "crypto15m_directional_enabled",
     "scripts_live_enabled", "scripts_paper_mode", "perps_farm_enabled",
-    "gambling_mode", "gambling_trade_probability",
     "stop_loss_on_day", "stop_loss_on_day_pct", "take_profit_on_day",
     "max_total_exposure_fraction", "max_open_positions", "max_daily_new_positions",
     "unlimited_daily_new_positions", "max_positions_per_event",
@@ -80,6 +117,7 @@ SETTINGS = frozenset({
 
 
 def classify(key: str) -> str:
+    """'protected' | 'live' | 'settings' | 'unknown'."""
     if key in PROTECTED or key.startswith(PROTECTED_PREFIXES):
         return "protected"
     if key in LIVE:
@@ -97,6 +135,7 @@ def _snake(k: str) -> str:
 def _camel(k: str) -> str:
     head, *rest = k.split("_")
     return head + "".join(p[:1].upper() + p[1:] for p in rest)
+
 
 
 def audit(tool: str, client: str, ok: bool, summary: str) -> None:
@@ -124,6 +163,7 @@ async def _announce(text: str) -> None:
             await HOOKS.emit("mcp:order", {"mode": "action", "message": text})
         except Exception:
             pass
+
 
 
 LIST_CAP = 25
@@ -154,6 +194,7 @@ def _since(args: dict, default: int = 60) -> int:
         return max(1, min(int(args.get("since_days") or default), 365))
     except (TypeError, ValueError):
         return default
+
 
 
 _DATASETS = {
@@ -217,6 +258,8 @@ _SIG_GROUPS = {
 
 
 async def t_summarize(args: dict, _ctx: dict) -> dict:
+    """Win rates by bucket. Gross of fees, said in the output, because a
+    favourite that wins 92% at a 94c entry is a losing strategy."""
     ds = _s(args, "dataset")
     group = _s(args, "group_by")
     since = _cutoff(_since(args, 60))
@@ -303,7 +346,36 @@ async def t_history(args: dict, _ctx: dict) -> dict:
     raise ToolError("kind must be manual or crypto15m")
 
 
+
 AGENT_AUTHOR = "mcp"
+
+
+def _author(ctx: dict) -> str:
+    """The author tag for the calling named agent. Default keeps the original
+    "mcp", so every script an agent wrote before named agents existed stays
+    Default's; any other agent is "mcp:<id>". "Edit or switch only its own"
+    is per agent: Sports Sam overwriting or arming a script the Careful
+    Researcher wrote is the user's book being managed by the wrong trader."""
+    aid = str(ctx.get("agent") or "default")
+    return AGENT_AUTHOR if aid == "default" else f"{AGENT_AUTHOR}:{aid}"
+
+
+def _by_agent(author: Any) -> bool:
+    a = str(author or "")
+    return a == AGENT_AUTHOR or a.startswith(AGENT_AUTHOR + ":")
+
+
+def _forecast_only(ctx: dict) -> Optional[str]:
+    """Refusal for a script/settings WRITE by an agent whose own rules say it
+    places no orders. Arming a script or changing an engine is a way to trade
+    by proxy, and a forecast-only agent must not have one."""
+    import mcp_agents
+    a = mcp_agents.get(HOOKS.get_cfg(), str(ctx.get("agent") or "default"))
+    r = (a or {}).get("rules") or {}
+    if a and (r.get("maxOpenPositions") == 0 or r.get("maxContractsPerMarket") == 0):
+        return (f"{a['name']}'s rules: no positions — it records forecasts only, so it "
+                f"does not write scripts or change engine settings either.")
+    return None
 
 
 def _script(sid: str) -> Optional[dict]:
@@ -315,7 +387,7 @@ def _summary(r: dict) -> dict:
     return {"id": r.get("id"), "name": r.get("name"),
             "description": r.get("description") or "",
             "enabled": bool(r.get("enabled")), "trusted": bool(r.get("trusted")),
-            "writtenByAgent": r.get("author") == AGENT_AUTHOR,
+            "writtenByAgent": _by_agent(r.get("author")),
             "lastError": r.get("last_error"), "updatedAt": r.get("updated_at"),
             "codeChars": len(r.get("code") or "")}
 
@@ -370,12 +442,18 @@ async def t_save_script(args: dict, ctx: dict) -> dict:
         raise ToolError("code required")
     sid = _s(args, "id")
     client = ctx.get("client") or ""
+    me = _author(ctx)
+    why = _forecast_only(ctx)
+    if why:
+        audit("save_script", client, False, why)
+        raise ToolError(why)
     if sid:
         r = _script(sid)
-        if r and r.get("author") != AGENT_AUTHOR:
-            audit("save_script", client, False, f"tried to overwrite user script {sid}")
-            raise ToolError("That script was written by the user; an agent can only "
-                            "edit scripts it created. Save under a new id instead.")
+        if r and r.get("author") != me:
+            audit("save_script", client, False, f"tried to overwrite script {sid} it did not write")
+            raise ToolError("That script was written by the user or by another of the "
+                            "user's agents; an agent can only edit scripts it created. "
+                            "Save under a new id instead.")
         if r and r.get("trusted"):
             audit("save_script", client, False, f"tried to edit trusted script {sid}")
             raise ToolError("That script is now trusted (un-sandboxed). Agents cannot "
@@ -389,7 +467,7 @@ async def t_save_script(args: dict, ctx: dict) -> dict:
                                     "notes": f"Written by AI agent ({client or 'unknown'})."})
     with db.get_db() as conn:
         conn.execute("UPDATE user_scripts SET author=?, enabled=0, trusted=0 WHERE id=?",
-                     (AGENT_AUTHOR, sid))
+                     (me, sid))
     errs = res.get("errors") or []
     audit("save_script", client, True,
           f"saved {sid} ({res.get('script', {}).get('name')})"
@@ -407,9 +485,14 @@ async def t_set_script_enabled(args: dict, ctx: dict) -> dict:
     r = _script(sid)
     if not r:
         raise ToolError("No script with that id.")
-    if r.get("author") != AGENT_AUTHOR:
-        audit("set_script_enabled", client, False, f"user script {sid}")
-        raise ToolError("An agent can only switch scripts it wrote.")
+    if r.get("author") != _author(ctx):
+        audit("set_script_enabled", client, False, f"script {sid} it did not write")
+        raise ToolError("An agent can only switch scripts it wrote — not the user's, "
+                        "and not another agent's.")
+    why = _forecast_only(ctx) if enabled else None
+    if why:
+        audit("set_script_enabled", client, False, why)
+        raise ToolError(why)
     if r.get("trusted"):
         audit("set_script_enabled", client, False, f"trusted script {sid}")
         raise ToolError("Trusted scripts are armed by the user only.")
@@ -423,6 +506,7 @@ async def t_set_script_enabled(args: dict, ctx: dict) -> dict:
     return {"script": {**_summary(r), "enabled": enabled},
             "scriptsMode": mode,
             "note": "The Scripts page's own live/paper switches decide whether it trades."}
+
 
 
 _last_patch = 0.0
@@ -443,7 +527,7 @@ async def t_get_config(args: dict, _ctx: dict) -> dict:
         "settings": bool(cfg.get("mcp_allow_config")),
         "liveSwitchesAndRiskLimits": bool(cfg.get("mcp_allow_live_switches")),
     }
-    out["environment"] = cfg.get("kalshi_env")
+    out["accountMode"] = cfg.get("account_mode")
     return out
 
 
@@ -452,6 +536,7 @@ async def t_engine_status(_args: dict, _ctx: dict) -> dict:
 
 
 def vet_patch(patch: Any, cfg: dict) -> tuple[dict, list[str]]:
+    """(sanitized snake-case patch, refusals). Pure apart from config."""
     from config import merge_with_defaults
     if not isinstance(patch, dict) or not patch:
         return {}, ["patch must be a non-empty object of config keys"]
@@ -483,6 +568,10 @@ async def t_update_config(args: dict, ctx: dict) -> dict:
     global _last_patch
     cfg = HOOKS.get_cfg()
     client = ctx.get("client") or ""
+    why = _forecast_only(ctx)
+    if why:
+        audit("update_engine_config", client, False, why)
+        raise ToolError(why)
     patch, refusals = vet_patch(args.get("patch"), cfg)
     if refusals and not args.get("apply_partial"):
         audit("update_engine_config", client, False, "; ".join(refusals))
@@ -513,6 +602,7 @@ async def t_update_config(args: dict, ctx: dict) -> dict:
             pass
     return {"applied": changes, "before": before, "refusedKeys": refusals,
             "note": "Applied through the app's settings store; visible in Settings."}
+
 
 
 _SINCE = {"type": "integer", "minimum": 1, "maximum": 365}

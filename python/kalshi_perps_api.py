@@ -1,3 +1,26 @@
+"""Kalshi perpetual-futures ("margin") REST client.
+
+Sibling of kalshi_api.py for the perps API (https://docs.kalshi.com/margin).
+Same RSA-PSS signing (kalshi_auth.sign_headers), same retry/429/clock-resync
+ladder, but a DIFFERENT host pair and price convention:
+
+  * Host: external-api.kalshi.com — NOT the event-contract host. Paths
+    live under /trade-api/v2/margin/*.
+  * Prices are FIXED-POINT DOLLAR STRINGS up to 4dp on the wire (tick 0.0001,
+    responses may carry 6dp); quantities are fixed-point count strings
+    ("1200.00"). NEVER the event API's 1-99 integer cents — and never floats:
+    wire strings are parsed with Decimal into integer micro-dollars
+    (usd_micro) / centi-contracts (cc), the units the perp_* DB tables store.
+  * Public market data (markets, orderbook, candlesticks, trades, funding
+    rates) is UNAUTHENTICATED and always read from PRODUCTION — research data
+    keeps flowing whatever mode the app is in, creds or not. Signed
+    portfolio calls need Live: Paper has no perps book, and in Paper every
+    signed perps call is refused before anything is signed.
+  * Timestamps: REST query params are unix SECONDS (start_ts/end_ts);
+    responses mix RFC3339 date-times and unix-second ints; WS uses epoch-ms.
+
+No batch endpoints, no queue position, no RFQs on margin.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -8,13 +31,12 @@ import uuid
 
 import httpx
 
-from kalshi_api import KalshiAPIError
-from kalshi_auth import sign_headers, get_env, sync_server_time, ENV_LOCK
+from kalshi_api import KalshiAPIError, _paper_mode_error
+from kalshi_auth import sign_headers, get_env, sync_server_time, ENV_LOCK, PAPER
 
 logger = logging.getLogger(__name__)
 
 _PERPS_BASES = {
-    "demo": "https://external-api.demo.kalshi.co",
     "production": "https://external-api.kalshi.com",
 }
 PUBLIC_BASE = _PERPS_BASES["production"]
@@ -33,11 +55,14 @@ _signed_client: Optional[httpx.AsyncClient] = None
 _signed_env: str = ""
 
 
+
 _MICRO = Decimal("1000000")
 _CC = Decimal("100")
 
 
 def usd_micro(s) -> int | None:
+    """Wire dollar string → integer micro-dollars ('6.3500' → 6_350_000).
+    Decimal end-to-end: usd_micro('0.0001') == 100 exactly. None-safe."""
     if s is None:
         return None
     try:
@@ -47,11 +72,13 @@ def usd_micro(s) -> int | None:
 
 
 def micro_str(m: int, dp: int = 4) -> str:
+    """Integer micro-dollars → wire string (6_350_000 → '6.3500')."""
     q = Decimal(int(m)) / _MICRO
     return f"{q:.{dp}f}"
 
 
 def cc(s) -> int | None:
+    """Wire FixedPointCount string → integer centi-contracts ('1200.00' → 120_000)."""
     if s is None:
         return None
     try:
@@ -61,6 +88,8 @@ def cc(s) -> int | None:
 
 
 def cc_str(c: int) -> str:
+    """Integer centi-contracts → wire count string. Whole contracts are emitted
+    without decimals (fractional_trading_enabled is false on all live perps)."""
     q = Decimal(int(c)) / _CC
     if q == q.to_integral_value():
         return str(int(q))
@@ -68,6 +97,7 @@ def cc_str(c: int) -> str:
 
 
 def micro_to_usd(m) -> float | None:
+    """Loader-side convenience: 6_350_000 → 6.35 (research code wants floats)."""
     if m is None:
         return None
     return int(m) / 1_000_000
@@ -80,6 +110,8 @@ def cc_to_contracts(c) -> float | None:
 
 
 def rfc3339_to_sqlite(s: str) -> str:
+    """'2026-07-05T20:00:00Z' / '...T20:00:00.123456Z' → '2026-07-05 20:00:00'
+    (the repo-wide SQLite TEXT format replay's bucketizers slice)."""
     s = (s or "").strip().replace("T", " ").rstrip("Z")
     if "." in s:
         s = s.split(".", 1)[0]
@@ -89,10 +121,10 @@ def rfc3339_to_sqlite(s: str) -> str:
 
 
 def env_ticker(symbol: str, env: str) -> str:
-    s = (symbol or "").upper()
-    if env == "demo" and s and not s.endswith("1"):
-        return s + "1"
-    return s
+    """Symbol → wire ticker. Production is the only perps venue, so this is
+    the upper-cased symbol; kept as a function so callers stay unchanged."""
+    return (symbol or "").upper()
+
 
 
 async def _get_pub_client() -> httpx.AsyncClient:
@@ -157,6 +189,9 @@ async def close_clients() -> None:
 
 
 async def _pub_get(path: str, params: dict | None = None) -> Any:
+    """Unauthenticated GET against the PROD perps host. Soft-fails to None
+    (kalshi_api._pub_get semantics: 429 honors retry-after, 5xx backoff,
+    network errors → None, never raises)."""
     assert path.startswith("/")
     url = f"{PATH_PREFIX}{path}"
     for attempt in range(1, MAX_RETRIES + 1):
@@ -192,11 +227,20 @@ async def _signed_request(
     timeout: httpx.Timeout | float | None = None,
     pin_env: str | None = None,
 ) -> Any:
+    """Signed request with the kalshi_api retry ladder (429 wait, 5xx backoff,
+    timestamp-401 clock resync) against the perps host for the current env.
+
+    Env safety mirrors kalshi_api._signed_request: the env is pinned to
+    `pin_env` (or the env seen on the first attempt) and an env switch
+    mid-flight ABORTS instead of silently signing for the other account.
+    """
     assert path.startswith("/")
     signed_path = f"{PATH_PREFIX}{path}"
     method = method.upper()
     last_exc: Optional[Exception] = None
     env0: Optional[str] = pin_env
+    if env0 == PAPER:
+        raise _paper_mode_error()
 
     for attempt in range(1, MAX_RETRIES + 1):
         cur_env = get_env()
@@ -207,6 +251,8 @@ async def _signed_request(
                 409, {"error": {"code": "env_changed",
                                 "message": "environment switched mid-request; aborted"}},
             )
+        if cur_env == PAPER:
+            raise _paper_mode_error()
         headers = sign_headers(method, signed_path)
         client = await _get_signed_client()
         try:
@@ -251,7 +297,10 @@ async def _signed_request(
     raise RuntimeError("exhausted retries without response")
 
 
+
 async def fetch_perps_markets(status: str = "") -> list[dict]:
+    """All perps markets with live bid/ask/price, reference/settlement/
+    liquidation mark prices, OI, volume, contract_size, leverage_estimates."""
     params = {"status": status} if status else None
     data = await _pub_get("/margin/markets", params=params)
     if not isinstance(data, dict):
@@ -267,6 +316,8 @@ async def fetch_perps_market(ticker: str) -> dict | None:
 
 
 async def fetch_perps_orderbook(ticker: str) -> dict | None:
+    """Raw book: {'orderbook': {'bids': [[px_str, count_str]...], 'asks': ...}}
+    — price levels stay dollar strings; convert with usd_micro at ingest."""
     data = await _pub_get(f"/margin/markets/{ticker}/orderbook")
     return data if isinstance(data, dict) else None
 
@@ -277,6 +328,9 @@ async def fetch_perps_candlesticks(
     end_ts: int,
     period_interval: int = 1,
 ) -> list[dict]:
+    """One request. Candles carry bid/ask quote OHLC (always present) + trade
+    OHLC/mean (null when no trades) + volume + OI. Timestamps unix seconds;
+    candles included are those ENDING in [start_ts, end_ts]."""
     if period_interval not in PERIOD_MIN_VALID:
         raise ValueError(f"period_interval must be one of {PERIOD_MIN_VALID}, got {period_interval}")
     data = await _pub_get(
@@ -301,6 +355,10 @@ async def fetch_perps_candlesticks_range(
     sleep_between: float = 0.3,
     max_requests: int = 60,
 ) -> list[dict]:
+    """Chunked fetch of an arbitrary window (backfill/top-up). Windows of
+    CANDLE_CHUNK candles; if a non-empty page ends short of its window
+    (undocumented server page cap), continue from the last candle instead of
+    trusting the window was complete. Deduped on end_period_ts."""
     period_s = int(period_interval) * 60
     out: dict[int, dict] = {}
     cursor = int(start_ts)
@@ -363,6 +421,9 @@ async def fetch_perps_trades(
 
 
 async def fetch_funding_rate_estimate(ticker: str) -> dict | None:
+    """In-progress window estimate: time-weighted premium-index average over
+    [last_funding_time, now), finalized at next_funding_time. Carries
+    funding_rate (double), mark_price (FP$), computed_time, next_funding_time."""
     data = await _pub_get(
         "/margin/funding_rates/estimate", params={"ticker": ticker},
     )
@@ -375,6 +436,8 @@ async def fetch_funding_rates_historical(
     start_ts: int | None = None,
     end_ts: int | None = None,
 ) -> list[dict]:
+    """Finalized funding rates (+ mark price at funding). Empty ticker = ALL
+    markets; omitted timestamps = full available history (verified tiny)."""
     params: dict = {}
     if ticker:
         params["ticker"] = ticker
@@ -396,6 +459,7 @@ async def fetch_perps_exchange_status() -> dict | None:
 async def fetch_perps_risk_parameters() -> dict | None:
     data = await _pub_get("/margin/risk_parameters")
     return data if isinstance(data, dict) else None
+
 
 
 async def get_perps_enabled() -> bool:
@@ -450,6 +514,8 @@ async def get_perps_fills(
 async def get_perps_funding_history(
     start_date: str, end_date: str, ticker: str = "",
 ) -> list[dict]:
+    """Our paid/received funding payments joined with rates.
+    Dates are inclusive UTC YYYY-MM-DD (both required by the API)."""
     params: dict = {"start_date": start_date, "end_date": end_date}
     if ticker:
         params["ticker"] = ticker
@@ -485,6 +551,7 @@ async def get_perps_notional_risk_limit() -> dict | None:
     except (KalshiAPIError, httpx.HTTPError):
         return None
     return data if isinstance(data, dict) else None
+
 
 
 async def place_perps_limit_order(
@@ -560,6 +627,9 @@ async def get_perps_orders(ticker: str = "", *, limit: int = 200) -> list[dict]:
 async def find_perps_order_by_client_id(
     client_order_id: str, *, ticker: str = "", pin_env: str | None = None,
 ) -> dict | None:
+    """Lost-response recovery, mirroring kalshi_api.find_order_by_client_id:
+    after a POST whose response was lost the order may be live — look it up by
+    our client id before booking an error."""
     params: dict = {"limit": 200}
     if ticker:
         params["ticker"] = ticker

@@ -1,3 +1,4 @@
+"""Auto-upgrade to Kalshi's Advanced API usage level — orchestration logic."""
 from __future__ import annotations
 
 import asyncio

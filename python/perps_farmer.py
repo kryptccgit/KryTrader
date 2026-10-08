@@ -1,3 +1,40 @@
+"""Perps volume farmer — maker-only, two-sided, loss-capped.
+
+Kalshi's in-app perps rewards pay volume bonuses (observed 2026-07:
+trade $50 → $25, $100K notional → $40, $1M → $200 ≈ 2-4 bps of volume).
+This engine generates qualifying volume at the lowest achievable cost:
+join the best bid AND best ask with small post_only clips, let the market
+fill both sides, and let captured spread offset the maker fees. It is a
+volume engine with a loss budget — NOT a profit strategy:
+
+    net cost / $ volume ≈ maker fee (5 bps today, 4 at the $100K 30-day
+    tier from ~Jul 8) − captured half-spread (~1-3 bps on KXBTCPERP)
+    ± adverse selection (unknowable up front — measured live below).
+
+The whole design hangs on MEASURED economics: every fill lands in
+perp_farm_fills (volume, fees, avg-cost realized P&L) and the engine
+auto-halts for the UTC day when the realized cost per $ of volume exceeds
+`perps_farm_max_cost_bps` (default = the ~4 bps bonus rate: if farming
+costs more than the bonus pays, stop burning) or the hard daily loss cap.
+
+Compliance: single-account genuine two-sided resting liquidity — exactly
+what venue programs pay for. No self-matches: quotes never cross each
+other (cross-guard + venue self-trade prevention), no wash trades, no
+prearranged volume (Rulebook 5.17).
+
+Mechanics per ~2.5s tick (gated from the service main loop, never raises):
+  * gates: enabled, WS quote fresh, spread ≥ min ticks, not in the Thu
+    maintenance window, margin enabled + funded (cached), daily halts
+  * desired quotes: join best bid / best ask, post_only, clip contracts;
+    an inventory beyond ±cap quotes only the reducing side
+  * requote: cancel/replace a resting order when the touch moved more than
+    `requote_ticks` away from its price
+  * fills: polled via GET /margin/fills since the last seen fill, deduped
+    into perp_farm_fills; inventory + avg-cost realized P&L updated here
+  * reconcile: positions endpoint every ~60s is the inventory tiebreaker
+
+Live orders are recovered by client_order_id after lost responses, the
+same discipline as the event-side engines."""
 from __future__ import annotations
 
 import asyncio
@@ -38,9 +75,12 @@ def in_maintenance_window(dt: datetime | None = None) -> bool:
     return _MAINT_START_UTC <= hm < _MAINT_END_UTC
 
 
+
 def desired_quotes(
     quote: dict, inventory_cc: int, cfg: dict,
 ) -> dict[str, int]:
+    """{'bid': price_micro, 'ask': price_micro} we WANT resting, given the
+    live top-of-book and our inventory. Empty dict = stand down this tick."""
     bid = quote.get("bid_usd_micro")
     ask = quote.get("ask_usd_micro")
     if not bid or not ask or ask <= bid:
@@ -64,6 +104,8 @@ def should_replace(live_price_micro: int, target_micro: int, cfg: dict) -> bool:
 
 def apply_fill(inv_cc: int, avg_micro: float, side: str, count_cc: int,
                price_micro: int) -> tuple[int, float, int]:
+    """Avg-cost inventory accounting. Returns (new_inv_cc, new_avg_micro,
+    realized_pnl_usd_micro). side is OUR order side: bid = buy (+), ask = sell (−)."""
     signed = count_cc if side == "bid" else -count_cc
     realized = 0.0
     if inv_cc == 0 or (inv_cc > 0) == (signed > 0):
@@ -80,6 +122,7 @@ def apply_fill(inv_cc: int, avg_micro: float, side: str, count_cc: int,
         elif inv_cc == 0:
             avg_micro = 0.0
     return inv_cc, avg_micro, int(round(realized))
+
 
 
 class _Farmer:
@@ -103,6 +146,7 @@ class _Farmer:
         self._stats_dirty: bool = True
         self._stats_day: str = ""
 
+
     def _wire_ticker(self, cfg: dict) -> str:
         sym = str(cfg.get("perps_farm_symbol") or "KXBTCPERP").upper().rstrip("1")
         return papi.env_ticker(sym, self.env)
@@ -120,6 +164,7 @@ class _Farmer:
         self.running = False
         if cancel_orders:
             await self._cancel_all()
+
 
     async def _cancel_all(self) -> None:
         for side in list(self.live):
@@ -159,6 +204,7 @@ class _Farmer:
                 }
             else:
                 logger.debug(f"perps_farmer: place {side} failed: {e}")
+
 
     async def _poll_fills(self, ticker: str, cfg: dict) -> None:
         min_ts = self.last_fill_ts - 5 if self.last_fill_ts else int(time.time()) - 3600
@@ -237,6 +283,8 @@ class _Farmer:
         return self.day_stats
 
     def _refresh_maker_fee(self) -> None:
+        """Refresh the measured maker fee (bps) at most every _FEE_REFRESH_SEC.
+        None until enough real fills exist; the gate then assumes Tier-0."""
         now = time.monotonic()
         if self._last_fee_calc and now - self._last_fee_calc < _FEE_REFRESH_SEC:
             return
@@ -248,6 +296,9 @@ class _Farmer:
             logger.debug(f"perps_farmer: fee calc failed: {e}")
 
     def _fee_gate_blocks(self, cfg: dict) -> str:
+        """Non-empty reason when the maker fee we're charged exceeds the user's
+        cap (0 = off). Cost of farming ≈ the maker fee, so this keeps the farmer
+        idle until fees are actually worth it."""
         max_fee = float(cfg.get("perps_farm_max_fee_bps", 0) or 0)
         if max_fee <= 0:
             return ""
@@ -282,6 +333,7 @@ class _Farmer:
         target = float(cfg.get("perps_farm_daily_volume_usd", 0) or 0)
         if target > 0 and vol_usd >= target:
             self._halt(f"daily volume target ${target:,.0f} reached")
+
 
     async def _reconcile(self, ticker: str) -> None:
         try:
@@ -330,7 +382,9 @@ class _Farmer:
                 self.last_error = f"balance check failed: {e}"
         return self._balance_ok
 
+
     async def farm_tick(self, cfg: dict) -> None:
+        """Awaited from the service loop every ≥2.5s while enabled. Never raises."""
         try:
             await self._tick(cfg)
         except Exception as e:
@@ -409,6 +463,7 @@ class _Farmer:
             await self._place(ticker, side, target, clip_cc)
 
     async def flatten(self, cfg: dict) -> dict:
+        """Cancel quotes and close inventory with reduce_only IOC at the touch."""
         ticker = self._wire_ticker(cfg)
         await self._cancel_all()
         closed = 0
@@ -482,6 +537,7 @@ async def farm_tick(cfg: dict) -> None:
 
 
 async def ensure_stopped() -> None:
+    """Called when the toggle goes off — cancel resting quotes exactly once."""
     if _farmer.running or _farmer.live:
         await _farmer.stop(cancel_orders=True)
 
@@ -495,6 +551,12 @@ def status(cfg: dict) -> dict:
 
 
 def ensure_ws(cfg: dict, env: str) -> None:
+    """Config-reconcile the farmer's quote feed (owned here since the perps
+    recorder was removed): the margin WS runs iff the farmer is enabled, the WS
+    toggle is on, and credentials exist for the env (the margin WS handshake is
+    always signed). Subscribes ONLY the farm symbol. perps_ws buffers are
+    capped drop-oldest, so nothing drains them to the DB anymore — unconsumed
+    rows simply age out; the farmer reads the live quote cache, not the tape."""
     want = (
         bool(cfg.get("perps_farm_enabled", False))
         and bool(cfg.get("perps_ws_enabled", True))
@@ -510,11 +572,19 @@ def ensure_ws(cfg: dict, env: str) -> None:
         asyncio.get_event_loop().create_task(pws.stop())
 
 
+
 _WALLET_TTL_SEC = 20.0
 _wallet_cache: dict = {"t": 0.0, "data": None}
 
 
 async def wallet(env: str) -> dict | None:
+    """Perps (margin) wallet balance — the SEPARATE perps wallet, distinct from
+    the main Kalshi cash balance. Powers the Perps page's wallet card.
+
+    Cached ~20s: the available-balance computation costs 50 rate tokens/call and
+    the page polls status every 3s. Never flashes a spurious zero — a failed or
+    malformed poll serves the last-known snapshot (balance-flash-zero guard);
+    returns None only before the first good read or when creds/env are absent."""
     if not kalshi_auth.credentials_present(env):
         return None
     now = time.monotonic()

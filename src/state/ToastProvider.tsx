@@ -3,6 +3,7 @@ import {
 } from 'react';
 import { CheckCircle, XCircle, Info, AlertTriangle, X } from 'lucide-react';
 import { cls } from '../utils/format';
+import { GlassPanel } from '../components/glass/GlassPanel';
 
 export type ToastKind = 'success' | 'error' | 'info' | 'warn';
 
@@ -86,13 +87,13 @@ function ToastItem({ toast, onClose }: { toast: Toast; onClose: () => void }) {
     Info;
 
   return (
-    <div
+    <GlassPanel
+      preset="modal"
+      display="flex"
+      tint="linear-gradient(165deg, rgba(30,28,48,0.62), rgba(12,12,20,0.72))"
+      style={{ boxShadow: TOAST_GLOW[toast.kind] }}
       className={cls(
-        'pointer-events-auto flex items-start gap-3 rounded-xl border bg-krypt-surface/90 p-3 backdrop-blur-md shadow-krypt-soft animate-fade-in',
-        toast.kind === 'success' && 'border-krypt-win/30',
-        toast.kind === 'error' && 'border-krypt-loss/40',
-        toast.kind === 'warn' && 'border-krypt-warn/40',
-        toast.kind === 'info' && 'border-krypt-border',
+        'glass-pop pointer-events-auto items-start gap-3 rounded-2xl p-3',
         exit && 'opacity-0 transition-opacity duration-200',
       )}
     >
@@ -105,14 +106,21 @@ function ToastItem({ toast, onClose }: { toast: Toast; onClose: () => void }) {
           toast.kind === 'info' && 'text-krypt-purple',
         )}
       />
-      <div className="flex-1 text-sm">{toast.message}</div>
+      <div className="flex-1 text-sm text-white/95">{toast.message}</div>
       <button
         onClick={onClose}
-        className="text-krypt-muted hover:text-white"
+        className="text-krypt-muted transition-colors hover:text-white"
         aria-label="Dismiss"
       >
         <X className="h-4 w-4" />
       </button>
-    </div>
+    </GlassPanel>
   );
 }
+
+const TOAST_GLOW: Record<ToastKind, string> = {
+  success: 'inset 0 0 0 1px rgba(34,197,94,0.3), 0 0 30px -10px rgba(34,197,94,0.5), var(--glass-shadow)',
+  error: 'inset 0 0 0 1px rgba(239,68,68,0.38), 0 0 30px -10px rgba(239,68,68,0.5), var(--glass-shadow)',
+  warn: 'inset 0 0 0 1px rgba(245,158,11,0.38), 0 0 30px -10px rgba(245,158,11,0.45), var(--glass-shadow)',
+  info: 'inset 0 0 0 1px rgba(168,85,247,0.22), 0 0 30px -12px rgba(168,85,247,0.45), var(--glass-shadow)',
+};

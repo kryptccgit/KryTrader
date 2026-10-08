@@ -1,3 +1,10 @@
+"""Autopilot: an AI agent on a timer, billed to the user's key.
+
+The provider is faked with scripted replies. What is pinned: it calls tools
+only through mcp_server (so every rail applies), it stops at each of its three
+budgets, it stops when switched off, it never overlaps itself, and every run
+is recorded with what it cost.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -32,6 +39,7 @@ def _text(t):
 
 
 class FakeAnthropic:
+    """Replays a script of responses; records every request."""
     script: list = []
     calls: list = []
 
@@ -230,3 +238,22 @@ def test_budget_settings_are_clamped():
     assert cfg["autopilot_interval_min"] == 15
     assert cfg["autopilot_daily_token_budget"] == 50_000_000
     assert cfg["autopilot_enabled"] is False
+
+
+def test_deleting_the_agent_autopilot_runs_as_blocks_it_never_falls_back(env):
+    """Pre-release audit (v6): the agent Autopilot runs as is deleted. It must
+    not quietly run as Default (usually looser rules); it blocks, says why,
+    and records no run and no bill."""
+    env["cfg"].update(autopilot_agent_id="gone1",
+                      mcp_agents=[{"id": "default", "name": "Default"}])
+    cfg = _cfg(env)
+    assert cfg["autopilot_agent_id"] == "gone1"
+    why = autopilot.blocked_reason(cfg)
+    assert why and "no longer exists" in why
+    assert autopilot.status(cfg)["blockedReason"] == why
+    res = run(autopilot.run_once(cfg, "manual"))
+    assert res["ok"] is False and "no longer exists" in res["message"]
+    assert autopilot.runs(5) == [] and FakeAnthropic.calls == []
+    env["cfg"].update(autopilot_agent_id="sam1", mcp_agents=[
+        {"id": "default", "name": "Default"}, {"id": "sam1", "name": "Sam", "enabled": False}])
+    assert "switched off" in autopilot.blocked_reason(_cfg(env))

@@ -17,6 +17,14 @@ def kalshi_fee_per_contract(
     price: float, fee_coeff: float = DEFAULT_FEE_COEFF,
     contracts: Optional[int] = None,
 ) -> float:
+    """Kalshi taker fee per contract, in dollars.
+
+    contracts=None → the continuous marginal rate fee_coeff·p·(1−p) (right for
+    large orders, where per-order rounding vanishes). With `contracts`, model
+    the REAL fee: Kalshi rounds the per-ORDER fee UP to the next cent, so small
+    orders pay much more per contract — a 1-lot at 95c pays 1c (3× the 0.33c
+    continuous model), which is exactly where the deep-favorite presets live.
+    """
     p = max(0.0, min(1.0, float(price)))
     raw = fee_coeff * p * (1.0 - p)
     if not contracts or contracts <= 0:
@@ -235,7 +243,7 @@ def format_report(report: dict, source_label: str) -> str:
     L.append(f"resolved signals: {o['n']}  (whale {n_w}, momentum {n_m})")
     L.append("")
     if o["n"] == 0:
-        L.append("No resolved signals found. Run the bot (even in demo/dry-run) long")
+        L.append("No resolved signals found. Run the bot (even on paper) long")
         L.append("enough for signals to settle, then re-run this backtest.")
         return "\n".join(L)
 

@@ -1,3 +1,14 @@
+"""Generate a parameter-swept candidate corpus for the Coin Optimizer.
+
+Turbine publishes a huge parameter sweep of each strategy family (up to ~910
+variants per family). Rather than scrape that bot-protected set, we generate the
+same kind of grid ourselves over the directional rule vocabulary — the honest,
+self-sufficient version of the same idea (and what Turbine does internally). The
+optimizer then scores every candidate per coin per hour-bucket on OUR data and
+keeps only what survives; a bad candidate just loses.
+
+Coin-AGNOSTIC: each recipe is a rule-set. The optimizer scopes it to the target
+coin itself (crypto15m_assets), so ~120 recipes sweep across all 7 coins."""
 from __future__ import annotations
 
 from turbine_import import _ge, _gt, _le, _lt, _price_band_rules
@@ -36,6 +47,7 @@ def _band_tag(b: list) -> str:
 
 
 def generate() -> list[dict]:
+    """Return coin-agnostic candidate strategies (name, archetype, config)."""
     out: list[dict] = []
 
     for cf, cf_tag in (("change5mPct", "5m"), ("change15mPct", "15m")):

@@ -1,125 +1,106 @@
 import React, { useEffect, useState } from 'react';
 import {
-  ArrowLeftRight, ExternalLink, Eye, EyeOff, Gift, KeyRound, RefreshCcw,
-  Save, ShieldCheck, Trash2, Wifi, WifiOff,
+  ExternalLink, Eye, EyeOff, FlaskConical, Gift, KeyRound, RefreshCcw,
+  Save, ShieldCheck, Sparkles, Trash2, Wifi, WifiOff,
 } from 'lucide-react';
-import type { CredentialsState, CredentialsStatusAll, KalshiEnv } from '@shared/types';
+import type { CredentialsState, CredentialsStatusAll } from '@shared/types';
+import { checkKalshiKeys } from '@shared/kalshiKeys';
 import { useApp } from '../state/AppStateProvider';
 import { useToast } from '../state/ToastProvider';
-import { Card, Page, Section, Switch } from '../components/common';
+import { Card, Modal, Page, Section, Switch } from '../components/common';
+import { KalshiKeyWizard } from '../components/KalshiKeyWizard';
 import { cls } from '../utils/format';
-import { openKalshiReferral } from '../utils/links';
-
-const ENV_LABEL: Record<KalshiEnv, string> = {
-  demo: 'Demo',
-  production: 'Live',
-};
-
-const ENV_PROFILE_URL: Record<KalshiEnv, string> = {
-  demo: 'https://demo.kalshi.co/account/profile',
-  production: 'https://kalshi.com/account/profile',
-};
+import { KALSHI_API_KEYS_URL, openKalshiReferral } from '../utils/links';
+import { isLive } from '../utils/account';
 
 export function ApiKeysPage() {
   const { backend, refresh, config, account } = useApp();
   const toast = useToast();
   const [statusAll, setStatusAll] = useState<CredentialsStatusAll | null>(null);
-  const [busy, setBusy] = useState(false);
+  const [wizard, setWizard] = useState(false);
+  const [dataDir, setDataDir] = useState<string | null>(null);
+  useEffect(() => {
+    void window.krypt.app.getUserDataPath().then(setDataDir).catch(() => setDataDir(null));
+  }, []);
+  const sep = dataDir?.includes('\\') ? '\\' : '/';
+  const credDir = dataDir ? `${dataDir}${sep}credentials` : null;
+  const [inline, setInline] = useState<boolean | null>(null);
+  useEffect(() => {
+    if (statusAll && inline === null) {
+      setInline(!statusAll.production.hasApiKey);
+    }
+  }, [statusAll, inline]);
 
   const reload = async (): Promise<void> => {
     try {
       const all = await window.krypt.credentials.statusAll();
       setStatusAll(all);
-    } catch {   }
+    } catch {
+      setInline((cur) => (cur === null ? false : cur));
+    }
   };
 
   useEffect(() => {
     void reload();
   }, [backend.authOk]);
 
-  const switchEnv = async (env: KalshiEnv): Promise<void> => {
-    if (config?.kalshiEnv === env) return;
-    if (env === 'production' && !window.confirm(
-      config?.enableTrading
-        ? 'Switch active session to PRODUCTION (real money)?\n\nAuto-trading is ON — the bot may place REAL-money orders right away.'
-        : 'Switch active session to PRODUCTION (real money)?\n\nThis environment trades real funds.',
-    )) return;
-    setBusy(true);
-    try {
-      await window.krypt.config.update({ kalshiEnv: env });
-      toast.success(`Switched active session to ${ENV_LABEL[env]}`);
-      await refresh.credentials();
-      await refresh.account();
-      await refresh.backend();
-      await reload();
-    } catch (e: any) {
-      toast.error(`Switch failed: ${e?.message || e}`);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const activeEnv: KalshiEnv = (config?.kalshiEnv as KalshiEnv) ?? 'demo';
+  const live = isLive(config);
 
   return (
     <Page
       title="API Keys"
-      subtitle="Save Kalshi credentials for both Demo and Live accounts. Stored locally under %APPDATA%/Krypt Trader/credentials and never sent off-machine."
+      subtitle={`Your Kalshi API key, for trading Live. Paper mode needs none. Stored encrypted on this computer${credDir ? ` (${credDir})` : ''} and never sent anywhere but Kalshi.`}
       actions={
         <button onClick={() => void reload()} className="krypt-btn-default" title="Re-read credential status from disk">
           <RefreshCcw className="h-4 w-4" /> Refresh
         </button>
       }
     >
-      {!statusAll?.demo.hasApiKey && !statusAll?.production.hasApiKey && (
+      {!statusAll?.production.hasApiKey && (
         <ReferralBanner />
       )}
 
-      <Section title="Active session">
+      {inline ? (
+        <Section title="Add a Kalshi key, step by step">
+          <Card>
+            <KalshiKeyWizard onDone={() => { setInline(false); void reload(); }} />
+          </Card>
+        </Section>
+      ) : (
+        <div className="mb-4 flex justify-end">
+          <button type="button" className="krypt-btn-default" onClick={() => setWizard(true)} data-testid="kalshi-wizard-open">
+            <Sparkles className="h-4 w-4" /> Add a key step by step
+          </button>
+        </div>
+      )}
+      <Modal open={wizard} onClose={() => setWizard(false)}>
+        <KalshiKeyWizard
+          onDone={() => { setWizard(false); void reload(); }}
+          onSkip={() => setWizard(false)}
+          onBackOut={() => setWizard(false)}
+        />
+      </Modal>
+
+      <Section title="Account mode">
         <Card>
-          <div className="flex flex-col items-start gap-4 md:flex-row md:items-center">
+          <div className="flex flex-col items-start gap-4 md:flex-row md:items-center" data-testid="apikeys-mode">
             <div className={cls(
               'grid h-10 w-10 shrink-0 place-items-center rounded-lg',
-              backend.authOk ? 'bg-krypt-win/10 text-krypt-win' : 'bg-krypt-loss/10 text-krypt-loss',
+              !live ? 'bg-krypt-purple/10 text-krypt-purple'
+                : backend.authOk ? 'bg-krypt-win/10 text-krypt-win' : 'bg-krypt-loss/10 text-krypt-loss',
             )}>
-              {backend.authOk ? <Wifi className="h-5 w-5" /> : <WifiOff className="h-5 w-5" />}
+              {!live ? <FlaskConical className="h-5 w-5" /> : backend.authOk ? <Wifi className="h-5 w-5" /> : <WifiOff className="h-5 w-5" />}
             </div>
             <div className="flex-1">
               <div className="text-sm text-white">
-                {backend.authOk
-                  ? `Authenticated · ${ENV_LABEL[activeEnv]}`
-                  : 'Not authenticated'}
+                {!live ? 'Paper — nothing is signed with your key'
+                  : backend.authOk ? 'Live · authenticated' : 'Live · not authenticated'}
               </div>
               <div className="mt-0.5 text-xs text-krypt-muted">
-                The bot signs all requests using the active session's keys.
-                Switch envs with one click — both keypairs stay saved.
+                {!live
+                  ? 'Paper trades Kalshi’s real prices with imaginary money and never uses a key. A key saved here is used only once you choose Go live (Settings → Account), and by the Test button.'
+                  : 'Live orders, balance and positions are signed with the key below.'}
               </div>
-            </div>
-            <div className="inline-flex shrink-0 rounded-md border border-krypt-border bg-krypt-surface2 p-0.5">
-              {(['demo', 'production'] as KalshiEnv[]).map((e) => {
-                const active = activeEnv === e;
-                const has = statusAll?.[e]?.hasApiKey && statusAll?.[e]?.hasRsaKey;
-                return (
-                  <button
-                    key={e}
-                    onClick={() => void switchEnv(e)}
-                    disabled={busy}
-                    className={cls(
-                      'flex items-center gap-1.5 rounded-[6px] px-3 py-1.5 text-xs font-medium uppercase tracking-wider transition-colors',
-                      active
-                        ? e === 'production'
-                          ? 'bg-krypt-loss/15 text-krypt-loss'
-                          : 'bg-krypt-warn/15 text-krypt-warn'
-                        : 'text-krypt-muted hover:text-white',
-                    )}
-                    title={has ? `Switch to ${ENV_LABEL[e]}` : `${ENV_LABEL[e]} keys not saved yet`}
-                  >
-                    {ENV_LABEL[e]}
-                    {!has && <span className="text-[10px] opacity-60">(empty)</span>}
-                    {active && <ArrowLeftRight className="h-3 w-3 opacity-60" />}
-                  </button>
-                );
-              })}
             </div>
           </div>
         </Card>
@@ -152,16 +133,7 @@ export function ApiKeysPage() {
 
       <div className="grid gap-4 lg:grid-cols-2">
         <CredentialSlot
-          env="demo"
-          title="Demo session"
-          accent="warn"
-          status={statusAll?.demo}
-          onSaved={async () => { await reload(); await refresh.credentials(); await refresh.backend(); }}
-        />
-        <CredentialSlot
-          env="production"
-          title="Live session"
-          accent="loss"
+          title="Kalshi key"
           status={statusAll?.production}
           onSaved={async () => { await reload(); await refresh.credentials(); await refresh.backend(); }}
         />
@@ -170,10 +142,14 @@ export function ApiKeysPage() {
       <Section title="Security notes">
         <Card>
           <ul className="list-disc space-y-1.5 pl-5 text-xs text-krypt-muted">
-            <li>Keys are written per-env to <span className="font-mono text-white">%APPDATA%/Krypt Trader/credentials/apikey.&lt;env&gt;.txt</span> with default user-only permissions.</li>
-            <li>The Python backend signs requests locally (Ed25519 or RSA-PSS, whichever key you paste); nothing is sent to any server other than Kalshi&apos;s.</li>
-            <li>You can save Demo and Live credentials at the same time and flip between them with the Active session toggle.</li>
-            <li>Click &quot;Delete saved keys&quot; on a slot before uninstalling if you want them gone.</li>
+            <li>
+              The key is written to{' '}
+              <span className="break-all font-mono text-white">{credDir ? `${credDir}${sep}apikey.production.txt` : 'the app\'s data folder'}</span>,
+              encrypted, with user-only permissions.
+            </li>
+            <li>The Python backend signs requests locally (Ed25519, or RSA-PSS for an RSA key); nothing is sent to any server other than Kalshi&apos;s.</li>
+            <li>In Paper mode nothing is signed with it at all — only the Test button you click.</li>
+            <li>Click Delete before uninstalling if you want it gone.</li>
           </ul>
         </Card>
       </Section>
@@ -205,14 +181,12 @@ function ReferralBanner() {
 }
 
 interface SlotProps {
-  env: KalshiEnv;
   title: string;
-  accent: 'warn' | 'loss';
   status?: CredentialsState;
   onSaved: () => Promise<void>;
 }
 
-function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
+function CredentialSlot({ title, status, onSaved }: SlotProps) {
   const toast = useToast();
   const [apiKey, setApiKey] = useState('');
   const [rsaPem, setRsaPem] = useState('');
@@ -220,28 +194,27 @@ function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
   const [busy, setBusy] = useState(false);
 
   const has = !!status?.hasApiKey && !!status?.hasRsaKey;
-  const accentClasses =
-    accent === 'loss'
-      ? 'border-krypt-loss/30 bg-krypt-loss/5 text-krypt-loss'
-      : 'border-krypt-warn/30 bg-krypt-warn/5 text-krypt-warn';
+  const accentClasses = 'border-krypt-purple/30 bg-krypt-purple/5 text-krypt-purple';
 
   const save = async (): Promise<void> => {
     if (!apiKey.trim() && !rsaPem.trim() && has) {
       toast.error(`${title} already has keys saved. Paste new values to replace, or click Delete to remove them.`);
       return;
     }
-    if (!apiKey.trim()) { toast.error(`${title}: paste your Kalshi API key (UUID) above`); return; }
-    if (!rsaPem.trim() || !rsaPem.includes('-----BEGIN')) {
-      toast.error(`${title}: paste your private key (PEM) above`); return;
+    const chk = checkKalshiKeys({ keyId: apiKey, pem: rsaPem });
+    if (!chk.ok) {
+      toast.error(`${title}: ${chk.issues.map((i) => i.message).join(' ')}`);
+      return;
     }
+    if (chk.fixes.length) toast.info(`${title}: ${chk.fixes.join(' ')}`);
     setBusy(true);
     try {
       const r = await window.krypt.credentials.save({
-        apiKey: apiKey.trim(), rsaPem, env,
+        apiKey: chk.keyId, rsaPem: chk.pem,
       });
       if (!r.ok) { toast.error(r.message || 'Save failed'); return; }
       toast.success(`${title}: keys saved. Verifying…`);
-      const t = await window.krypt.credentials.test(env);
+      const t = await window.krypt.credentials.test();
       if (t.ok) {
         toast.success(`${title}: verified · balance $${t.data?.balanceUsd.toFixed(2)}`);
       } else {
@@ -258,7 +231,7 @@ function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
   const test = async (): Promise<void> => {
     setBusy(true);
     try {
-      const r = await window.krypt.credentials.test(env);
+      const r = await window.krypt.credentials.test();
       if (r.ok) {
         toast.success(`${title}: $${r.data?.balanceUsd.toFixed(2)}`);
       } else {
@@ -273,7 +246,7 @@ function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
     if (!window.confirm(`Delete saved ${title} credentials from disk?`)) return;
     setBusy(true);
     try {
-      const r = await window.krypt.credentials.clear(env);
+      const r = await window.krypt.credentials.clear();
       if (r.ok) { toast.success(`${title}: cleared`); await onSaved(); }
       else toast.error(r.message || 'Failed');
     } finally {
@@ -289,7 +262,7 @@ function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
           accentClasses,
         )}>
           <KeyRound className="h-3 w-3" />
-          {ENV_LABEL[env]}
+          kalshi.com
         </span>
         <div className="text-sm font-semibold text-white">{title}</div>
         <span className={cls(
@@ -332,22 +305,22 @@ function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
         spellCheck={false}
       />
       <p className="krypt-help">
-        Generate one in your Kalshi {ENV_LABEL[env]} account →{' '}
+        Generate one in your Kalshi account (Account → API keys) →{' '}
         <a
           href="#"
           onClick={(e) => {
             e.preventDefault();
-            void window.krypt.app.openExternal(ENV_PROFILE_URL[env]);
+            void window.krypt.app.openExternal(KALSHI_API_KEYS_URL);
           }}
           className="text-krypt-purple hover:underline"
         >
-          open {env === 'production' ? 'kalshi.com' : 'demo.kalshi.co'}
+          open kalshi.com
           <ExternalLink className="ml-0.5 inline h-3 w-3" />
         </a>
       </p>
 
       <label className="krypt-label mt-3 flex items-center justify-between">
-        Private key (PEM, Ed25519 or RSA)
+        Private key (the file Kalshi gave you)
         <button
           type="button"
           onClick={() => setShowPem((v) => !v)}
@@ -358,7 +331,7 @@ function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
       </label>
       <textarea
         className="krypt-input min-h-[140px] font-mono text-[11px]"
-        placeholder={'-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----'}
+        placeholder="Paste the whole key, including its BEGIN and END lines"
         value={rsaPem}
         onChange={(e) => setRsaPem(e.target.value)}
         spellCheck={false}
@@ -368,7 +341,7 @@ function CredentialSlot({ env, title, accent, status, onSaved }: SlotProps) {
             : undefined
         }
       />
-      <p className="krypt-help">PKCS#1 or PKCS#8, password-less.</p>
+      <p className="krypt-help">Ed25519 (Kalshi&apos;s default) or RSA, without a password.</p>
 
       <div className="mt-4 flex flex-wrap items-center gap-2">
         <button onClick={save} disabled={busy} className="krypt-btn-primary">

@@ -1,7 +1,57 @@
 import { ReactNode, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Share2 } from 'lucide-react';
 import { cls } from '../utils/format';
 import { shareToX, X_PROFILE } from '../utils/share';
+import { GlassPanel } from './glass/GlassPanel';
+import { GlassButton } from './glass/GlassButton';
+import { GlassSwitch } from './glass/GlassSwitch';
+import { GLASS_TINTS } from './glass/glassPresets';
+
+export function DialogShell({
+  onClose, maxWidth, children,
+}: { onClose: () => void; maxWidth: string; children: ReactNode }) {
+  return createPortal(
+    <div
+      className="fixed inset-0 z-50 grid place-items-center bg-black/45 p-4"
+      onMouseDown={onClose}
+    >
+      <GlassPanel
+        preset="modal"
+        tint={GLASS_TINTS.modal}
+        className={cls('glass-pop w-full rounded-2xl p-5', maxWidth)}
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        {children}
+      </GlassPanel>
+    </div>,
+    document.body,
+  );
+}
+
+export function Modal({
+  open, onClose, maxWidth = 'max-w-xl', children,
+}: { open: boolean; onClose: () => void; maxWidth?: string; children: ReactNode }) {
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+  if (!open) return null;
+  return createPortal(
+    <div className="fixed inset-0 z-50 grid place-items-center overflow-y-auto bg-black/45 p-4">
+      <GlassPanel
+        preset="modal"
+        tint={GLASS_TINTS.modal}
+        className={cls('glass-pop w-full rounded-2xl p-6', maxWidth)}
+      >
+        {children}
+      </GlassPanel>
+    </div>,
+    document.body,
+  );
+}
 
 export function NameDialog({
   open, title, label, initialValue = '', placeholder, confirmLabel = 'Save',
@@ -38,14 +88,7 @@ export function NameDialog({
   };
 
   return (
-    <div
-      className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4"
-      onMouseDown={onClose}
-    >
-      <div
-        className="w-full max-w-sm rounded-xl border border-krypt-border bg-krypt-surface p-5 shadow-krypt-soft"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
+    <DialogShell onClose={onClose} maxWidth="max-w-sm">
         <h3 className="text-sm font-semibold text-white">{title}</h3>
         {label && <p className="mt-1 text-xs text-krypt-muted">{label}</p>}
         <input
@@ -60,13 +103,12 @@ export function NameDialog({
           className="krypt-input mt-3 w-full"
         />
         <div className="mt-4 flex justify-end gap-2">
-          <button onClick={onClose} className="krypt-btn-default">Cancel</button>
-          <button onClick={submit} disabled={!value.trim()} className="krypt-btn-primary">
+          <GlassButton onClick={onClose}>Cancel</GlassButton>
+          <GlassButton variant="primary" onClick={submit} disabled={!value.trim()}>
             {confirmLabel}
-          </button>
+          </GlassButton>
         </div>
-      </div>
-    </div>
+    </DialogShell>
   );
 }
 
@@ -85,24 +127,16 @@ export function ConfirmDialog({
 }) {
   if (!open) return null;
   return (
-    <div
-      className="fixed inset-0 z-50 grid place-items-center bg-black/60 p-4"
-      onMouseDown={onClose}
-    >
-      <div
-        className="w-full max-w-md rounded-xl border border-krypt-border bg-krypt-surface p-5 shadow-krypt-soft"
-        onMouseDown={(e) => e.stopPropagation()}
-      >
+    <DialogShell onClose={onClose} maxWidth="max-w-md">
         <h3 className="text-sm font-semibold text-white">{title}</h3>
-        <div className="mt-2 text-xs leading-relaxed text-krypt-muted">{body}</div>
+        <div className="mt-2 text-xs leading-relaxed text-white/70">{body}</div>
         <div className="mt-4 flex justify-end gap-2">
-          <button onClick={onClose} className="krypt-btn-default">{cancelLabel}</button>
-          <button onClick={onConfirm} className={danger ? 'krypt-btn-danger' : 'krypt-btn-primary'}>
+          <GlassButton onClick={onClose}>{cancelLabel}</GlassButton>
+          <GlassButton variant={danger ? 'danger' : 'primary'} onClick={onConfirm}>
             {confirmLabel}
-          </button>
+          </GlassButton>
         </div>
-      </div>
-    </div>
+    </DialogShell>
   );
 }
 
@@ -118,7 +152,7 @@ export function Page({
     <div className="flex h-full flex-col">
       <div className="flex shrink-0 items-end justify-between gap-4 px-6 py-5">
         <div>
-          <h2 className="text-2xl font-semibold tracking-tight text-white">{title}</h2>
+          <h2 className="glass-title text-2xl font-semibold tracking-tight">{title}</h2>
           {subtitle && (
             <p className="mt-1 text-sm text-krypt-muted">{subtitle}</p>
           )}
@@ -141,13 +175,13 @@ export function Card({
   return (
     <div className={cls('krypt-card', className)}>
       {header && (
-        <div className="-mx-5 -mt-5 mb-4 border-b border-krypt-border bg-krypt-surface2/60 px-5 py-3">
+        <div className="-mx-5 -mt-5 mb-4 rounded-t-2xl border-b border-white/[0.06] bg-gradient-to-b from-white/[0.05] to-white/[0.01] px-5 py-3">
           {header}
         </div>
       )}
       {children}
       {footer && (
-        <div className="-mx-5 -mb-5 mt-4 border-t border-krypt-border bg-krypt-surface2/60 px-5 py-3">
+        <div className="-mx-5 -mb-5 mt-4 rounded-b-2xl border-t border-white/[0.06] bg-white/[0.02] px-5 py-3">
           {footer}
         </div>
       )}
@@ -164,19 +198,33 @@ export function StatCard({
   accent?: 'good' | 'bad' | 'warn' | 'neutral';
   className?: string;
 }) {
-  const ring =
-    accent === 'good' ? 'ring-1 ring-krypt-win/30' :
-    accent === 'bad' ? 'ring-1 ring-krypt-loss/30' :
-    accent === 'warn' ? 'ring-1 ring-krypt-warn/30' :
-    '';
   return (
-    <div className={cls('krypt-card', ring, className)}>
+    <GlassPanel
+      preset="card"
+      tint={ACCENT_TINT[accent ?? 'neutral']}
+      className={cls('rounded-2xl p-5', className)}
+      style={{ boxShadow: ACCENT_GLOW[accent ?? 'neutral'] }}
+    >
       <div className="text-[11px] uppercase tracking-wider text-krypt-muted">{label}</div>
-      <div className="mt-1 font-mono text-2xl font-medium text-white">{value}</div>
-      {hint && <div className="mt-1 text-xs text-krypt-dim">{hint}</div>}
-    </div>
+      <div className="mt-1 font-mono text-2xl font-medium tabular-nums text-white [text-shadow:0_1px_12px_rgba(0,0,0,0.5)]">{value}</div>
+      {hint && <div className="mt-1 text-xs text-white/50">{hint}</div>}
+    </GlassPanel>
   );
 }
+
+const ACCENT_TINT: Record<'good' | 'bad' | 'warn' | 'neutral', string> = {
+  neutral: GLASS_TINTS.card,
+  good: 'linear-gradient(160deg, rgba(34,197,94,0.13), rgba(14,14,24,0.58) 55%)',
+  bad: 'linear-gradient(160deg, rgba(239,68,68,0.13), rgba(14,14,24,0.58) 55%)',
+  warn: 'linear-gradient(160deg, rgba(245,158,11,0.13), rgba(14,14,24,0.58) 55%)',
+};
+
+const ACCENT_GLOW: Record<'good' | 'bad' | 'warn' | 'neutral', string> = {
+  neutral: 'var(--glass-shadow)',
+  good: 'inset 0 0 0 1px rgba(34,197,94,0.32), 0 0 34px -14px rgba(34,197,94,0.55), var(--glass-shadow)',
+  bad: 'inset 0 0 0 1px rgba(239,68,68,0.32), 0 0 34px -14px rgba(239,68,68,0.55), var(--glass-shadow)',
+  warn: 'inset 0 0 0 1px rgba(245,158,11,0.32), 0 0 34px -14px rgba(245,158,11,0.5), var(--glass-shadow)',
+};
 
 export function ShareableStat({
   label, value, hint, accent, className, shareText,
@@ -210,7 +258,7 @@ export function ShareButton({
       onClick={() => void shareToX(text)}
       title={`Share to ${X_PROFILE}`}
       className={cls(
-        'grid place-items-center rounded-md border border-krypt-border bg-krypt-surface2 text-krypt-muted transition-colors hover:border-krypt-purple/40 hover:bg-krypt-purple/10 hover:text-white',
+        'grid place-items-center rounded-lg border border-white/10 bg-gradient-to-b from-white/[0.08] to-white/[0.02] text-krypt-muted shadow-[inset_0_1px_0_rgba(255,255,255,0.08)] transition-all duration-200 hover:border-krypt-purple/50 hover:bg-krypt-purple/15 hover:text-white hover:shadow-[0_0_16px_-4px_rgba(168,85,247,0.7)] active:scale-90',
         sz,
         className,
       )}
@@ -224,7 +272,7 @@ export function Empty({
   title, description, action,
 }: { title: string; description?: string; action?: ReactNode }) {
   return (
-    <div className="grid place-items-center rounded-xl border border-dashed border-krypt-border p-10 text-center">
+    <div className="grid place-items-center rounded-2xl border border-dashed border-white/10 bg-white/[0.015] p-10 text-center">
       <div>
         <div className="text-base font-medium text-white">{title}</div>
         {description && <p className="mt-1 max-w-md text-sm text-krypt-muted">{description}</p>}
@@ -244,36 +292,30 @@ export function Switch({
   disabled?: boolean;
 }) {
   return (
-    <button
-      role="switch"
-      aria-checked={checked}
-      disabled={disabled}
-      onClick={() => onChange(!checked)}
+    <div
+      onClick={() => { if (!disabled) onChange(!checked); }}
       className={cls(
-        'flex w-full items-start justify-between gap-4 rounded-lg border border-krypt-border bg-krypt-surface2 p-3 text-left transition-colors hover:border-krypt-borderHi',
-        disabled && 'opacity-50',
+        'flex w-full cursor-pointer select-none items-center justify-between gap-4 rounded-xl border border-white/[0.07] bg-white/[0.025] p-3 text-left shadow-[inset_0_1px_0_rgba(255,255,255,0.04)] transition-colors hover:border-white/[0.14] hover:bg-white/[0.04]',
+        disabled && 'cursor-not-allowed',
       )}
     >
-      <div className="flex-1">
+      <div className={cls('flex-1', disabled && 'opacity-50')}>
         {label && <div className="text-sm text-white">{label}</div>}
         {description && (
           <div className="mt-0.5 text-xs text-krypt-muted">{description}</div>
         )}
       </div>
-      <div
-        className={cls(
-          'relative h-5 w-9 shrink-0 rounded-full transition-colors',
-          checked ? 'bg-krypt-glow' : 'bg-krypt-border',
-        )}
-      >
-        <div
-          className={cls(
-            'absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all',
-            checked ? 'left-4' : 'left-0.5',
-          )}
+      <div className="shrink-0" onClick={(e) => e.stopPropagation()}>
+        <GlassSwitch
+          checked={checked}
+          onCheckedChange={onChange}
+          disabled={disabled}
+          ariaLabel={label}
+          width={44}
+          height={24}
         />
       </div>
-    </button>
+    </div>
   );
 }
 
@@ -284,9 +326,20 @@ export function useOptimisticValue<T>(
   const [local, setLocal] = useState<T>(value);
   const key = JSON.stringify(value ?? null);
   useEffect(() => { setLocal(value); }, [key]);
+  const valueRef = useRef(value);
+  valueRef.current = value;
+  const seq = useRef(0);
   const apply = (next: T): void => {
     setLocal(next);
-    void onCommit(next);
+    const mine = ++seq.current;
+    const rollback = (): void => {
+      if (mine === seq.current) setLocal(valueRef.current);
+    };
+    try {
+      void Promise.resolve(onCommit(next)).catch(rollback);
+    } catch {
+      rollback();
+    }
   };
   return [local, apply];
 }

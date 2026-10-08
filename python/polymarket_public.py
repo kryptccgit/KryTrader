@@ -1,3 +1,38 @@
+"""Polymarket, read-only.
+
+Why this exists: Kalshi and Polymarket list overlapping questions, and a
+terminal that shows the same question priced on both venues is useful in a way
+nobody has to trust us for — the two numbers are checkable against two public
+APIs.
+
+Why it is READ-ONLY, deliberately:
+
+  * Trading Polymarket needs a Polygon wallet, USDC collateral and the L1/L2
+    signing scheme — a whole custody surface this app does not have and should
+    not grow by accident.
+  * Polymarket geoblocks US persons from trading, and this app's users are on a
+    US CFTC-regulated exchange. Offering a trade button that would be refused
+    (or worse, not refused) is not a feature.
+  * `krypt-polybot` already does Polymarket execution properly.
+
+So: prices in, no orders out. Everything here hits public endpoints with no
+credentials of any kind.
+
+── Venue differences that matter, and must never be smoothed over ──────────
+Kalshi is a CFTC-regulated designated contract market; contracts settle under
+exchange rules against named sources, and member funds sit in segregated
+accounts. Polymarket is an on-chain venue settling via the UMA optimistic
+oracle, where resolution can be proposed and disputed by token holders. Two
+markets asking the same question in English can therefore still settle
+DIFFERENTLY. That is why nothing in this module or its UI ever calls a price
+difference an arbitrage.
+
+── Shapes ──────────────────────────────────────────────────────────────────
+Gamma quotes 0..1 fractions, not cents, and — unlike Kalshi — carries a real
+`bestBid`/`bestAsk` on the market object, so one sweep prices the whole
+universe without a per-market round trip. `outcomePrices` is a midpoint and is
+NOT used as a quote.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -56,6 +91,10 @@ async def close_clients() -> None:
 
 
 async def _get(url: str, params: dict | None = None) -> Any:
+    """One public GET, serialised with a minimum gap, counted on the Privacy
+    panel's ledger. Returns None when the endpoint did not answer — never [] or
+    {}, because "Polymarket is unreachable" and "Polymarket has nothing" are
+    different facts and the UI says which."""
     global _last_call, _lock, _geoblocked_at
     if _lock is None:
         _lock = asyncio.Lock()
@@ -96,7 +135,16 @@ async def _get(url: str, params: dict | None = None) -> Any:
         return None
 
 
+
 def price_cents(v: Any) -> Optional[float]:
+    """A Polymarket 0..1 price → cents, or None when there is no price.
+
+    Deliberately NOT the Kalshi parser. The venues differ:
+      * Polymarket quotes fractions (0.18), Kalshi quotes cents (18).
+      * Polymarket's tick is usually 0.01 but some markets go to 0.001, so a
+        price can legitimately be 0.2c — a range Kalshi has no concept of.
+      * 0 and 1 are the settled outcomes at both venues and are not quotes.
+    """
     if v is None or isinstance(v, bool):
         return None
     try:
@@ -138,6 +186,7 @@ def _iso(v: Any) -> Optional[str]:
 
 
 def market_row(raw: dict) -> Optional[dict]:
+    """One Gamma market → the shape the cross-venue panel renders."""
     if not isinstance(raw, dict):
         return None
     cid = _text(raw.get("conditionId")) or _text(raw.get("condition_id"))
@@ -181,6 +230,13 @@ def market_row(raw: dict) -> Optional[dict]:
 
 
 async def sweep(refresh: bool = False) -> dict:
+    """Open Polymarket markets, ranked by 24h volume, cached.
+
+    Gamma's `search`/`q` parameters are silently IGNORED (verified 2026-08-24:
+    'bitcoin', 'fed' and a nonsense string all returned the same rows), so
+    there is no server-side lookup to lean on — matching happens locally
+    against this sweep, exactly like the Kalshi side.
+    """
     if not refresh:
         hit = _cache.get("sweep")
         if hit and time.monotonic() - hit[0] < SWEEP_TTL:
@@ -227,6 +283,7 @@ async def sweep(refresh: bool = False) -> dict:
 
 
 async def market(condition_id: str) -> Optional[dict]:
+    """One market by conditionId, for refreshing a pinned pair."""
     cid = (condition_id or "").strip()
     if not cid:
         return None

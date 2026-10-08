@@ -19,6 +19,7 @@ _seq = 0
 
 def _seed_whale(*, ticker="KXTEST-A", side="yes", price=0.60, dollars=3000.0,
                 ago_sql: str = "now") -> int:
+    """Insert a whale_trades row `ago_sql` old (SQLite datetime modifier)."""
     global _seq
     _seq += 1
     with db.get_db() as conn:

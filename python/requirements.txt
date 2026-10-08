@@ -1,7 +1,21 @@
 httpx>=0.28.0
 cryptography>=42.0.0
 websockets>=12.0
+# Explicit, though httpx already pulls it in: ws_ssl.py builds the WebSocket
+# SSL context from this bundle because a frozen macOS build has no usable
+# OpenSSL default verify paths. A transitive-only dep can silently drop out
+# of the PyInstaller bundle; this one going missing kills every wss feed.
 certifi>=2024.2.2
 
+# AI market analysis (Terminal). Both are optional at RUNTIME — the feature
+# is inert without a user-supplied key — but not at BUILD time: the frozen
+# bundle has no pip to fall back on, so a missing SDK here is a feature
+# that fails on the user machine and nowhere else.
 anthropic>=1.1,<2
 openai>=3.5,<4
+# Both SDKs are built on httpx2, and ai_providers.counted_client hands them
+# an httpx2.Client directly (anthropic rejects a plain httpx.Client with a
+# TypeError -- that is what broke every Anthropic call). Pinned so the type
+# we build is the type the SDKs check for, not whatever a transitive resolve
+# happens to pick; `service.py --selftest` proves the pairing in the bundle.
+httpx2>=2.12,<3

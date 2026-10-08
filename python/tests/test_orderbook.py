@@ -28,6 +28,9 @@ def test_fp_orderbook_restores_cross_pricing():
 
 
 def test_cross_pricing_rounds_decicent_levels_not_truncates():
+    """Main-engine regression: book levels are deci-cent floats now. int(5.7)
+    truncated to 5 -> cross 95c, a 1c overbid vs the historical round(5.7)=6 ->
+    cross 94c behavior."""
     raw = {"orderbook_fp": {"no_dollars": [["0.0570", "100.00"]], "yes_dollars": []}}
     book = kalshi_api._normalize_orderbook(raw)
     assert book["no"] == [[5.7, 100.0]]
@@ -35,6 +38,10 @@ def test_cross_pricing_rounds_decicent_levels_not_truncates():
 
 
 def test_normalize_preserves_decicent_levels():
+    """tapered_deci_cent books (all 7 15m crypto series) carry real 0.1c levels
+    in the deep-favorite band — quantizing to whole cents merged them and made
+    resting exits look 'at the bid' 0.1-0.5c above the TRUE bid (never filled).
+    Live wire shape verified 2026-07-16: dollar strings at 3dp ("0.0110")."""
     raw = {"orderbook_fp": {
         "yes_dollars": [["0.9470", "100.00"], ["0.9480", "50.00"]],
         "no_dollars": [["0.0110", "651.00"]],
@@ -45,6 +52,8 @@ def test_normalize_preserves_decicent_levels():
 
 
 def test_place_limit_order_decicent_validation(monkeypatch):
+    """Deci-cent prices are accepted and hit the wire as exact 4dp dollars;
+    off-grid prices are rejected before any network call."""
     import asyncio
     sent = {}
 

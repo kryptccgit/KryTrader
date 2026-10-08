@@ -1,3 +1,17 @@
+"""Cross-venue matching.
+
+The gold cases below are real titles pulled from both live APIs, chosen because
+a plain token-overlap matcher got them WRONG in the most dangerous direction:
+it paired Barack Obama with Michelle Obama, Mark Cuban with Mark Kelly, Jon
+Stewart with Jon Ossoff and John Fetterman with John Thune — each of which
+would have rendered as a double-digit "spread" between two different people —
+while rejecting the true Marco Rubio and J.D. Vance pairs because the
+boilerplate swamped the name.
+
+A false pair is far worse than a missed one here. A missed pair shows nothing;
+a false pair invites a trade on a market that is not the one on screen. Every
+must-not-match case below is therefore a regression test on that failure.
+"""
 from __future__ import annotations
 
 import crossvenue as cv
@@ -51,6 +65,7 @@ def _score(title, sub, question, k_close=None, p_close=None):
     return cv.score_pair(k_text, question, _idf(k_text), k_close, p_close)
 
 
+
 def test_two_different_people_never_pair():
     for title, sub, question in MUST_NOT_MATCH:
         conf, why = _score(title, sub, question)
@@ -85,6 +100,7 @@ def test_a_rephrasing_is_not_treated_as_a_different_question():
     assert conf >= cv.CONFIDENT
 
 
+
 def test_different_strikes_do_not_pair():
     conf, why = _score("Will Bitcoin reach $150,000 by December 31, 2026?", "",
                        "Will Bitcoin reach $200,000 by December 31, 2026?")
@@ -115,6 +131,7 @@ def test_every_score_carries_its_reasons():
     for title, sub, question in MUST_MATCH + MUST_NOT_MATCH:
         _conf, why = _score(title, sub, question)
         assert why and all(isinstance(w, str) and w for w in why)
+
 
 
 def _poly(question, **over):
@@ -149,6 +166,7 @@ def test_nothing_is_returned_when_nothing_is_close():
     assert cv.find_matches(k, pool) == []
 
 
+
 def test_a_price_difference_is_never_called_an_edge():
     k = {"yesBid": 40.0, "yesAsk": 41.0}
     p = {"yesBid": 30.0, "yesAsk": 31.0}
@@ -176,6 +194,7 @@ def test_asks_are_compared_to_asks():
 def test_near_identical_asks_report_neither_side_as_cheaper():
     c = cv.compare({"yesBid": 40.0, "yesAsk": 41.0}, {"yesBid": 40.0, "yesAsk": 41.2})
     assert c["cheaperToBuyYes"] == "neither"
+
 
 
 def test_polymarket_prices_are_fractions_not_cents():
@@ -212,6 +231,7 @@ def test_an_unquoted_market_has_no_spread_or_mid():
 def test_a_market_with_no_condition_id_is_dropped():
     assert pm.market_row({"question": "Q?"}) is None
     assert pm.market_row(None) is None
+
 
 
 def test_vice_presidency_is_not_the_presidency():
@@ -266,7 +286,12 @@ def test_reasons_read_as_english_not_as_python():
     assert "both name" in blob
 
 
+
 def test_announcing_a_run_is_not_the_same_question_as_winning():
+    """Live 2026-08-25: scored 0.59 confident and rendered 23.0c against 1.95c
+    — a 21c "difference" between declaring a candidacy and winning an
+    election. The Kalshi side states no stage, so the general-election stage
+    on the Polymarket side had nothing to clash with."""
     conf, why = _score(
         "Will Donald Trump announce a run for President of the United States?",
         "Donald Trump",
@@ -275,6 +300,9 @@ def test_announcing_a_run_is_not_the_same_question_as_winning():
 
 
 def test_a_combined_market_is_not_its_own_single_leg():
+    """Live 2026-08-25: scored 0.78 confident. P(A and B) <= P(A) by
+    construction, so pairing a joint against one of its legs manufactures a
+    permanent one-directional spread rather than an occasional wrong number."""
     conf, why = _score(
         "Will Gavin Newsom and JD Vance be the 2028 Democratic and Republican nominees?",
         "Gavin Newsom",
@@ -291,6 +319,8 @@ def test_the_conjunction_rule_reads_names_not_any_and():
 
 
 def test_both_sides_combining_names_still_pair():
+    """The rule fires on a DIFFERENCE, not on the presence of a conjunction —
+    two venues asking the same combined question must still match."""
     conf, _why = _score(
         "Will Trump and Putin meet before 2027?", "",
         "Will Trump and Putin meet before 2027?")
@@ -298,6 +328,8 @@ def test_both_sides_combining_names_still_pair():
 
 
 def test_neither_side_stating_a_stage_is_not_penalised():
+    """Sports and event markets state no stage at all. Silence on both sides is
+    agreement by omission and must stay unpenalised."""
     conf, _ = _score("Will Trump buy Greenland? Before 2027", "",
                      "Will Trump acquire Greenland before 2027?")
     assert conf >= cv.CONFIDENT

@@ -1,3 +1,12 @@
+"""AI agents over MCP, the paper book, and the forecast scoreboard.
+
+The MCP server is the second surface (after remote control) where something
+other than a hand at this desk can spend money. Most of what is pinned here is
+what it REFUSES: a buy with no forecast, a forecast with no edge after fees, an
+order over the agent's caps, a sell of the user's own position, a request from
+a host or origin that is not this machine. And the scoreboard must refuse to
+crown a winner on a sample that cannot support it.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -40,10 +49,10 @@ def run(coro):
 def _clean(monkeypatch):
     db.init_db()
     with db.get_db() as conn:
-        for t in ("ai_forecasts", "paper_fills", "mcp_orders"):
+        for t in ("ai_forecasts", "paper_fills", "paper_state", "mcp_orders"):
             conn.execute(f"DELETE FROM {t}")
     mcp_server._hits.clear()
-    cfg = {"mcp_enabled": True, "mcp_trade_mode": "paper"}
+    cfg = {"account_mode": "live", "mcp_enabled": True, "mcp_trade_mode": "paper"}
     state = {"cfg": cfg, "authed": False}
     mcp_server.configure(
         get_cfg=lambda: merge_with_defaults(dict(state["cfg"])),
@@ -84,6 +93,7 @@ def _audit_rows():
         return [dict(r) for r in conn.execute("SELECT * FROM mcp_orders ORDER BY id")]
 
 
+
 def test_initialize_negotiates_a_version_and_names_the_rules():
     ctx = {}
     res = run(mcp_server.handle_message({
@@ -101,6 +111,9 @@ def test_initialize_negotiates_a_version_and_names_the_rules():
 
 
 def test_an_unknown_method_is_a_clean_rpc_error():
+    """Claude Code's v2 client probes with `server/discover` (2026-07-28) and
+    falls back to `initialize` only if the probe gets a completed, non-auth,
+    non-5xx answer. A JSON-RPC 'method not found' is that answer."""
     res = run(mcp_server.handle_message(
         {"jsonrpc": "2.0", "id": 9, "method": "server/discover"}, {}))
     assert res["error"]["code"] == -32601
@@ -127,6 +140,7 @@ def test_place_order_is_marked_destructive_for_the_client():
     spec = next(t.spec() for t in mcp_server.TOOLS if t.name == "place_order")
     assert spec["annotations"]["destructiveHint"] is True
     assert spec["annotations"]["readOnlyHint"] is False
+
 
 
 def test_a_buy_without_a_forecast_is_refused_and_audited():
@@ -196,6 +210,7 @@ def test_record_forecast_reports_an_absent_side_as_null(monkeypatch):
     assert body["buyYes"] is None
 
 
+
 def test_paper_buy_walks_the_real_book_up_to_the_limit():
     fid = _forecast(80)
     err, body = _call("place_order", {"ticker": TICKER, "side": "yes", "action": "buy",
@@ -223,7 +238,7 @@ def test_paper_sell_hits_bids_and_cannot_sell_what_it_does_not_hold():
 def test_paper_accounting_settles_at_the_real_outcome(monkeypatch):
     paper_book.record_fill(ticker=TICKER, title="t", side="yes", action="buy",
                            contracts=10, price_cents=54, fee_usd=0.18,
-                           forecast_id=None, client="", env="demo")
+                           forecast_id=None, client="", env="paper")
     pf = paper_book.portfolio(1000.0)
     assert pf["cashUsd"] == pytest.approx(1000 - 5.40 - 0.18)
     assert pf["positions"][0]["unrealizedUsd"] is None
@@ -237,6 +252,7 @@ def test_paper_accounting_settles_at_the_real_outcome(monkeypatch):
     assert pf["realizedUsd"] == pytest.approx(10 - 5.58, abs=0.01)
     assert pf["cashUsd"] == pytest.approx(1000 - 5.58 + 10, abs=0.01)
     assert run(paper_book.settle_pending()) == 0
+
 
 
 def test_the_agent_per_order_cap_binds(_clean):
@@ -265,13 +281,14 @@ def test_unknown_trade_mode_falls_to_off_not_paper():
     assert merge_with_defaults({"mcp_port": 80})["mcp_port"] == 1024
 
 
+
 def test_live_orders_take_the_desktop_submit_path(_clean):
     _clean["cfg"]["mcp_trade_mode"] = "live"
     _clean["cfg"]["mcp_live_approval"] = False
     _clean["authed"] = True
     sent = []
 
-    async def _submit(req):
+    async def _submit(req, scope=None):
         sent.append(req)
         return {"ok": True, "orderId": "ord-1", "message": "Filled 3.",
                 "filledContracts": 3, "avgFillCents": 54.0, "status": "executed"}
@@ -308,6 +325,7 @@ def test_live_agent_cannot_cancel_the_users_orders(_clean):
     assert err and "user's" in body
 
 
+
 def _h(**kw):
     base = {"host": "127.0.0.1:47821", "authorization": "Bearer tok"}
     base.update(kw)
@@ -335,6 +353,7 @@ def _free_port():
 
 
 def test_http_round_trip_and_stdio_bridge(monkeypatch):
+    """The real listener, then the real bridge against it."""
     port = _free_port()
     token = mcp_server.rotate_token()
 
@@ -433,6 +452,7 @@ def test_the_token_is_registered_with_the_log_scrubber():
     assert kalshi_auth.has_secret(mcp_server.TOKEN_SECRET)
 
 
+
 def _resolved(ticker, p, mid, outcome, source="mcp"):
     fid = forecast_ledger.record(ticker=ticker, prob_yes=p, source=source,
                                  market={"midCents": mid})
@@ -492,6 +512,7 @@ def test_resolver_only_scores_settled_markets(monkeypatch):
     assert forecast_ledger.get(b)["outcome"] is None
 
 
+
 def test_panel_analysis_passes_auth_and_records_its_forecast(monkeypatch):
     import ai_analyst
     import service
@@ -527,13 +548,14 @@ def test_a_declined_fair_value_is_not_recorded(monkeypatch):
     assert forecast_ledger.scoreboard()["totalForecasts"] == 0
 
 
+
 @pytest.fixture
 def live(_clean, monkeypatch):
     _clean["cfg"]["mcp_trade_mode"] = "live"
     _clean["authed"] = True
     sent = []
 
-    async def _submit(req):
+    async def _submit(req, scope=None):
         sent.append(req)
         return {"ok": True, "orderId": f"ord-{len(sent)}", "message": "Placed.",
                 "filledContracts": 0, "avgFillCents": None, "status": "resting"}
@@ -603,11 +625,12 @@ def test_approval_cannot_be_disabled_by_a_mangled_config():
     assert merge_with_defaults({"mcp_live_approval": False})["mcp_live_approval"] is False
 
 
+
 def test_the_daily_loss_stop_halts_buys_but_not_exits(_clean, monkeypatch):
     _clean["cfg"]["mcp_daily_loss_usd"] = 5.0
     paper_book.record_fill(ticker=TICKER, title="t", side="yes", action="buy",
                            contracts=20, price_cents=54, fee_usd=0.35,
-                           forecast_id=None, client="", env="demo")
+                           forecast_id=None, client="", env="paper")
 
     async def _found(tickers):
         return {TICKER: {"ticker": TICKER, "yes_bid_dollars": "0.20",
@@ -636,6 +659,7 @@ def test_unrealised_gains_do_not_pay_for_realised_losses():
     assert d["unrealizedUsd"] == pytest.approx(8.0)
     loss = max(0.0, -(d["realizedUsd"] + min(0.0, d["unrealizedUsd"])))
     assert loss == pytest.approx(3.0)
+
 
 
 def test_phone_approval_needs_the_remote_trading_switch(live):

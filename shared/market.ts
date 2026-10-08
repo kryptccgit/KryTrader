@@ -1,4 +1,5 @@
-import type { KalshiEnv } from './types';
+
+import type { BookEnv } from './types';
 
 export type DataSource =
   | 'kalshi-ws'
@@ -54,6 +55,7 @@ export interface MarketSummary {
   observedAt: string;
 }
 
+
 export type DiscoverColumn =
   | 'trending'
   | 'closing'
@@ -80,6 +82,7 @@ export interface DiscoverResult {
   ageSec: number | null;
 }
 
+
 export interface BookLevel {
   priceCents: number;
   contracts: number;
@@ -101,6 +104,7 @@ export interface OrderBookSnapshot {
   stale: boolean;
   note: string | null;
 }
+
 
 export type CandleInterval = 1 | 60 | 1440;
 
@@ -128,6 +132,7 @@ export interface CandleSeries {
   note: string | null;
 }
 
+
 export interface TapeTrade {
   tradeId: string;
   ticker: string;
@@ -149,6 +154,7 @@ export interface TapeResult {
   note: string | null;
   fetchedAt: string;
 }
+
 
 export type RiskVerdict = 'pass' | 'warn' | 'fail' | 'unknown';
 
@@ -177,6 +183,7 @@ export interface ResolutionRisk {
   venueNote: string;
 }
 
+
 export interface MarketDetail {
   market: MarketSummary;
   event: {
@@ -200,6 +207,7 @@ export interface MarketDetail {
   fetchedAt: string;
   errors: { panel: string; message: string }[];
 }
+
 
 export interface TerminalPosition {
   ticker: string;
@@ -230,7 +238,7 @@ export interface TerminalPortfolio {
   cashUsd: number | null;
   shardCash: Record<string, { name: string; cashUsd: number }>;
   shardTransferUrl: string;
-  env: KalshiEnv;
+  env: BookEnv;
   fetchedAt: string;
   note: string | null;
 }
@@ -240,9 +248,8 @@ export interface RestingOrder {
   clientOrderId: string | null;
   ticker: string;
   title: string | null;
-  /** null when Kalshi sent no direction at all — never guessed as "buy YES". */
-  side: MarketSideName | null;
-  action: OrderAction | null;
+  side: MarketSideName;
+  action: OrderAction;
   priceCents: number | null;
   count: number | null;
   remaining: number | null;
@@ -251,12 +258,14 @@ export interface RestingOrder {
   manual: boolean;
 }
 
+
 export interface TicketRequest {
   ticker: string;
   side: MarketSideName;
   action: OrderAction;
   count: number;
   priceCents: number;
+  expectMode?: 'paper' | 'live';
 }
 
 export interface TicketPreview extends TicketRequest {
@@ -283,6 +292,7 @@ export interface TicketResult {
   avgFillCents: number | null;
   feesUsd: number | null;
   reconciled: boolean;
+  code?: string;
 }
 
 export interface ManualTrade {
@@ -315,7 +325,7 @@ export interface CalibrationBucket {
 }
 
 export interface ManualHistory {
-  env: KalshiEnv;
+  env: BookEnv;
   trades: ManualTrade[];
   closedCount: number;
   openCount: number;
@@ -330,6 +340,7 @@ export interface ManualHistory {
   fetchedAt: string;
   note: string | null;
 }
+
 
 export type RuleKind = 'stop' | 'take' | 'alert';
 
@@ -357,7 +368,7 @@ export interface TerminalRule {
 export interface RuleList {
   rules: TerminalRule[];
   armedCount: number;
-  env: KalshiEnv;
+  env: BookEnv;
   fetchedAt: string;
 }
 
@@ -370,6 +381,7 @@ export interface RuleRequest {
   contracts?: number | null;
   note?: string;
 }
+
 
 export interface MicroSample {
   ts: number;
@@ -393,6 +405,7 @@ export interface Microstructure {
   probeFillablePct: number | null;
   note: string | null;
 }
+
 
 export interface HostReport {
   host: string;
@@ -423,6 +436,7 @@ export interface NetworkReport {
   fetchedAt: string;
   note: string;
 }
+
 
 export interface PolyMarket {
   conditionId: string;
@@ -475,6 +489,7 @@ export interface CrossVenueResult {
   fetchedAt: string;
 }
 
+
 export interface RemoteBotStatus {
   configured: boolean;
   running: boolean;
@@ -504,7 +519,34 @@ export interface RemoteStatus {
   alertsEnabled: boolean;
 }
 
-export type AiProvider = 'anthropic' | 'openai';
+
+export type AiProvider =
+  | 'anthropic' | 'openai' | 'openrouter' | 'gemini' | 'ollama' | 'lmstudio';
+
+export interface AiProviderCaps {
+  label: string;
+  local: boolean;
+  needsKey: boolean;
+  webSearch: boolean;
+  webSearchHow: string;
+  tools: 'all' | 'per-model';
+  toolsHow: string;
+  tokens: string;
+  pricing: 'published' | 'provider' | 'none' | 'free';
+  catalogue: 'curated' | 'listed';
+  modelsEndpoint: string;
+}
+
+export interface AiProviderCheck {
+  ok: boolean;
+  provider: AiProvider;
+  message: string;
+  model?: string;
+  models?: string[];
+  modelInfo?: { id: string; tools: boolean | null; context: number | null; loaded: boolean | null }[];
+  tools?: boolean;
+  webSearch?: boolean;
+}
 
 export type AiVerdict = 'cheap' | 'rich' | 'fair' | 'unclear';
 
@@ -553,6 +595,8 @@ export interface AiStatus {
   keys: Record<AiProvider, boolean>;
   models: Record<AiProvider, string[]>;
   providers: AiProvider[];
+  capabilities: Record<AiProvider, AiProviderCaps>;
+  prices?: Record<string, { inPerMTok: number; outPerMTok: number }>;
 }
 
 export type AiAnalyzeResult =
@@ -598,19 +642,63 @@ export interface TerminalApi {
   aiStatus: () => Promise<AiStatus>;
   aiSetKey: (args: { provider: AiProvider; key: string })
     => Promise<{ ok: boolean; provider: AiProvider; hasKey: boolean }>;
+  aiCheckProvider: (args: { provider: AiProvider }) => Promise<AiProviderCheck>;
   aiAnalyze: (args: { ticker: string }) => Promise<AiAnalyzeResult>;
   aiScoreboard: () => Promise<ForecastScoreboard>;
 
   mcpStatus: () => Promise<McpStatus>;
-  mcpRotateToken: () => Promise<{ ok: boolean }>;
-  mcpCopyConfig: (args: { client: McpClient }) => Promise<{ ok: boolean }>;
+  mcpRotateToken: (args?: { agentId?: string }) => Promise<{ ok: boolean }>;
+  mcpCopyConfig: (args: { client: McpClient; agentId?: string }) => Promise<{ ok: boolean }>;
+  mcpCopyHttpSnippet: (args?: { agentId?: string }) => Promise<{ ok: boolean }>;
+  mcpInstallConfig?: (args: { client: 'claude-desktop' | 'codex'; agentId?: string }) => Promise<{
+    ok: boolean; message: string; files: string[]; backups: string[];
+  }>;
+  mcpOpenConfigFolder?: (args: { client: 'claude-desktop' | 'codex' }) => Promise<{ ok: boolean; message?: string }>;
+  agentsClosePaper?: (args: { agentId: string }) => Promise<{
+    ok?: boolean; message?: string;
+    closed?: { ticker: string; side: string; contracts: number; avgPriceCents: number | null; feeUsd: number | null }[];
+    open?: { ticker: string; side: string; contracts: number; reason: string }[];
+  }>;
+  healthCheck: (args?: { deep?: boolean }) => Promise<HealthReport>;
   mcpActivity: (args?: { limit?: number }) => Promise<McpActivity>;
-  mcpPaperReset: () => Promise<{ ok: boolean; removed: number }>;
+  mcpPaperReset: () => Promise<{ ok: boolean; removed: Record<string, number> }>;
   mcpDecide: (args: { id: number; approve: boolean }) => Promise<{ ok: boolean; message: string }>;
   autopilotStatus: () => Promise<AutopilotStatus>;
   autopilotRunNow: () => Promise<{ ok: boolean; message: string }>;
   onMcpOrder: (cb: (d: { mode: McpTradeMode | 'action'; message: string }) => void) => () => void;
+  mcpSeen: () => Promise<McpSeen>;
+  onMcpToolCall: (cb: (d: McpToolCallEvent) => void) => () => void;
 }
+
+export interface McpToolCallEvent {
+  v: 1;
+  kind: 'call' | 'connect';
+  at: number;
+  client: string;
+  transport: string | null;
+  model: string | null;
+  tool: string | null;
+  outcome: 'ok' | 'refused' | 'error';
+  reason: string | null;
+  durationMs: number;
+  summary: string;
+  ticker: string | null;
+  fairCents: number | null;
+  edgeCents: number | null;
+  midCents?: number | null;
+  side: 'yes' | 'no' | null;
+  mode: 'paper' | 'live' | null;
+  suppressed?: number;
+  agentId?: string | null;
+  agentName?: string | null;
+}
+
+export interface McpSeen {
+  clients: { client: string; firstAt: number; lastAt: number; calls: number; model: string | null; agentId?: string }[];
+  agents?: { agentId: string; firstAt: number; lastAt: number; calls: number; clients: string[] }[];
+  now: number;
+}
+
 
 export type ForecastVerdict = 'too-few' | 'indistinguishable' | 'ai-better' | 'market-better';
 
@@ -633,6 +721,8 @@ export interface ForecastRow {
   title: string | null;
   source: 'panel' | 'mcp';
   model: string | null;
+  client: string | null;
+  agentId?: string | null;
   fairValueCents: number | null;
   marketMidCents: number | null;
   outcome: number | null;
@@ -650,8 +740,29 @@ export interface ForecastScoreboard {
   overall: ForecastScore;
   bySource: (ForecastScore & { source: 'panel' | 'mcp' })[];
   buckets: { lo: number; hi: number; n: number; meanForecast: number; hitRate: number }[];
+  byForecaster?: ForecasterScore[];
+  byAgent?: AgentScore[];
   recent: ForecastRow[];
 }
+
+export interface AgentScore extends ForecastScore {
+  agentId: string;
+  total: number;
+  pending: number;
+  lastAt: string | null;
+}
+
+export interface ForecasterScore extends ForecastScore {
+  source: 'panel' | 'mcp';
+  client: string | null;
+  model: string | null;
+  agentId?: string | null;
+  total: number;
+  pending: number;
+  lastAt: string | null;
+  open: { ticker: string; fairValueCents: number; marketMidCents: number | null; createdAt: string | null }[];
+}
+
 
 export type McpTradeMode = 'off' | 'paper' | 'live';
 export type McpClient = 'cursor' | 'claude-code' | 'claude-desktop' | 'codex';
@@ -677,6 +788,8 @@ export interface McpStatus {
   lastCallAt: string | null;
   lastTool: string | null;
   clients: string[];
+  lastSeen: { client: string; at: string } | null;
+  httpEnabled: boolean;
   spentTodayUsd: number;
   rails: McpRails;
   permissions: Record<McpPermission, boolean>;
@@ -684,8 +797,46 @@ export interface McpStatus {
   pending: McpOrderRow[];
   lossToday: {
     realizedUsd: number; unrealizedUsd: number; lossUsd: number; unmarked: string[];
+    unmarkedCostUsd?: number;
+    positionsUnreadable?: boolean;
   } | null;
   toolCount: number;
+  agents?: McpAgentStatus[];
+}
+
+export interface McpAgentStatus {
+  id: string;
+  hasToken: boolean;
+  effectiveMode: McpTradeMode;
+  serverName: string;
+  spentTodayUsd: number | null;
+  lastSeenAt: number | null;
+  calls: number;
+  clients: string[];
+}
+
+
+export type HealthStatus = 'ok' | 'warn' | 'fail' | 'off';
+
+export type HealthAction =
+  | { kind: 'nav'; page: string; label: string }
+  | { kind: 'copy'; text: string; label: string };
+
+export interface HealthRow {
+  id: string;
+  label: string;
+  status: HealthStatus;
+  detail: string;
+  fix: string | null;
+  action: HealthAction | null;
+  network: boolean;
+  tested: boolean;
+}
+
+export interface HealthReport {
+  checkedAt: string;
+  deep: boolean;
+  rows: HealthRow[];
 }
 
 export type McpPermission =
@@ -707,6 +858,8 @@ export interface McpOrderRow {
   env: string;
   mode: 'paper' | 'live';
   client: string | null;
+  agentId?: string;
+  agentName?: string | null;
   ticker: string;
   side: 'yes' | 'no';
   action: 'buy' | 'sell';
@@ -719,7 +872,8 @@ export interface McpOrderRow {
   filled: number | null;
   avgFillCents: number | null;
   message: string;
-  status: 'pending' | 'deciding' | 'approved' | 'rejected' | 'expired' | 'failed' | null;
+  status: 'pending' | 'deciding' | 'approved' | 'rejected' | 'expired' | 'failed'
+    | 'unknown' | 'cancelled' | null;
 }
 
 export interface PaperPosition {
@@ -731,6 +885,15 @@ export interface PaperPosition {
   costUsd: number;
   markCents: number | null;
   unrealizedUsd: number | null;
+  agentId?: string;
+}
+
+export interface AgentPaperSummary {
+  agentId: string;
+  realizedUsd: number;
+  unrealizedUsd: number | null;
+  openPositions: number;
+  fills: number;
 }
 
 export interface PaperBook {
@@ -752,10 +915,11 @@ export interface AutopilotRun {
   trigger: 'schedule' | 'manual';
   provider: string;
   model: string;
-  status: 'running' | 'ok' | 'steps' | 'budget' | 'stopped' | 'error';
+  status: 'running' | 'ok' | 'steps' | 'budget' | 'context' | 'stopped' | 'error';
   steps: number;
   inputTokens: number | null;
   outputTokens: number | null;
+  tokensEstimated?: boolean;
   costUsd: number | null;
   summary: string;
   error: string | null;
@@ -773,13 +937,18 @@ export interface AutopilotStatus {
   today: { runs: number; tokens: number; costUsd: number | null };
   limits: { intervalMin: number; maxRunsPerDay: number; dailyTokenBudget: number; maxSteps: number };
   provider: string;
+  providerLabel?: string;
   model: string;
+  tokenAccounting?: string;
   toolCount: number;
   runs: AutopilotRun[];
+  agentId?: string;
+  agentName?: string | null;
 }
 
 export interface McpActivity {
   orders: McpOrderRow[];
   paper: PaperBook;
+  paperByAgent?: Record<string, AgentPaperSummary>;
   actions: McpActionRow[];
 }

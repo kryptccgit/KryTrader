@@ -1,9 +1,18 @@
+"""Unit tests for the CaptureTrail trailing-exit engine.
+
+The engine reasons in "favorable mark" space (higher = better). Binary callers
+pass the held-side probability; perps callers pass price (long) or its mirror
+(short). These tests exercise the mechanics on raw marks — the domain mapping
+is tested where it's applied (favorable_mark + the backtests).
+"""
 from __future__ import annotations
 
 import capturetrail as ct
 
 
 def _run(marks, p, entry=None):
+    """Feed a mark series through a fresh state; return (exit_index, reason,
+    state) where exit_index is the first tick that fired (or None)."""
     st = ct.CTState.open(entry if entry is not None else marks[0])
     for i, m in enumerate(marks):
         done, reason = ct.step(st, m, p)

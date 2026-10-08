@@ -1,3 +1,29 @@
+"""Discord transport: a minimal Gateway client.
+
+Deliberately hand-rolled on `websockets` rather than pulling in discord.py. The
+app ships a PyInstaller bundle and its whole dependency list is three packages;
+adding a full framework to receive direct messages and post replies would be
+the largest thing in the build. The Gateway subset needed here is small and the
+codebase already hand-rolls a resilient websocket client (kalshi_ws.py), so
+this follows the same shape.
+
+What it does: IDENTIFY, heartbeat, listen for MESSAGE_CREATE, and POST replies
+over the REST API.
+
+── The security rule this file exists to enforce ───────────────────────────
+Only a DIRECT message from the exact paired user id is ever passed to the
+command engine. Two independent checks, because either one alone has a failure
+mode:
+
+  * the author's id must equal the configured id — otherwise anyone who can
+    reach the bot can drive it;
+  * the channel must be a DM (guild_id absent, channel type 1) — otherwise
+    inviting the bot to a server would let it answer "what are my positions"
+    in front of everyone in it.
+
+Everything else is dropped silently. A bot that explains itself to strangers is
+a bot that confirms to strangers that it exists.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -109,6 +135,7 @@ class DiscordBot:
         return self._dm_channel
 
     async def send(self, text: str) -> bool:
+        """Push a message to the paired user. Used for replies AND alerts."""
         chan = await self._dm_channel_id()
         if not chan:
             return False
@@ -232,6 +259,8 @@ class DiscordBot:
 
 
 def _chunks(text: str, size: int):
+    """Split on line boundaries where possible — a table cut mid-row is
+    unreadable on a phone."""
     if len(text) <= size:
         yield text
         return

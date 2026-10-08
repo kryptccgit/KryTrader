@@ -1,3 +1,4 @@
+"""Trend/VWAP indicator fields added for the Turbine strategy library."""
 from __future__ import annotations
 
 import indicators as I

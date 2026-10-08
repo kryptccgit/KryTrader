@@ -1,3 +1,28 @@
+"""Live execution engine for user strategy scripts.
+
+Ticked from the service master loop like every other engine. Each enabled
+script's `decide(ctx)` runs against the shared crypto15m snapshot (already
+~3s-cached, so scripts add no extra API load); returned order intents are
+sanitized, pushed through the money rails, and placed via the same Kalshi
+order path as the built-in engine. Positions are inserted into
+`crypto15m_positions` with a `script:<id>` strategy tag and a `script_id`
+column — the existing crypto15m manage pass (fill polling, settlement,
+never-strand-a-position) then handles their lifecycle for free. With
+`scripts_paper_mode` on, entries become dry_run rows simulated by the same
+paper machinery as paper runners.
+
+Safety rails apply to sandboxed AND trusted scripts (trusted bypasses only
+the language sandbox, never the money rails):
+  • script_max_entry_cents  — hard cap on the submit price
+  • script_max_contracts    — per-order size cap
+  • script_max_open         — open positions per script
+  • script_daily_loss_usd   — per-script realized daily loss → auto-disable
+  • one entry attempt per script per market window (attempted = a position
+    row exists for that script+ticker, including 0-contract refusal rows)
+
+Any script exception / budget breach auto-disables the script and surfaces
+in the UI — the engine loop itself never sees a script error.
+"""
 from __future__ import annotations
 
 import json
@@ -75,6 +100,7 @@ async def _emit_event(name: str, data: Any) -> None:
 
 
 def _disable(sid: str, reason: str) -> None:
+    """Auto-disable a script and record why. Never raises."""
     try:
         with db.get_db() as conn:
             db.update_user_script(conn, sid, enabled=0, last_error=reason[:500])
@@ -84,6 +110,8 @@ def _disable(sid: str, reason: str) -> None:
 
 
 async def _get_compiled(row: dict) -> Optional[script_sandbox.CompiledScript]:
+    """Compiled module for a script row, (re)compiling on code/trusted
+    change. Compile failure disables the script. Restores persisted state."""
     sid = str(row["id"])
     trusted = bool(row.get("trusted"))
     want = script_sandbox.code_hash(str(row.get("code") or ""), trusted)
@@ -115,6 +143,18 @@ async def _get_compiled(row: dict) -> Optional[script_sandbox.CompiledScript]:
 
 
 async def _run_bounded(fn: Callable[[], Any], timeout_s: float, name: str) -> Any:
+    """Run fn() in a joined daemon thread with a hard wall-clock timeout and
+    surface its return/exception. A callable that blocks past the timeout — an
+    un-interruptible C-level op the trace budget can't see, or a trusted hook
+    that never returns — is ABANDONED (thread leaks, logged) so the engine
+    master loop keeps running, and we raise ScriptBudgetExceeded so the caller
+    auto-disables the script.
+
+    The join happens OFF the event loop (asyncio.to_thread): a near-budget
+    hook used to freeze the entire backend — RPC, WS, order polling, the 15m
+    stop-loss cadence — for up to the full timeout, every tick. The hook still
+    runs on its own raw daemon thread (never a pool slot), so an abandoned
+    thread can't exhaust the shared executor."""
     import asyncio
     import threading
     result: dict[str, Any] = {}
@@ -137,6 +177,10 @@ async def _run_bounded(fn: Callable[[], Any], timeout_s: float, name: str) -> An
 
 
 async def _call_hook(mod: script_sandbox.CompiledScript, hook: str, *args: Any) -> Any:
+    """Call a hook with a wall-clock backstop regardless of trust mode, so a
+    hook the deterministic trace budget can't interrupt (any C-level op) can
+    never wedge the service master loop. Sandboxed hooks additionally run under
+    the in-thread line/time trace budget inside mod.call()."""
     timeout = TRUSTED_TIMEOUT_S if mod.trusted else SANDBOX_TIMEOUT_S
     return await _run_bounded(
         lambda: mod.call(hook, *args, budget_ms=DECIDE_BUDGET_MS),
@@ -144,6 +188,13 @@ async def _call_hook(mod: script_sandbox.CompiledScript, hook: str, *args: Any) 
 
 
 def _script_daily_pnl(conn, sid: str, env: str, *, paper: bool) -> float:
+    """Realized P&L today across BOTH position tables (crypto windows +
+    main-market signal follows) — the per-script daily-loss breaker's input.
+
+    Scoped to the CURRENT mode: paper (dry_run) and live rows must never share
+    the breaker's bucket, or a morning of simulated paper wins would let real
+    live losses run past script_daily_loss_usd the same day. bot_positions
+    signal follows are live-only, so they only count in live mode."""
     total = 0.0
     try:
         row = conn.execute(
@@ -170,6 +221,8 @@ def _script_daily_pnl(conn, sid: str, env: str, *, paper: bool) -> float:
 
 
 def _count_open_for_script(conn, sid: str, env: str, *, paper: bool) -> int:
+    """Open positions gating script_max_open — mode-scoped like the daily
+    P&L, so resting paper rows never consume live slots (or vice versa)."""
     n = 0
     try:
         n += conn.execute(
@@ -210,6 +263,8 @@ def _already_attempted(conn, sid: str, ticker: str, env: str) -> bool:
 
 def _record_refusal(sid: str, a: dict, side: str, env: str, reason: str,
                     *, paper: bool = False) -> None:
+    """0-contract canceled row: marks the ticker attempted for this script's
+    window and shows the refusal in the position history."""
     with db.get_db() as conn:
         pid = db.insert_crypto15m_position(conn, {
             "asset": a["asset"], "series": a.get("series") or "",
@@ -229,6 +284,10 @@ def _record_refusal(sid: str, a: dict, side: str, env: str, reason: str,
 
 async def _place_intent(s: dict, a: dict, intent: dict, cfg: dict,
                         env: str, *, paper: bool) -> Optional[dict]:
+    """Push a sanitized intent through the rails and place the order.
+    Returns the inserted position row (any status) or None on a quiet skip.
+    Mirrors _open_entry's crash-safety: the row is inserted BEFORE the POST
+    so a lost response can always be reconciled via the client_order_id."""
     sid = str(s["id"])
     side = intent["side"]
     direction = crypto15m_trader.direction_for_favorite(side)
@@ -290,10 +349,11 @@ async def _place_intent(s: dict, a: dict, intent: dict, cfg: dict,
         resp = await kalshi_api.place_limit_order(
             ticker=ticker, side=direction, action="buy",
             count=contracts, price_cents=limit_cents, client_order_id=coid,
+            pin_env=env,
         )
     except Exception as e:
         recovered, lookup_ok = await crypto15m_trader._lookup_lost_order(
-            coid, ticker or "")
+            coid, ticker or "", pin_env=env)
         with db.get_db() as conn:
             if isinstance(recovered, dict) and recovered.get("order_id"):
                 db.update_crypto15m_position(
@@ -326,6 +386,7 @@ async def _place_intent(s: dict, a: dict, intent: dict, cfg: dict,
 
 
 def _pos_lite(r: dict) -> dict:
+    """Compact position dict handed to on_fill / on_settle hooks."""
     return {
         "id": r.get("id"), "ticker": r.get("ticker"), "asset": r.get("asset"),
         "side": r.get("side"), "contracts": r.get("filled_contracts") or 0,
@@ -341,6 +402,7 @@ def _snake_to_camel(k: str) -> str:
 
 
 def _sanitize_supervise(raw) -> tuple[dict, list[str]]:
+    """(clean snake-key patch limited to the whitelist, rejection notes)."""
     if raw is None:
         return {}, []
     if not isinstance(raw, dict) or not isinstance(raw.get("set"), dict):
@@ -378,6 +440,10 @@ def _sanitize_supervise(raw) -> tuple[dict, list[str]]:
 
 async def _run_supervise(s: dict, mod: script_sandbox.CompiledScript,
                          cfg: dict, app: dict) -> None:
+    """One supervise() call: sanitize the returned patch against the
+    whitelist, drop no-ops, rate-limit, and hand the survivors to the host
+    (which persists them + pushes the merged config back). Every applied
+    patch is audit-logged."""
     sid = str(s["id"])
     raw = await _call_hook(mod, "supervise", dict(app))
     patch, notes = _sanitize_supervise(raw)
@@ -401,6 +467,9 @@ async def _run_supervise(s: dict, mod: script_sandbox.CompiledScript,
 
 
 async def _paper_script_sell(pos: dict, env: str) -> None:
+    """Book a simulated sell for a dry_run script position at the current
+    executable bid — the paper counterpart of _place_exit, same booking shape
+    as _paper_manage_position's tp/sl sells."""
     market = crypto15m_trader._ws_quote_market(pos["ticker"])
     if market is None:
         try:
@@ -427,6 +496,10 @@ async def _paper_script_sell(pos: dict, env: str) -> None:
 
 async def _manage_pass(s: dict, mod: script_sandbox.CompiledScript, cfg: dict,
                        env: str, assets_by_ticker: dict, portfolio: dict) -> None:
+    """Run manage(position, ctx) over this script's open FILLED crypto
+    positions. 'sell' rides the engine's shared exit machinery (_place_exit →
+    exit-fill polling → booking; paper rows book a simulated sell); 'update'
+    retunes the row-level tp/sl the exit checks already honor."""
     sid = str(s["id"])
     with db.get_db() as conn:
         rows = _open_crypto_for_script(conn, sid, env)
@@ -493,6 +566,8 @@ async def _manage_pass(s: dict, mod: script_sandbox.CompiledScript, cfg: dict,
 
 
 def _fetch_new_signals() -> list[tuple[dict, str]]:
+    """New whale/momentum signals since the last pass (high-water marks).
+    First pass just baselines the marks — scripts never replay the backlog."""
     out: list[tuple[dict, str]] = []
     try:
         with db.get_db() as conn:
@@ -518,6 +593,9 @@ def _fetch_new_signals() -> list[tuple[dict, str]]:
 
 async def _place_signal_follow(s: dict, sig: dict, source: str, act: dict,
                                cfg: dict, env: str) -> Optional[dict]:
+    """Follow a signal on ITS side (scripts filter/size, never side-flip):
+    a bot_positions row tagged with the script id, managed to settlement by
+    the main engine's poll/reconcile machinery like any signal trade."""
     sid = str(s["id"])
     ticker = str(sig.get("ticker") or "")
     direction = str(sig.get("taker_side") or sig.get("direction") or "").lower()
@@ -565,9 +643,10 @@ async def _place_signal_follow(s: dict, sig: dict, source: str, act: dict,
         resp = await kalshi_api.place_limit_order(
             ticker=ticker, side=direction, action="buy",
             count=contracts, price_cents=limit_cents, client_order_id=coid,
+            pin_env=env,
         )
     except Exception as e:
-        found, confirmed = await crypto15m_trader._lookup_lost_order(coid, ticker)
+        found, confirmed = await crypto15m_trader._lookup_lost_order(coid, ticker, pin_env=env)
         with db.get_db() as conn:
             if isinstance(found, dict) and found.get("order_id"):
                 db.update_bot_position(
@@ -598,6 +677,8 @@ async def _place_signal_follow(s: dict, sig: dict, source: str, act: dict,
 
 
 async def _notify_lifecycle(scripts_by_id: dict[str, dict], env: str) -> None:
+    """Deliver on_fill / on_settle for script positions whose lifecycle moved
+    since we last looked (managed by the crypto15m pass, so we observe)."""
     with db.get_db() as conn:
         rows = conn.execute(
             """SELECT * FROM crypto15m_positions
@@ -669,9 +750,12 @@ async def _drain_logs(sid: str, mod: script_sandbox.CompiledScript) -> None:
 
 
 async def run_tick(cfg: dict, *, authed: bool) -> None:
+    """One engine pass: for each enabled script × asset, ask decide() and
+    place qualifying intents. Called from the service master loop; every
+    failure path is contained per-script."""
     if not cfg.get("scripts_live_enabled"):
         return
-    paper = bool(cfg.get("scripts_paper_mode"))
+    paper = bool(cfg.get("scripts_paper_mode")) or kalshi_auth.is_paper()
     if not authed and not paper:
         return
     with db.get_db() as conn:

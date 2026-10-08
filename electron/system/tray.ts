@@ -1,6 +1,7 @@
 import { app, Menu, Tray, nativeImage } from 'electron';
 import { join } from 'node:path';
 import { existsSync } from 'node:fs';
+import { trayTradingLabel } from './tray-logic';
 
 let tray: Tray | null = null;
 
@@ -8,6 +9,7 @@ interface TrayHandlers {
   openWindow: () => void;
   toggleTrading: () => void;
   isTrading: () => boolean;
+  isLive: () => boolean;
   quit: () => void;
 }
 
@@ -43,7 +45,7 @@ export function installTray(handlers: TrayHandlers): Tray {
   const img = trayImage();
   tray = new Tray(img.isEmpty() ? nativeImage.createEmpty() : img);
   if (img.isEmpty() && process.platform === 'darwin') tray.setTitle('KT');
-  tray.setToolTip('Krypt Trader');
+  tray.setToolTip('Krypt Trader — still running. Right-click → Quit to stop it.');
   tray.on('click', () => handlers.openWindow());
   tray.on('double-click', () => handlers.openWindow());
   rebuild(handlers);
@@ -57,11 +59,11 @@ export function rebuild(handlers: TrayHandlers): void {
     { label: 'Open Krypt Trader', click: () => handlers.openWindow() },
     { type: 'separator' },
     {
-      label: trading ? 'Pause Trading' : 'Resume Trading',
+      label: trayTradingLabel(trading, handlers.isLive()),
       click: () => handlers.toggleTrading(),
     },
     { type: 'separator' },
-    { label: 'Quit', click: () => handlers.quit() },
+    { label: 'Quit Krypt Trader', click: () => handlers.quit() },
   ]);
   tray.setContextMenu(menu);
 }

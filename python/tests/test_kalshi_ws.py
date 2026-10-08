@@ -1,3 +1,9 @@
+"""Unit tests for the kalshi_ws client's pure message-handling + read logic.
+
+These exercise the in-memory book maintenance, seq-gap recovery, dollar/fp
+parsing, and the read APIs WITHOUT opening a socket — by driving a `_Client`
+instance with the message dicts Kalshi would send.
+"""
 from __future__ import annotations
 
 import asyncio

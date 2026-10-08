@@ -53,6 +53,10 @@ def _parse_days_to_close(close_time: str) -> float | None:
 
 
 def _trade_age_sec(t: dict, now: datetime | None = None) -> float | None:
+    """Age of a tape trade in seconds from its created_time, or None when the
+    timestamp is missing/unparseable (callers fail OPEN — better to score a
+    trade of unknown age than to silently drop the whole tape). Handles both
+    the REST ISO strings and the WS buffer's epoch timestamps (ts_ms)."""
     ct = t.get("created_time")
     if ct in (None, ""):
         return None
@@ -639,6 +643,10 @@ async def scan_momentum(cfg: dict) -> tuple[int, list[dict]]:
 
 
 def compute_convergence_score(*, count: int, total_usd: float, implied: float) -> float:
+    """Score a convergence group (N whales, same market+side, within the
+    window). The bonus IS the edge (edge = confidence − implied), scaled by
+    conviction: 3 whales +4, 4 whales +6, 5+ whales +8, plus +1 for ≥$25k of
+    combined flow. Same 97 ceiling as the other scorers."""
     implied = max(5.0, min(float(implied), 95.0))
     if count >= 5:
         bonus = 8.0
@@ -655,6 +663,14 @@ def compute_convergence_score(*, count: int, total_usd: float, implied: float) -
 def build_convergence_signals(
     conn, *, max_signal_age_sec: int, min_count: int = 3, hours: int = 2,
 ) -> list[dict]:
+    """Convergence candidates from the stored whale tape: >= min_count whales
+    on the SAME side of the SAME market within `hours`. Pure DB read — the
+    whale scanner (which runs regardless of trade_whales) keeps whale_trades
+    populated. A group only counts as FRESH while its newest whale is within
+    max_signal_age_sec, so a restart can't chase an hours-old pile-on. The
+    signal id is the newest whale's row id (stable for dedup via
+    already_traded_signal_ids; a later whale re-arms the signal, and the
+    market/side-already-open gate stops double entries)."""
     groups = db.get_recent_whales_for_convergence(conn, hours=hours)
     out: list[dict] = []
     for (ticker, side), whales in groups.items():

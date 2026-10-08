@@ -1,3 +1,18 @@
+"""LIVE provider check for the manual terminal — run by hand, not in `npm test`.
+
+Unit tests pin our logic; this pins Kalshi's. It hits the real public API and
+reports what actually came back: routes that still exist, response shapes that
+still match, rate limits we did not know about. Every provider in terminal.py
+gets a line here the same day it is written, because the failures this catches
+(a renamed field, a tier that 400s, a candle endpoint that needs both
+timestamps) are invisible to an offline suite and invisible in a screenshot.
+
+    python/.venv/Scripts/python.exe python/live_terminal_check.py
+    python/.venv/Scripts/python.exe python/live_terminal_check.py KXBTCD-26AUG24-T90000
+
+Signed endpoints (portfolio, orders) are SKIPPED unless credentials for the
+active environment are already saved — this check never places an order.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -62,6 +77,8 @@ async def check_sweep() -> list[dict]:
 
 
 async def check_cache() -> None:
+    """The sweep is the expensive call; every sweep-backed column must be
+    served from one TTL-cached pull, not re-fetched per column."""
     t0 = time.monotonic()
     await terminal.discover("volume", limit=5, refresh=True)
     cold = time.monotonic() - t0
@@ -119,6 +136,13 @@ async def check_market(ticker: str) -> None:
 
 
 async def check_candles(ticker: str, long_dated: str = "") -> None:
+    """1m candles on the probed market; the coarser intervals on a market that
+    lives long enough to have them.
+
+    A 15-minute crypto market having no 1-hour candles is arithmetic, not an
+    outage — probing it there would be a test that fails for a reason the code
+    is right about, and chasing that would have meant "fixing" correct code.
+    """
     probes = [(ticker, 1, 240, "1m/4h")]
     if long_dated:
         probes.append((long_dated, 60, 60 * 24 * 14, "1h/14d"))

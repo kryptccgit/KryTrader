@@ -1,3 +1,6 @@
+"""perps_farmer: quoting decisions, avg-cost fill accounting, halts,
+maintenance window, flatten. Pure helpers tested directly; the engine tick
+runs against monkeypatched papi/pws — no network, no real orders."""
 from __future__ import annotations
 
 import asyncio
@@ -21,6 +24,12 @@ def fresh_db(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_maintenance_window(monkeypatch):
+    """Pin the Thursday-maintenance gate OFF for every test. Without this the
+    whole engine-tick suite went red every Thursday 06:50-09:10 UTC (farm_tick
+    correctly stands down in the real window, and the tests ran on the wall
+    clock). The engine always calls in_maintenance_window() with NO argument;
+    explicit-dt calls (test_maintenance_window) pass through to the real logic
+    so the gate itself stays tested."""
     real = pf.in_maintenance_window
     monkeypatch.setattr(
         pf, "in_maintenance_window",
@@ -47,6 +56,7 @@ CFG = {
     "perps_farm_daily_volume_usd": 0.0,
     "perps_farm_max_cost_bps": 4.0,
 }
+
 
 
 def test_desired_quotes_two_sided():
@@ -101,6 +111,7 @@ def test_maintenance_window():
     assert pf.in_maintenance_window(thu_in) is True
     assert pf.in_maintenance_window(thu_out) is False
     assert pf.in_maintenance_window(fri) is False
+
 
 
 def _seed_fill(farmer, trade_id, side, count_cc, price_micro, fee_micro=0):
@@ -164,6 +175,7 @@ def test_halt_expires_next_day(fresh_db, farmer):
     assert farmer._halted()
     farmer.halted_day = "2020-01-01"
     assert not farmer._halted()
+
 
 
 class _FakePapi:
@@ -277,6 +289,9 @@ def test_tick_cancels_when_stream_down(fresh_db, farmer, monkeypatch):
 
 
 def test_tick_quotes_on_slow_book_fresh_receipt(fresh_db, farmer, monkeypatch):
+    """Regression: Kalshi's perps ticker wire ts_ms lags real time by minutes on
+    a slow book, but the frame was just received. Freshness must key off recv_ms
+    (local receipt), so the farmer still quotes instead of standing down."""
     import time
     fake = _FakePapi()
     now = int(time.time() * 1000)
@@ -290,6 +305,8 @@ def test_tick_quotes_on_slow_book_fresh_receipt(fresh_db, farmer, monkeypatch):
 
 
 def test_tick_stands_down_when_receipt_stale(fresh_db, farmer, monkeypatch):
+    """No frame received for the symbol in a long time (stream quiet for it) →
+    'quote stale', even though the socket reports connected."""
     import time
     fake = _FakePapi()
     now = int(time.time() * 1000)
@@ -315,6 +332,10 @@ def test_tick_never_raises(fresh_db, farmer, monkeypatch):
 
 
 def test_poll_fills_parses_kalshi_margin_shape(fresh_db, farmer, monkeypatch):
+    """Regression: /margin/fills identifies fills as `fill_id` (not `trade_id`)
+    and reports fees as `fees` (not `fee_cost`). The old keys skipped every fill
+    (0 volume/fees/P&L while inventory reconciled off positions) — which also
+    silently disarmed the cost + daily-loss halts that read perp_farm_fills."""
     import kalshi_perps_api as papi
 
     fill = {
@@ -349,12 +370,13 @@ def test_poll_fills_parses_kalshi_margin_shape(fresh_db, farmer, monkeypatch):
     assert farmer.inventory_cc == -100
 
 
-def test_demo_env_uses_suffixed_ticker(fresh_db, farmer, monkeypatch):
+def test_production_quotes_the_plain_ticker(fresh_db, farmer, monkeypatch):
     fake = _FakePapi()
     _wire_fakes(monkeypatch, farmer, fake, _fresh_quote())
-    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "demo")
+    monkeypatch.setattr(kalshi_auth, "get_env", lambda: "production")
     asyncio.run(farmer.farm_tick(CFG))
-    assert all(p["ticker"] == "KXBTCPERP1" for p in fake.placed)
+    assert all(p["ticker"] == "KXBTCPERP" for p in fake.placed)
+
 
 
 def test_effective_fee_bps_helper_excludes_taker(fresh_db):

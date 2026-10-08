@@ -6,6 +6,7 @@ import type {
   DiscoverColumn, DiscoverFilters as Filters, DiscoverResult, MarketSummary,
 } from '@shared/market';
 import { Card, Empty, Page } from '../components/common';
+import { GlassSegmented } from '../components/glass/GlassSegmented';
 import {
   Caveat, Cents, Count, ProbBar, Provenance, TimeToClose, Unknown,
 } from '../components/terminal/atoms';
@@ -14,6 +15,7 @@ import { TerminalMarketPage } from './TerminalMarket';
 import type { PageId } from '../App';
 import { useTerminal, usePoll } from '../state/TerminalProvider';
 import { cls } from '../utils/format';
+import { userMessage } from '../utils/errors';
 
 const COLUMNS: {
   id: DiscoverColumn;
@@ -103,7 +105,7 @@ function DiscoverScreen() {
       setSearchErr(null);
     } catch (e) {
       if (seq !== searchSeq.current) return;
-      setSearchErr(e instanceof Error ? e.message : String(e));
+      setSearchErr(userMessage(e));
       setSearchRes(null);
     } finally {
       if (seq === searchSeq.current) setSearching(false);
@@ -160,22 +162,15 @@ function DiscoverScreen() {
       </div>
 
       {!query && (
-        <div className="mb-3 flex flex-wrap gap-1.5">
-          {COLUMNS.map(({ id, label, icon: Icon }) => (
-            <button
-              key={id}
-              onClick={() => setColumn(id)}
-              className={cls(
-                'flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs transition-colors',
-                column === id
-                  ? 'border-krypt-purple/50 bg-krypt-purple/10 text-white'
-                  : 'border-krypt-border bg-krypt-surface text-krypt-muted hover:border-krypt-borderHi hover:text-white',
-              )}
-            >
-              <Icon className="h-3.5 w-3.5" />
-              {label}
-            </button>
-          ))}
+        <div className="mb-3">
+          <GlassSegmented
+            wrap
+            value={column}
+            onChange={setColumn}
+            options={COLUMNS.map(({ id, label, icon: Icon }) => ({
+              value: id, label, icon: <Icon className="h-3.5 w-3.5" />,
+            }))}
+          />
         </div>
       )}
 

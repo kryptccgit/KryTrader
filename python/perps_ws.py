@@ -1,3 +1,40 @@
+"""Kalshi perps ("margin") WebSocket client — real-time perps market data.
+
+Lean sibling of kalshi_ws.py against the DEDICATED margin WS host
+(`/trade-api/ws/v2/margin`). Same signed handshake (RSA-PSS headers on the
+upgrade), same reconnect/watchdog/backoff idioms, but perps wire format:
+fixed-point DOLLAR strings (4dp) and count strings — parsed at ingest into
+integer micro-dollars / centi-contracts (kalshi_perps_api.usd_micro / cc),
+the exact units the perp_* DB tables store. Never floats, never cents.
+
+Channels (https://docs.kalshi.com/margin-ws):
+  * ticker — subscribed for the configured symbols; coalesced to at most one
+    message per market per second. Carries bid/ask + sizes, last price,
+    volume, OI, reference/settlement/liquidation mark prices and the live
+    funding rate: the primary series the perps recorder persists.
+  * trade — public tape for the same symbols.
+
+Both are LOSSY/going-forward streams with no `seq` — no gap logic exists or
+is needed. orderbook_delta (per-sid seq; NO get_snapshot command on the
+margin WS — a gap means full resubscribe) is deliberately deferred until
+depth recording is needed for the stale-quote strategy.
+
+Parsed rows land in drop-oldest, size-capped buffers (nothing drains them to
+the DB since the research recorder was removed 2026-07-16 — unconsumed rows
+age out; the farmer reads the live quote cache). Historically perps_record
+drained them on its
+15s gate (swap-and-return; single event loop, no locking). Buffers survive
+reconnects — they are write-once records, not fallback-suppressing caches
+(the opposite call from kalshi_ws's trade ring, deliberately).
+
+Auth note: the margin WS handshake requires credentials even for public
+channels — start() waits until credentials_present(env). The signed path
+`/trade-api/ws/v2/margin` is INFERRED from the AsyncAPI pathname; on a 401
+upgrade we retry ONCE signing the event path `/trade-api/ws/v2` and remember
+which one worked for the session.
+
+Opt out with ``KRYPT_PERPS_WS=0`` (off/false/no); URL override:
+``KRYPT_PERPS_WS_URL``."""
 from __future__ import annotations
 
 import asyncio
@@ -22,7 +59,6 @@ except Exception:
     _WS_IMPORT_OK = False
 
 _WS_BASES = {
-    "demo": "wss://external-api-margin-ws.demo.kalshi.co/trade-api/ws/v2/margin",
     "production": "wss://external-api-margin-ws.kalshi.com/trade-api/ws/v2/margin",
 }
 _WS_PATH = "/trade-api/ws/v2/margin"
@@ -42,12 +78,14 @@ TickerCb = Callable[[dict], None]
 
 
 def _mark(v) -> tuple[Optional[int], Optional[int]]:
+    """tickerPrice object {price, ts_ms} (or bare string) → (usd_micro, ts_ms)."""
     if isinstance(v, dict):
         return usd_micro(v.get("price")), v.get("ts_ms")
     return usd_micro(v), None
 
 
 def _fr(v) -> Optional[float]:
+    """funding_rate: double on the wire, sometimes nested {rate,...}."""
     if isinstance(v, dict):
         v = v.get("rate", v.get("funding_rate"))
     try:
@@ -82,12 +120,13 @@ class _Client:
 
         self.on_ticker: Optional[TickerCb] = None
 
+
     def start(self, env: str, *, on_ticker: Optional[TickerCb] = None) -> None:
         if _DISABLED or not _WS_IMPORT_OK:
             if not _WS_IMPORT_OK and not _DISABLED:
                 logger.warning("perps_ws: `websockets` not installed — REST poll only")
             return
-        self.env = env if env in _WS_BASES else "production"
+        self.env = env if (env in _WS_BASES or env == "paper") else "production"
         self.on_ticker = on_ticker
         self._stop = False
         loop = asyncio.get_event_loop()
@@ -113,13 +152,14 @@ class _Client:
         return self._task is not None and not self._task.done() and not self._stop
 
     def set_env(self, env: str) -> None:
-        env = env if env in _WS_BASES else "production"
+        env = env if (env in _WS_BASES or env == "paper") else "production"
         if env != self.env:
             self.env = env
             self._gen += 1
             logger.info(f"perps_ws: env → {env}, reconnecting")
 
     def set_symbols(self, tickers) -> None:
+        """Desired WIRE tickers (already env-mapped by the caller)."""
         self.want_symbols = {t for t in tickers if t}
 
     async def _close_ws(self) -> None:
@@ -130,6 +170,7 @@ class _Client:
                 await ws.close()
             except Exception:
                 pass
+
 
     async def _run(self) -> None:
         attempt = 0
@@ -161,7 +202,7 @@ class _Client:
         return sc
 
     async def _connect_once(self, gen: int) -> None:
-        if not kalshi_auth.credentials_present(self.env):
+        if self.env == "paper" or not kalshi_auth.credentials_present(self.env):
             await asyncio.sleep(5)
             return
         url = os.environ.get("KRYPT_PERPS_WS_URL") or _WS_BASES[self.env]
@@ -232,6 +273,7 @@ class _Client:
         self._chan_have = {"ticker": set(), "trade": set()}
         self._inflight.clear()
 
+
     def _next_id(self) -> int:
         self._id += 1
         return self._id
@@ -240,6 +282,8 @@ class _Client:
         await ws.send(json.dumps(obj))
 
     async def _reconcile(self, ws) -> None:
+        """One shared multi-market sub per channel, kept in sync with
+        want_symbols via update_subscription add/delete (kalshi_ws pattern)."""
         for ch in ("ticker", "trade"):
             want = self.want_symbols
             sid = self._chan_sids.get(ch)
@@ -277,6 +321,7 @@ class _Client:
                                                  "action": "delete_markets"}})
             if add or rem:
                 self._chan_have[ch] = set(want)
+
 
     def _handle(self, m: dict) -> None:
         t = m.get("type")
@@ -370,7 +415,9 @@ class _Client:
             "kalshi_env": self.env,
         }, _TRADE_BUF_MAX, "dropped_trades")
 
+
     def drain_ticks(self) -> list[dict]:
+        """Swap-and-return every buffered ticker row (each exactly once)."""
         out, self._tick_buf = self._tick_buf, []
         return out
 

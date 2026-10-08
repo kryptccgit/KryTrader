@@ -13,7 +13,7 @@ import sys
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 if __name__ == "__main__" and "--mcp-stdio" in sys.argv[1:]:
     import mcp_bridge
@@ -88,6 +88,8 @@ def _setup_logging() -> None:
     root.addHandler(sh)
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
+    logging.getLogger("httpcore2").setLevel(logging.WARNING)
 
 
 
@@ -117,12 +119,19 @@ import remote
 import ai_analyst
 import forecast_ledger
 import paper_book
+import paper_exchange
 import mcp_server
+import mcp_agents
 import mcp_workbench
+import shard_rail
 import autopilot
+import health
+import kalshi_key_check
 import remote_discord
 import remote_telegram
-from config import DEFAULT_CONFIG, merge_with_defaults
+from config import DEFAULT_CONFIG, merge_with_defaults, scope_env
+
+DATA_ENV = "production"
 
 
 def _iso_utc(s: Any) -> Any:
@@ -158,6 +167,7 @@ class State:
 
 
 STATE = State()
+shard_rail.GET_CFG = lambda: merge_with_defaults(dict(STATE.cfg or {}))
 
 FORECAST_RESOLVE_SEC = 300.0
 
@@ -182,13 +192,38 @@ async def respond_ok(req_id: str, result: Any = None) -> None:
     await _send({"type": "rpc", "id": req_id, "ok": True, "result": result})
 
 
-async def respond_err(req_id: str, msg: str) -> None:
-    await _send({"type": "rpc", "id": req_id, "ok": False, "error": msg})
+async def respond_err(req_id: str, msg: str, code: Optional[str] = None) -> None:
+    out = {"type": "rpc", "id": req_id, "ok": False, "error": msg}
+    if code:
+        out["code"] = code
+    await _send(out)
+
+
+def human_error(e: BaseException) -> str:
+    """What a failed RPC tells the user: the exception's own words, never
+    "KeyError: 'x'" or "TimeoutError: " — the class goes in the response's
+    `code` and the full detail in the log. Scrubbed like a log line, because
+    an exception message can quote whatever the failing call was handed."""
+    if isinstance(e, (asyncio.TimeoutError, TimeoutError)):
+        msg = str(e).strip() or "Timed out waiting for a reply. Try again."
+    elif isinstance(e, KeyError):
+        msg = f"Missing value: {e.args[0]}" if e.args else "A required value was missing."
+    else:
+        msg = str(e).strip() or "Something went wrong in the backend. Details are in the log."
+    try:
+        import logscrub
+        msg = logscrub.scrub(msg)
+    except Exception:
+        pass
+    return msg[:500]
 
 
 
 
 async def _start_run_if_balance_known(env: str, cents: int) -> None:
+    """Start a bot_run only when the balance is actually known. A cold/failed
+    balance fetch returns (0,0); recording that as start_total would poison
+    bot_runs (the per-run P&L shown on History), so defer instead."""
     if trader.cached_balance(env) is None:
         logger.warning(f"deferring bot_run start ({env}): balance not yet known")
         return
@@ -213,6 +248,7 @@ async def _start_run_if_balance_known(env: str, cents: int) -> None:
 async def _build_account_snapshot() -> dict:
     env = kalshi_auth.get_env()
     cash_cents = 0
+    balance_known = False
     if STATE.auth_ok:
         try:
             await trader.refresh_balance(STATE.cfg, force=False)
@@ -221,20 +257,31 @@ async def _build_account_snapshot() -> dict:
         bal = trader.cached_balance(env)
         if bal is not None:
             cash_cents = int(bal.get("cents", 0))
+            balance_known = True
     cash_usd = cash_cents / 100.0
     with db.get_db() as conn:
         stats_env = db.aggregate_stats(conn, env)
-        stats_demo = db.aggregate_stats(conn, "demo")
-        stats_prod = db.aggregate_stats(conn, "production")
+        stats_paper = db.aggregate_stats(conn, db.PAPER_ENV)
+        stats_prod = db.aggregate_stats(conn, db.LIVE_ENV)
+        stats_retired = db.aggregate_stats(conn, db.RETIRED_ENV)
         crypto_open_cost = db.open_crypto15m_filled_cost_usd(conn, env)
         account_open_cost = db.open_filled_cost_usd(conn, env)
         balance_syncing = db.recent_balance_transition(conn, env)
     open_cost = stats_env["open_cost"]
     port_usd = account_open_cost + crypto_open_cost
+    if env == db.PAPER_ENV:
+        try:
+            port_usd += paper_book.agents_open_cost_usd()
+        except Exception as e:
+            logger.debug(f"paper agents' open cost unavailable: {e}")
     total = cash_usd + port_usd
 
+    paper = env == db.PAPER_ENV
     user_start = float(STATE.cfg.get("start_bankroll_usd", 0.0) or 0.0)
-    if user_start > 0:
+    if paper:
+        baseline = paper_exchange.bankroll()
+        baseline_source = "paper"
+    elif user_start > 0:
         baseline = user_start
         baseline_source = "user"
     else:
@@ -302,6 +349,8 @@ async def _build_account_snapshot() -> dict:
     return {
         "shardCash": shard_cash,
         "shardTransferUrl": kalshi_api.web_exchange_indexes_url(env),
+        "accountMode": "paper" if paper else "live",
+        "balanceKnown": balance_known,
         "cashUsd": cash_usd,
         "portfolioUsd": port_usd,
         "totalUsd": total,
@@ -333,10 +382,15 @@ async def _build_account_snapshot() -> dict:
         "resolvedCount": stats_env["resolved_count"],
         "totalOpened": stats_env["total_opened"],
         "byEnv": {
+            "paper": {
+                "wins": stats_paper["wins"],
+                "losses": stats_paper["losses"],
+                "realizedPnl": stats_paper["realized_pnl"],
+            },
             "demo": {
-                "wins": stats_demo["wins"],
-                "losses": stats_demo["losses"],
-                "realizedPnl": stats_demo["realized_pnl"],
+                "wins": stats_retired["wins"],
+                "losses": stats_retired["losses"],
+                "realizedPnl": stats_retired["realized_pnl"],
             },
             "production": {
                 "wins": stats_prod["wins"],
@@ -350,6 +404,9 @@ async def _build_account_snapshot() -> dict:
 
 
 def _live_pnl_usd(r: dict) -> float | None:
+    """Unrealized (mark-to-market) P&L for an OPEN filled position: held
+    contracts valued at the live mark price minus cost. None for resolved rows
+    (use realized pnl), unfilled rows, or rows without a mark yet."""
     if r.get("resolved"):
         return None
     mark = r.get("mark_price_cents")
@@ -387,7 +444,8 @@ def _position_row_to_js(r: dict) -> dict:
         "kalshiOrderId": r.get("kalshi_order_id"),
         "status": r["status"],
         "confidence": float(r.get("confidence") or 0),
-        "edgePts": float(r.get("edge_pts") or 0),
+        "edgePts": (None if (r.get("signal_source") or "") == "manual"
+                    or r.get("edge_pts") is None else float(r["edge_pts"])),
         "signalPriceCents": float(r.get("signal_price") or 0),
         "resolved": bool(r.get("resolved") or 0),
         "outcomeCorrect": (
@@ -412,7 +470,7 @@ def _position_row_to_js(r: dict) -> dict:
             if r.get("balance_before_usd") is not None
             else None
         ),
-        "kalshiEnv": r.get("kalshi_env") or "demo",
+        "kalshiEnv": r.get("kalshi_env") or db.RETIRED_ENV,
         "createdAt": _iso_utc(r.get("created_at")) or "",
         "lastUpdated": _iso_utc(r.get("last_updated")) or "",
         "resolvedAt": _iso_utc(r.get("resolved_at")),
@@ -494,6 +552,11 @@ _bg_tasks: set[asyncio.Task] = set()
 
 
 def _fire_and_forget(coro) -> None:
+    """Run a notification coroutine (Discord webhook) as a background task —
+    a slow or unreachable Discord must never stall the trading loop (inline
+    awaits cost up to 8s per send, multiplied by event bursts). Errors are
+    swallowed (webhooks are best-effort); a strong reference is kept so the
+    task can't be garbage-collected mid-flight."""
     async def _quiet():
         try:
             await coro
@@ -523,16 +586,22 @@ def _should_fire_event_webhook(pos_id: int, kind: str) -> bool:
 
 
 def _on_ws_fill(_msg: dict) -> None:
+    """A WebSocket fill arrived — wake the order poll on the next loop tick
+    instead of waiting out the 30s timer. REST poll remains the accounting
+    truth; this only removes the detection latency."""
     STATE.ws_fill_pending = True
     STATE.ws_c15_pending = True
 
 
 def _on_ws_lifecycle(msg: dict) -> None:
+    """A market was determined/settled — wake the resolution check immediately."""
     if (msg or {}).get("event_type") in ("determined", "settled"):
         STATE.ws_resolve_pending = True
 
 
 def _on_ws_trade(trade: dict) -> None:
+    """Per-trade WS hook (sync, must stay cheap): flag whale-sized prints so the
+    scanner runs immediately instead of waiting out whale_scan_interval."""
     try:
         count = float(trade.get("count_fp") or 0)
         side = trade.get("taker_side") or ""
@@ -547,6 +616,8 @@ def _on_ws_trade(trade: dict) -> None:
 
 
 def _ws_held_tickers() -> set[str]:
+    """Tickers we currently hold/work (open bot positions + open 15m positions),
+    for the env in play — the set the WS subscribes orderbook/ticker/lifecycle to."""
     env = kalshi_auth.get_env()
     out: set[str] = set()
     try:
@@ -563,6 +634,13 @@ def _ws_held_tickers() -> set[str]:
 
 
 async def _maybe_upgrade_api_level() -> None:
+    """Auto-request Kalshi's Advanced API usage level (3x order throughput, free).
+
+    Self-healing: reads the current tier; if it's still `basic`, POSTs the
+    upgrade. Kalshi requires >=1 API-placed order in the last 100 (else 403), so
+    a brand-new account can't upgrade until the bot has traded once — this keeps
+    trying (rate-limited to ~5 min) and lands right after the first order. Never
+    raises into the loop. Fully skippable via `auto_upgrade_api_level`."""
     if not STATE.cfg.get("auto_upgrade_api_level", True) or not STATE.auth_ok:
         return
     try:
@@ -596,9 +674,24 @@ async def _maybe_upgrade_api_level() -> None:
 
 
 async def _reverify_auth_if_needed() -> bool:
+    """Self-heal a latched-off auth state.
+
+    The one-shot startup verify in _main() sets STATE.auth_ok=False on a single
+    transient failure (network stack not ready when Electron spawns Python at cold
+    boot/resume, a Kalshi 5xx/429 burst that outlasts the in-call retry window).
+    Every live path — trade scan, order poll, reconcile, resolution — is gated on
+    STATE.auth_ok, and nothing else in the loop ever flips it back True, so one
+    boot blip silently disables trading for the whole session until the user
+    manually re-tests credentials. This re-primes and re-verifies against Kalshi;
+    on success it re-enables trading. Returns True iff it flipped auth_ok True.
+    """
     if STATE.auth_ok:
         return False
-    if not kalshi_auth.credentials_present(kalshi_auth.get_env()):
+    if kalshi_auth.is_paper():
+        STATE.auth_ok = True
+        await emit_event("backend:authChanged", {"authOk": True})
+        return True
+    if not kalshi_auth.credentials_present():
         return False
     async with kalshi_auth.ENV_LOCK:
         env0 = kalshi_auth.get_env()
@@ -632,6 +725,7 @@ async def _scanner_and_trader_loop() -> None:
     last_crypto15m_record = 0.0
     last_perps_farm = 0.0
     last_ws_subs = 0.0
+    last_paper_sweep = 0.0
     last_cleanup = 0.0
     last_stats_push = asyncio.get_event_loop().time()
 
@@ -662,7 +756,8 @@ async def _scanner_and_trader_loop() -> None:
             logger.debug(f"auth re-verify failed (will retry): {e}")
 
         try:
-            if STATE.auth_ok and STATE.api_tier not in ("advanced", "expert", "premier", "paragon", "prime", "prestige") \
+            if STATE.auth_ok and not kalshi_auth.is_paper() \
+                    and STATE.api_tier not in ("advanced", "expert", "premier", "paragon", "prime", "prestige") \
                     and now - last_api_level_check >= 120:
                 last_api_level_check = now
                 await asyncio.wait_for(_maybe_upgrade_api_level(), 12)
@@ -834,6 +929,7 @@ async def _scanner_and_trader_loop() -> None:
         except Exception as e:
             logger.error(f"resolution error: {e}", exc_info=True)
 
+
         try:
             if (
                 cfg.get("crypto15m_record_signals", True)
@@ -849,6 +945,7 @@ async def _scanner_and_trader_loop() -> None:
             if (
                 cfg.get("perps_farm_enabled", False)
                 and STATE.auth_ok
+                and not kalshi_auth.is_paper()
                 and now - last_perps_farm >= 2.5
             ):
                 await perps_farmer.farm_tick(cfg)
@@ -879,6 +976,15 @@ async def _scanner_and_trader_loop() -> None:
                 await _sync_remote_bots()
         except Exception as e:
             logger.debug(f"remote bot sync error: {e}")
+
+        try:
+            if kalshi_auth.is_paper() and now - last_paper_sweep >= 10:
+                last_paper_sweep = now
+                res = await paper_exchange.sweep()
+                if res.get("filled"):
+                    STATE.ws_fill_pending = True
+        except Exception as e:
+            logger.debug(f"paper sweep error: {e}")
 
         try:
             if now - last_forecast_resolve >= FORECAST_RESOLVE_SEC:
@@ -967,6 +1073,8 @@ async def _scanner_and_trader_loop() -> None:
             ):
                 snap_for_stats = await _build_account_snapshot()
                 try:
+                    if not snap_for_stats.get("balanceKnown"):
+                        raise RuntimeError("balance not read yet")
                     await webhook.send_stats(
                         cfg.get("stats_webhook_url", ""),
                         snap_for_stats,
@@ -987,6 +1095,15 @@ async def _scanner_and_trader_loop() -> None:
 
 
 async def _crypto15m_loop() -> None:
+    """Dedicated 15m-executor loop, ISOLATED from the main scanner/trader loop.
+
+    The main loop is one long serial iteration (market sync, scans, order poll,
+    reconcile, resolution) — a Kalshi 5xx storm or a slow 10-page market sync
+    stalled the 15m tick 5-80s, exactly the windows where a stop-loss needed
+    its 4s cadence to protect capital in a fast drop. run_tick manages its own
+    concurrency through DB state, and only this task calls it, so ticks never
+    overlap. A WS fill wakes the next tick within ~0.5s (STATE.ws_c15_pending)
+    so a just-filled entry arms its stop-loss/TP without waiting out the poll."""
     last_tick = 0.0
     while not (_loop_stop and _loop_stop.is_set()):
         try:
@@ -1019,6 +1136,14 @@ async def _crypto15m_loop() -> None:
 
 
 async def _script_loop() -> None:
+    """User-script executor (Scripts tab), in ITS OWN task for the same
+    reason the 15m loop is isolated from the main loop: script hooks can
+    legally run near their per-call wall budgets, and when they ticked
+    serially inside _crypto15m_loop a heavy script delayed the 15m stop-loss
+    cadence that exists to protect capital in fast drops. Positions scripts
+    open are still managed to settlement by the crypto15m pass, so a slow or
+    disabled script never strands an open bet. Script errors auto-disable
+    the script — they can never take this loop down."""
     last_script = 0.0
     while not (_loop_stop and _loop_stop.is_set()):
         try:
@@ -1036,6 +1161,11 @@ async def _script_loop() -> None:
 
 
 def _watchdog_restart(name: str, factory):
+    """Done-callback for the core loop tasks: if one DIES (a loop-killing
+    exception like MemoryError escaping the per-section try/excepts), the
+    process previously kept serving RPCs — balances refreshed, the UI stayed
+    green — while all scanning/trading/exits were silently dead. Log loud,
+    tell the renderer, and restart the loop after a short breather."""
     def _cb(task: asyncio.Task) -> None:
         if task.cancelled() or (_loop_stop and _loop_stop.is_set()):
             return
@@ -1120,9 +1250,10 @@ async def _h_setConfig(p: dict) -> dict:
         f"max_daily="
         f"{'∞' if cfg.get('unlimited_daily_new_positions') else cfg.get('max_daily_new_positions')} "
         f"stop_loss={cfg.get('stop_loss_on_day')} "
-        f"env={cfg.get('kalshi_env')}"
+        f"account={cfg.get('account_mode')}"
     )
-    new_env = cfg.get("kalshi_env", "demo")
+    paper_exchange.set_bankroll(cfg.get("paper_bankroll_usd"))
+    new_env = scope_env(cfg)
     verify_auth = False
     async with kalshi_auth.ENV_LOCK:
         prev_env = kalshi_auth.get_env()
@@ -1130,25 +1261,25 @@ async def _h_setConfig(p: dict) -> dict:
         env_changed = new_env != prev_env
         if env_changed:
             kalshi_auth.reset_credential_cache()
-            if kalshi_auth.credentials_present(new_env):
+            STATE.auth_ok = new_env == kalshi_auth.PAPER
+            if new_env != kalshi_auth.PAPER and kalshi_auth.credentials_present():
                 try:
                     kalshi_auth.prime_credentials(sync_time=False)
                     verify_auth = True
                 except Exception as e:
                     logger.warning(f"env-switch auth failed: {e}")
-                    STATE.auth_ok = False
-            else:
-                STATE.auth_ok = False
 
     if env_changed and verify_auth:
         try:
             await asyncio.to_thread(kalshi_auth.sync_server_time, True)
             bal = await kalshi_api.get_balance(pin_env=new_env)
             int(bal.get("balance", 0))
-            STATE.auth_ok = True
+            ok = True
         except Exception as e:
             logger.warning(f"env-switch auth failed: {e}")
-            STATE.auth_ok = False
+            ok = False
+        if kalshi_auth.get_env() == new_env:
+            STATE.auth_ok = ok
 
     if env_changed:
         await emit_event("backend:authChanged", {"authOk": STATE.auth_ok})
@@ -1169,6 +1300,11 @@ async def _h_setConfig(p: dict) -> dict:
     except Exception as e:
         logger.warning(f"could not sync remote bots after config change: {e}")
     try:
+        _prune_deleted_agent_tokens(p.get("config"),
+                                    prune=p.get("pruneAgentTokens") is True)
+    except Exception as e:
+        logger.warning(f"could not remove deleted agents' tokens: {type(e).__name__}")
+    try:
         await _sync_mcp()
     except Exception as e:
         logger.warning(f"could not sync MCP server after config change: {e}")
@@ -1179,18 +1315,22 @@ async def _h_setCredentials(p: dict) -> dict:
     p = p or {}
     api_key = p.get("apiKey", "")
     rsa_pem = p.get("rsaPem", "")
-    env = p.get("env")
-    kalshi_auth.save_credentials(api_key, rsa_pem, env)
+    if p.get("env") not in (None, "production"):
+        raise ValueError("Kalshi keys are saved for production only")
+    kalshi_auth.save_credentials(api_key, rsa_pem)
+    try:
+        import logscrub
+        logscrub.refresh_known_secrets()
+    except Exception:
+        pass
     status = kalshi_auth.credentials_status_all()
     await emit_event("credentials:changed", status)
     return status
 
 
 async def _h_clearCredentials(p: dict) -> dict:
-    p = p or {}
-    env = p.get("env")
-    kalshi_auth.clear_credentials(env)
-    if env in (None, kalshi_auth.get_env()):
+    kalshi_auth.clear_credentials()
+    if not kalshi_auth.is_paper():
         STATE.auth_ok = False
         await emit_event("backend:authChanged", {"authOk": False})
     status = kalshi_auth.credentials_status_all()
@@ -1203,33 +1343,45 @@ async def _h_credentialStatus(_p: dict) -> dict:
 
 
 async def _h_testCredentials(p: dict) -> dict:
-    p = p or {}
-    target_env = p.get("env") or kalshi_auth.get_env()
-    if not kalshi_auth.credentials_present(target_env):
-        raise RuntimeError(f"credentials not set for {target_env}")
+    """One signed balance read with the saved key, on the user's click.
 
-    async with kalshi_auth.ENV_LOCK:
-        saved_env = kalshi_auth.get_env()
-        if target_env != saved_env:
-            kalshi_auth.set_env(target_env)
-        kalshi_auth.reset_credential_cache()
-        try:
-            kalshi_auth.prime_credentials(sync_time=False)
-            await asyncio.to_thread(kalshi_auth.sync_server_time, True)
-            bal = await kalshi_api.get_balance()
-        finally:
-            if target_env != saved_env:
-                kalshi_auth.set_env(saved_env)
-                kalshi_auth.reset_credential_cache()
-                try:
-                    kalshi_auth.prime_credentials(sync_time=False)
-                except Exception:
-                    pass
+    Works in Paper too — checking the key is the step before going live — and
+    never flips the global env to do it (kalshi_api.verify_saved_key signs
+    with the key pair directly), so no engine sees "production" mid-test."""
+    if not kalshi_auth.credentials_present():
+        raise RuntimeError("Kalshi credentials not set")
+    bal = await kalshi_api.verify_saved_key()
     cents = int(bal.get("total_balance_cents", bal.get("balance", 0)))
-    if target_env == saved_env:
+    if not kalshi_auth.is_paper() and not STATE.auth_ok:
+        async with kalshi_auth.ENV_LOCK:
+            kalshi_auth.reset_credential_cache()
+            try:
+                kalshi_auth.prime_credentials(sync_time=False)
+            except Exception:
+                pass
         STATE.auth_ok = True
         await emit_event("backend:authChanged", {"authOk": True})
-    return {"env": target_env, "balanceUsd": cents / 100.0}
+    return {"env": "production", "balanceUsd": cents / 100.0}
+
+
+async def _h_verifyCredentials(p: dict) -> dict:
+    """testCredentials, but a failure is an ANSWER rather than an exception:
+    {ok: False, code, title, fix}, from kalshi_key_check.
+
+    Runs only on the user's click (the setup wizard's save, or Test on the API
+    Keys page) — a signed read is account traffic."""
+    try:
+        res = await _h_testCredentials({})
+        return {"ok": True, **res}
+    except Exception as e:
+        d = kalshi_key_check.diagnose(e)
+        try:
+            import logscrub
+            d = {k: (logscrub.scrub(v) if isinstance(v, str) else v) for k, v in d.items()}
+        except Exception:
+            pass
+        logger.info(f"credential check failed: {d['code']}")
+        return {"ok": False, "env": "production", **d}
 
 
 async def _h_account(_p: dict) -> dict:
@@ -1254,15 +1406,24 @@ async def _h_pnlSeries(p: dict) -> list:
     ]
 
 
+_POSITION_ENVS = (db.PAPER_ENV, kalshi_auth.PRODUCTION, db.RETIRED_ENV)
+
+
 async def _h_positions(p: dict) -> list:
     f = p or {}
     status = f.get("status")
     resolved = f.get("resolved")
     src = f.get("signalSource")
     limit = int(f.get("limit") or 500)
+    env = str(f.get("env") or "").strip().lower() or kalshi_auth.get_env()
+    if env != "all" and env not in _POSITION_ENVS:
+        raise ValueError("env must be paper, production, demo or all")
 
     sql = "SELECT * FROM bot_positions WHERE 1=1"
     args: list = []
+    if env != "all":
+        sql += " AND kalshi_env = ?"
+        args.append(env)
     if status:
         placeholders = ",".join("?" for _ in status)
         sql += f" AND status IN ({placeholders})"
@@ -1434,7 +1595,7 @@ async def _h_pause(p: dict) -> dict:
 def _run_row_to_js(r: dict) -> dict:
     return {
         "id": int(r["id"]),
-        "kalshiEnv": r.get("kalshi_env") or "demo",
+        "kalshiEnv": r.get("kalshi_env") or db.RETIRED_ENV,
         "startedAt": _iso_utc(r.get("started_at")) or "",
         "endedAt": _iso_utc(r.get("ended_at")),
         "startCashUsd": float(r.get("start_cash_usd") or 0),
@@ -1551,6 +1712,9 @@ async def _h_kalshiMarketUrl(p: dict) -> dict:
 
 
 async def _h_trading_status(p: dict) -> dict:
+    """Ordered gate checklist for both engines — the "why isn't it trading"
+    panel. Each row: {id, label, state: ok|blocked|off, reason}. The first
+    blocked row is the answer."""
     cfg = STATE.cfg
     env = trader.get_env()
     main: list[dict] = []
@@ -1563,7 +1727,10 @@ async def _h_trading_status(p: dict) -> dict:
         })
 
     gate("paused", "Engine not paused", not STATE.paused, "paused by user")
-    gate("auth", "Kalshi auth", bool(STATE.auth_ok), "auth failed — check API keys")
+    if env == db.PAPER_ENV:
+        gate("auth", "Paper account", True)
+    else:
+        gate("auth", "Kalshi auth", bool(STATE.auth_ok), "auth failed — check API keys")
     enabled = bool(cfg.get("enable_trading"))
     gate("master", "Trading enabled", enabled, "master switch is OFF", off=not enabled)
     try:
@@ -1601,6 +1768,8 @@ async def _h_trading_status(p: dict) -> dict:
 
 
 async def _h_c15_backtest(p: dict) -> dict:
+    """Replay the CURRENT (or supplied) 15m config over recorded ticks using
+    the live entry gates. Read-heavy — run off the event loop."""
     import replay
     from config import merge_with_defaults as _merge
     cfg = dict(STATE.cfg or {})
@@ -1615,6 +1784,8 @@ async def _h_c15_backtest(p: dict) -> dict:
 
 
 async def _h_main_backtest(p: dict) -> dict:
+    """Replay recorded whale/momentum signals through the live should_trade
+    gates with follower economics."""
     import replay
     from config import merge_with_defaults as _merge
     cfg = dict(STATE.cfg or {})
@@ -1628,6 +1799,9 @@ async def _h_main_backtest(p: dict) -> dict:
 
 
 async def _h_collection_stats(p: dict) -> dict:
+    """Inventory of the passively collected research data — what the Backtest
+    page's "view data" area shows. Counts + spans + a recent sample per
+    stream, all cheap indexed queries."""
     def _q() -> dict:
         with db.get_db() as conn:
             c15 = conn.execute(
@@ -1697,6 +1871,10 @@ async def _h_c15_history(p: dict) -> dict:
 
 
 async def _h_turbine_library(p: dict) -> dict:
+    """The imported Turbine strategy library joined with the last saved
+    backtest results (net-of-fee edge on OUR data). Each entry carries the
+    crypto15m config slice so the UI can drop it straight into a Multi-Run
+    runner. Optionally re-runs the backtest when p.rerun is set."""
     import json as _json
     import os as _os
 
@@ -1709,7 +1887,7 @@ async def _h_turbine_library(p: dict) -> dict:
         if (p or {}).get("rerun"):
             try:
                 import turbine_backtest
-                for r in turbine_backtest.run(env=trader.get_env(), since_days=int((p or {}).get("days") or 90)):
+                for r in turbine_backtest.run(env=DATA_ENV, since_days=int((p or {}).get("days") or 90)):
                     results[r["name"]] = r
             except Exception as e:
                 logger.warning(f"turbine rerun failed: {e}")
@@ -1763,6 +1941,9 @@ def _get_proc_pool() -> "_cf.ProcessPoolExecutor":
 
 
 async def _run_heavy(fn, params: dict):
+    """Run a picklable module-level worker in the process pool; on any pool
+    failure, reset it and fall back to a worker thread (never blocks the loop
+    beyond the work itself)."""
     global _PROC_POOL
     loop = asyncio.get_event_loop()
     try:
@@ -1779,11 +1960,16 @@ async def _run_heavy(fn, params: dict):
 
 
 async def _h_coin_optimize(p: dict) -> dict:
+    """Sweep the strategy library across hour-buckets for one coin and assemble
+    a best-24h schedule (walk-forward holdout). Heavy CPU → runs in a subprocess
+    off the event loop (see _run_heavy)."""
     import coin_optimizer
-    return await _run_heavy(coin_optimizer.run_optimize, {**(p or {}), "env": trader.get_env()})
+    return await _run_heavy(coin_optimizer.run_optimize, {**(p or {}), "env": DATA_ENV})
 
 
 async def _h_export_research(p: dict) -> dict:
+    """Dump the collected research data as CSVs the user can analyze anywhere.
+    Written under data/exports/<stamp>/; the renderer reveals the folder."""
     import csv
     def _dump() -> dict:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
@@ -1810,10 +1996,14 @@ async def _h_export_research(p: dict) -> dict:
 
 
 async def _h_edge_health(p: dict) -> dict:
+    """Rolling per-strategy forward measurement (Edge Health panel)."""
     return await asyncio.to_thread(crypto15m_trader.edge_health, trader.get_env())
 
 
 async def _h_perps_status(p: dict) -> dict:
+    """Perps page status: the farmer (the public one-time-reward feature) and
+    its wallet. The recorder/strategy research program was removed 2026-07-16
+    (every backtested mechanism dead; re-check triggers cold)."""
     cfg = STATE.cfg or {}
     return {
         "farmer": await asyncio.to_thread(perps_farmer.status, cfg),
@@ -1823,6 +2013,7 @@ async def _h_perps_status(p: dict) -> dict:
 
 async def _h_perps_farm_flatten(p: dict) -> dict:
     return await perps_farmer.flatten(STATE.cfg or {})
+
 
 
 
@@ -1862,6 +2053,9 @@ def _script_warnings(code: str) -> list[str]:
 
 
 async def _h_script_save(p: dict) -> dict:
+    """Create or update a script. Validation runs in the script's declared
+    trust mode; an invalid script still SAVES (so work isn't lost) but comes
+    back with the errors and is force-disabled."""
     sid = str(p.get("id") or "").strip() or os.urandom(8).hex()
     code = str(p.get("code") or "")
     meta = script_sandbox.parse_header(code)
@@ -1911,6 +2105,9 @@ async def _h_script_set_enabled(p: dict) -> dict:
 
 
 async def _h_script_set_trusted(p: dict) -> dict:
+    """Flip the trusted (full-Python) flag. The renderer shows the scary
+    consent modal BEFORE calling this; flipping re-validates in the new mode
+    and always drops back to disabled so the user consciously re-arms."""
     sid = str(p.get("id") or "")
     trusted = bool(p.get("trusted"))
     with db.get_db() as conn:
@@ -1923,6 +2120,8 @@ async def _h_script_set_trusted(p: dict) -> dict:
 
 
 async def _h_script_validate(p: dict) -> dict:
+    """Validate code (editor button + the AI-output import path). Returns
+    parsed metadata so the import flow can prefill name/description."""
     code = str(p.get("code") or "")
     trusted = bool(p.get("trusted"))
     errors = script_sandbox.validate(code, trusted=trusted)
@@ -1937,6 +2136,9 @@ async def _h_script_validate(p: dict) -> dict:
 
 
 async def _h_script_backtest(p: dict) -> dict:
+    """Backtest a script (by id, or raw code from the editor) over the
+    recorded tick corpus. Never places orders — script_backtest is
+    structurally order-free."""
     import script_backtest
     cfg = dict(STATE.cfg or {})
     patch = (p or {}).get("config") or {}
@@ -1944,7 +2146,7 @@ async def _h_script_backtest(p: dict) -> dict:
         cfg.update(patch)
     cfg = merge_with_defaults(cfg)
     since = int((p or {}).get("sinceDays") or 60)
-    env = str((p or {}).get("env") or kalshi_auth.get_env())
+    env = DATA_ENV
     code = p.get("code")
     trusted = False
     if not code:
@@ -1971,12 +2173,14 @@ async def _h_script_backtest(p: dict) -> dict:
 async def _h_script_context_pack(_p: dict) -> dict:
     import script_docs
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
-    env = kalshi_auth.get_env()
-    text = await asyncio.to_thread(script_docs.build_context_pack, cfg, env)
+    text = await asyncio.to_thread(script_docs.build_context_pack, cfg, DATA_ENV)
     return {"text": text}
 
 
 async def _h_script_api_docs(_p: dict) -> dict:
+    """Structured script-API reference for the in-app docs panel. Rendered
+    FROM the live modules (same sources as the context pack) so the panel can
+    never drift from what the sandbox/engine/backtester actually do."""
     import replay
     import script_docs
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
@@ -2004,6 +2208,7 @@ async def _h_script_api_docs(_p: dict) -> dict:
             {"name": "Night Shift (supervisor)", "code": script_docs.EXAMPLE_SUPERVISOR},
         ],
     }
+
 
 
 
@@ -2099,7 +2304,16 @@ async def _h_terminal_micro(p: dict) -> dict:
 
 
 
+
 async def _remote_command(text: str, sender: str) -> str:
+    """Every chat message that survives its transport's identity check lands
+    here. Trading is gated on its own switch, separately from reading.
+
+    Every command is logged, including the read-only ones. For a control
+    surface that can spend money from a phone, "what did the phone ask for,
+    and when" is exactly the record you want afterwards — and it is the only
+    place that history exists, since the chat app's own history is on a device
+    that may be the thing you are trying to explain."""
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
     first = (text or "").strip().split()[:1]
     verb = (first[0] if first else "?")[:24]
@@ -2118,11 +2332,16 @@ async def _remote_command(text: str, sender: str) -> str:
 
 
 def _remote_set_telegram_chat(chat_id: str) -> None:
+    """Persist the chat id the pairing handshake bound, so a restart does not
+    ask the user to pair again."""
     STATE.cfg["remote_telegram_chat_id"] = str(chat_id)
     asyncio.create_task(emit_event("remote:paired", {"chatId": str(chat_id)}))
 
 
 async def _sync_remote_bots() -> None:
+    """Start/stop the bots to match the config. Called on every config change
+    and periodically, so flipping a switch in the app takes effect without a
+    restart."""
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
 
     want_d = bool(cfg.get("remote_discord_enabled"))
@@ -2157,6 +2376,8 @@ async def _sync_remote_bots() -> None:
 
 
 async def _remote_push(text: str) -> None:
+    """Send an alert to whichever bots are live. Best effort: a chat outage
+    must never affect trading."""
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
     if not cfg.get("remote_alerts_enabled"):
         return
@@ -2169,11 +2390,14 @@ async def _remote_push(text: str) -> None:
 
 
 async def _rule_event(name: str, data: Any) -> None:
+    """A standing instruction fired: tell the window AND the phone. The whole
+    point of the remote is to hear about this when you are not at the desk."""
     await emit_event(name, data)
     try:
         await _remote_push(remote.format_rule_event(data or {}))
     except Exception as e:
         logger.debug(f"remote rule push failed: {e}")
+
 
 
 async def _h_ai_status(_p: dict) -> dict:
@@ -2183,12 +2407,25 @@ async def _h_ai_status(_p: dict) -> dict:
 
 async def _h_ai_set_key(p: dict) -> dict:
     provider = str((p or {}).get("provider") or "")
-    if provider not in ai_analyst.PROVIDERS:
-        raise ValueError("provider must be anthropic or openai")
+    if provider not in ai_analyst.SECRET_NAMES:
+        raise ValueError("provider must be one of " + ", ".join(ai_analyst.SECRET_NAMES))
     key = str((p or {}).get("key") or "").strip()
     has = await asyncio.to_thread(ai_analyst.save_key, provider, key)
     logger.info(f"[ai] {provider} API key {'saved' if key else 'cleared'}")
     return {"ok": True, "provider": provider, "hasKey": has}
+
+
+async def _h_ai_check_provider(p: dict) -> dict:
+    """Settings' "Test connection". The renderer names a provider id; the
+    host, the key and the endpoint are all chosen here. Free endpoints only
+    (model listings), so pressing it never bills the user."""
+    provider = str((p or {}).get("provider") or "").strip().lower()
+    if provider not in ai_analyst.PROVIDERS:
+        raise ValueError("unknown AI provider")
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    res = await asyncio.to_thread(ai_analyst.check_provider, provider, cfg)
+    logger.info(f"[ai] connection check {provider}: {'ok' if res.get('ok') else 'failed'}")
+    return res
 
 
 async def _h_ai_analyze(p: dict) -> dict:
@@ -2212,12 +2449,13 @@ async def _h_ai_analyze(p: dict) -> dict:
                 model=str(analysis.get("model") or ""),
                 market=detail.get("market") or {},
                 rationale=str(analysis.get("summary") or ""),
-                env=kalshi_auth.get_env(),
+                env=DATA_ENV,
             )
             analysis["forecastId"] = fid
         except Exception as e:
             logger.warning(f"[ai] could not record forecast for {ticker}: {e}")
     return {"ok": True, "analysis": analysis}
+
 
 
 async def _h_ai_scoreboard(_p: dict) -> dict:
@@ -2237,6 +2475,13 @@ async def _h_mcp_status(_p: dict) -> dict:
     return st
 
 
+async def _h_mcp_seen(_p: dict) -> dict:
+    """Which agent clients connected or called this session — memory only.
+    Onboarding asks this instead of mcpStatus, which runs the agent day-loss
+    check and so can fetch Kalshi marks when trade mode is on."""
+    return mcp_server.seen()
+
+
 async def _h_autopilot_status(_p: dict) -> dict:
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
     st = await asyncio.to_thread(autopilot.status, cfg)
@@ -2245,10 +2490,14 @@ async def _h_autopilot_status(_p: dict) -> dict:
 
 
 async def _h_autopilot_run_now(_p: dict) -> dict:
+    """A run on the user's click. Started in the background: the renderer
+    gets an answer now and watches the run on the status poll."""
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
     if autopilot.STATE.running:
         return {"ok": False, "message": "Autopilot is already running."}
     why = autopilot.blocked_reason(cfg)
+    if not why:
+        why = await asyncio.to_thread(autopilot.tool_refusal, cfg)
     if why:
         return {"ok": False, "message": why}
     t = asyncio.create_task(autopilot.run_once(cfg, "manual"))
@@ -2258,6 +2507,9 @@ async def _h_autopilot_run_now(_p: dict) -> dict:
 
 
 async def _h_mcp_decide(p: dict) -> dict:
+    """The user's answer to a live agent order waiting for approval. The
+    renderer only names the row and yes/no; the order itself is the one the
+    backend recorded, re-vetted here before anything is sent."""
     try:
         rid = int((p or {}).get("id"))
     except (TypeError, ValueError):
@@ -2265,27 +2517,175 @@ async def _h_mcp_decide(p: dict) -> dict:
     return await mcp_server.decide(rid, bool((p or {}).get("approve")), via="app")
 
 
-async def _h_mcp_rotate_token(_p: dict) -> dict:
-    await asyncio.to_thread(mcp_server.rotate_token)
-    logger.info("[mcp] token rotated — every configured client must be updated")
+def _mcp_agent_param(p: dict, cfg: dict) -> dict:
+    """The named agent a token request is for. Unknown is refused, never
+    defaulted: copying Default's token when the user clicked "Connect" on
+    Sports Sam would wire their client up as the wrong trader."""
+    aid = str((p or {}).get("agentId") or "").strip().lower()
+    agent = mcp_agents.get(cfg, aid) if mcp_agents.valid_id(aid) else None
+    if agent is None:
+        raise ValueError("No such agent. Refresh the AI Agents page.")
+    return agent
+
+
+async def _h_mcp_rotate_token(p: dict) -> dict:
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    agent = _mcp_agent_param(p, cfg)
+    await asyncio.to_thread(mcp_server.rotate_token, agent["id"])
+    logger.info(f"[mcp] token rotated for agent {agent['id']} — every client "
+                f"configured as it must be updated")
     return {"ok": True}
 
 
 async def _h_mcp_client_config(p: dict) -> dict:
+    """The snippet WITH the token. Electron main calls this and puts the text
+    on the clipboard; it is never forwarded to the renderer."""
     client = str((p or {}).get("client") or "")
     if client not in mcp_server.CLIENTS:
         raise ValueError(f"client must be one of {', '.join(mcp_server.CLIENTS)}")
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
-    token = await asyncio.to_thread(mcp_server.get_token, True)
+    agent = _mcp_agent_param(p, cfg)
+    token = await asyncio.to_thread(mcp_server.get_token, True, agent["id"])
     return {"client": client,
-            "text": mcp_server.client_config(client, int(cfg["mcp_port"]), token)}
+            "text": mcp_server.client_config(client, int(cfg["mcp_port"]), token, agent)}
+
+
+async def _h_mcp_http_snippet(p: dict) -> dict:
+    """curl + Python examples for the HTTP API, WITH the token. Same rule as
+    mcpClientConfig: only Electron main calls this, and it goes straight to
+    the clipboard — the renderer never sees the text."""
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    agent = _mcp_agent_param(p, cfg)
+    token = await asyncio.to_thread(mcp_server.get_token, True, agent["id"])
+    return {"text": mcp_server.http_snippet(int(cfg["mcp_port"]), token)}
+
+
+
+async def _health_kalshi(deep: bool) -> dict:
+    env = kalshi_auth.get_env()
+    present = kalshi_auth.credentials_present()
+    if not (deep and present):
+        return health.check_kalshi(env, present, STATE.auth_ok)
+    try:
+        await _h_testCredentials({})
+    except Exception as e:
+        return health.check_kalshi(env, True, STATE.auth_ok, probed=True,
+                                   probe_ok=False, probe_error=e)
+    return health.check_kalshi(env, True, STATE.auth_ok, probed=True, probe_ok=True)
+
+
+async def _health_ai(deep: bool, cfg: dict) -> list:
+    check = getattr(ai_analyst, "check_provider", None)
+    can_probe = callable(check)
+    active = ai_analyst._norm_provider(cfg.get("ai_provider"))
+    out = []
+    for prov in ai_analyst.PROVIDERS:
+        try:
+            local = not ai_analyst.needs_key(prov)
+        except Exception:
+            local = False
+        if local and prov != active:
+            continue
+        try:
+            has = True if local else bool(ai_analyst.has_key(prov))
+        except Exception:
+            has = False
+        if not (deep and has and can_probe):
+            needed = prov == active and bool(cfg.get("autopilot_enabled"))
+            out.append(health.check_ai(prov, active=prov == active, has_key=has,
+                                       can_probe=can_probe, local=local, needed=needed))
+            continue
+        if prov != active:
+            out.append(health.check_ai(prov, active=False, has_key=True,
+                                       can_probe=True, local=local, idle=True))
+            continue
+        try:
+            import inspect
+            if inspect.iscoroutinefunction(check):
+                res = await asyncio.wait_for(check(prov, cfg), 30.0)
+            else:
+                res = await asyncio.wait_for(asyncio.to_thread(check, prov, cfg), 30.0)
+            out.append(health.check_ai(prov, active=prov == active, has_key=True,
+                                       can_probe=True, probed=True, local=local,
+                                       probe=res if isinstance(res, dict) else {}))
+        except Exception as e:
+            out.append(health.check_ai(prov, active=prov == active, has_key=True,
+                                       can_probe=True, probed=True, probe_error=e,
+                                       local=local))
+    return out
+
+
+async def _health_agents(deep: bool, cfg: dict) -> list:
+    st = await asyncio.to_thread(mcp_server.status, cfg)
+    rows = [health.check_mcp(st)]
+    probe = None
+    if deep and st.get("enabled") and st.get("httpEnabled") and st.get("running"):
+        token = None
+        for a in mcp_agents.agents(cfg):
+            if a.get("enabled", True):
+                token = await asyncio.to_thread(mcp_server.get_token, False, a["id"])
+                if token:
+                    break
+        probe = (await health.probe_http(int(st["port"]), token) if token
+                 else {"ok": False, "status": 401, "error": "no token"})
+    rows.append(health.check_http(st, probed=probe is not None, probe=probe))
+    return rows
+
+
+def _health_local(cfg: dict) -> list:
+    rows = [health.check_autopilot(autopilot.status(cfg))]
+    for which, bot, paired in (
+            ("discord", remote_discord.BOT, bool(cfg.get("remote_discord_user_id"))),
+            ("telegram", remote_telegram.BOT,
+             bool(cfg.get("remote_telegram_chat_id") or remote_telegram.BOT.chat_id))):
+        rows.append(health.check_remote(
+            which, enabled=bool(cfg.get(f"remote_{which}_enabled")),
+            has_token=kalshi_auth.has_secret(f"{which}_bot_token"),
+            paired=paired, bot=bot.status()))
+    try:
+        stats = kalshi_ws.stats()
+    except Exception:
+        stats = None
+    rows.append(health.check_ws(stats, authed=STATE.auth_ok))
+    return rows
+
+
+async def _h_health_check(p: dict) -> dict:
+    deep = (p or {}).get("deep") is True
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+
+    async def _guard(label: str, coro) -> list:
+        try:
+            r = await coro
+            return r if isinstance(r, list) else [r]
+        except Exception as e:
+            logger.warning(f"[health] {label} check failed: {type(e).__name__}: {e}")
+            return [health.row(label.lower().replace(" ", "-"), label, health.FAIL,
+                               f"The check itself failed: {type(e).__name__}.",
+                               "Copy diagnostics from the Logs page if this persists.")]
+
+    async def _local() -> list:
+        return await asyncio.to_thread(_health_local, cfg)
+
+    parts = await asyncio.gather(
+        _guard("Kalshi", _health_kalshi(deep)),
+        _guard("AI providers", _health_ai(deep, cfg)),
+        _guard("AI agents", _health_agents(deep, cfg)),
+        _guard("Local services", _local()),
+    )
+    rows = [r for part in parts for r in part]
+    if deep:
+        bad = [r["id"] for r in rows if r["status"] in (health.FAIL, health.WARN)]
+        logger.info(f"[health] checks run: {len(rows)} rows, attention: {bad or 'none'}")
+    return {"checkedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "deep": deep, "rows": rows}
 
 
 async def _h_mcp_activity(p: dict) -> dict:
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
     limit = max(1, min(int((p or {}).get("limit") or 100), 500))
     rows = await asyncio.to_thread(mcp_server.activity, limit)
-    tickers = await asyncio.to_thread(paper_book.open_tickers)
+    tickers = await asyncio.to_thread(paper_book.open_tickers, None, agents_only=True)
     marks: dict = {}
     if tickers:
         try:
@@ -2295,19 +2695,68 @@ async def _h_mcp_activity(p: dict) -> dict:
         except Exception as e:
             logger.debug(f"paper marks failed: {e}")
     paper = await asyncio.to_thread(
-        paper_book.portfolio, float(cfg["mcp_paper_bankroll_usd"]), marks)
+        paper_book.portfolio, float(cfg["paper_bankroll_usd"]), marks)
+    ids = {a["id"] for a in mcp_agents.agents(cfg)}
+    ids |= set(await asyncio.to_thread(paper_book.agent_ids))
+    by_agent = {aid: await asyncio.to_thread(paper_book.agent_summary, aid, marks)
+                for aid in sorted(ids)}
     acts = await asyncio.to_thread(mcp_workbench.actions, limit)
-    return {"orders": rows, "paper": paper, "actions": acts}
+    return {"orders": rows, "paper": paper, "paperByAgent": by_agent, "actions": acts}
 
 
-async def _h_mcp_paper_reset(_p: dict) -> dict:
-    n = await asyncio.to_thread(paper_book.reset)
-    logger.info(f"[mcp] paper book reset ({n} fill rows removed)")
-    return {"ok": True, "removed": n}
+async def _h_paper_status(_p: dict) -> dict:
+    """The paper account at a glance: mode, bankroll, cash, open orders.
+    Local only — no network."""
+    cfg = merge_with_defaults(dict(STATE.cfg or {}))
+    bal = await paper_exchange.balance()
+    with db.get_db() as conn:
+        resting = conn.execute(
+            "SELECT COUNT(*) FROM paper_orders WHERE status='resting'").fetchone()[0]
+    return {
+        "accountMode": cfg.get("account_mode"),
+        "bankrollUsd": round(paper_exchange.bankroll(), 2),
+        "nextBankrollUsd": round(float(cfg.get("paper_bankroll_usd") or 0.0), 2),
+        "cashUsd": round(int(bal["balance"]) / 100.0, 2),
+        "restingOrders": int(resting or 0),
+        "hasKalshiKey": kalshi_auth.credentials_present(),
+    }
 
 
-async def _mcp_submit(req: dict) -> dict:
-    return await _h_terminal_submit(req)
+async def _h_paper_reset(_p: dict) -> dict:
+    """Start the paper account over at the bankroll. Confirmed in the app
+    before it is sent; touches nothing live."""
+    removed = await paper_exchange.reset_account()
+    for k in [k for k in trader._day_risk_breach if k and k[0] == db.PAPER_ENV]:
+        trader._day_risk_breach.pop(k, None)
+    if kalshi_auth.is_paper():
+        STATE.active_run_id = 0
+        try:
+            cents, _ = await trader.refresh_balance(STATE.cfg, force=True)
+            await _start_run_if_balance_known(kalshi_auth.get_env(), cents)
+        except Exception as e:
+            logger.warning(f"paper reset: could not open a new run: {e}")
+    await emit_event("data:reset", {"summary": removed, "scope": "paper"})
+    try:
+        await emit_event("account:update", await _build_account_snapshot())
+    except Exception:
+        pass
+    return {"ok": True, "removed": removed}
+
+
+async def _h_mcp_paper_reset(p: dict) -> dict:
+    return await _h_paper_reset(p)
+
+
+async def _h_mcp_agent_close_paper(p: dict) -> dict:
+    """The user closing one agent's PAPER positions at the bid — the only
+    way out for a deleted or switched-off agent's, which nothing it can call
+    will sell. The app's own button; never in _MCP_RPC_ALLOWED, so no agent
+    reaches it. Touches the paper book only."""
+    return await mcp_server.close_agent_paper((p or {}).get("agentId"))
+
+
+async def _mcp_submit(req: dict, scope: Optional[str] = None) -> dict:
+    return await _h_terminal_submit(req, scope=scope)
 
 
 async def _mcp_cancel(order_id: str) -> dict:
@@ -2329,6 +2778,38 @@ _MCP_RPC_ALLOWED = frozenset({
 
 async def _sync_mcp() -> None:
     await mcp_server.sync(merge_with_defaults(dict(STATE.cfg or {})))
+
+
+_MAIN_AGENT_IDS: list = [None]
+
+
+def _names_agents(raw_cfg: Any) -> Optional[set]:
+    """The agent ids a config main sent lists, or None if it lists none (an
+    old settings file): that config knows nothing about the user's agents."""
+    if not isinstance(raw_cfg, dict):
+        return None
+    lst = raw_cfg.get("mcpAgents", raw_cfg.get("mcp_agents"))
+    if not isinstance(lst, list) or not lst:
+        return None
+    return {str(a.get("id") or "").strip().lower() for a in lst if isinstance(a, dict)}
+
+
+def _prune_deleted_agent_tokens(raw_cfg: Any, prune: bool = True) -> None:
+    """`prune` False only moves the baseline. setConfig passes it from main's
+    `pruneAgentTokens` flag, which main sets when the USER removed agents —
+    never on a Settings reset or a profile replace. "Reset all trading
+    settings" sent a Default-only list, and pruning against it deleted every
+    named agent's token: their clients stopped working and could not be
+    brought back by restoring the settings. The baseline still moves, so a
+    later real deletion is measured from the config in force, not from
+    before the reset."""
+    after = _names_agents(raw_cfg)
+    gone = mcp_server.deleted_agents(_MAIN_AGENT_IDS[0], after) if prune else set()
+    if after is not None:
+        _MAIN_AGENT_IDS[0] = after
+    if gone:
+        removed = mcp_server.delete_tokens(gone)
+        logger.info(f"[mcp] removed the tokens of {len(removed)} deleted agent(s)")
 
 
 async def _h_remote_status(_p: dict) -> dict:
@@ -2390,6 +2871,7 @@ async def _h_remote_unpair(p: dict) -> dict:
 
 
 async def _h_remote_test(_p: dict) -> dict:
+    """Prove the round trip end to end, from the app, before trusting it."""
     sent = []
     for name, bot in (("discord", remote_discord.BOT),
                       ("telegram", remote_telegram.BOT)):
@@ -2403,6 +2885,12 @@ async def _h_remote_test(_p: dict) -> dict:
 
 
 async def _h_crossvenue(p: dict) -> dict:
+    """The same question, priced on Polymarket.
+
+    Read-only: this app never sends an order to Polymarket. Pairing is done
+    locally because Gamma's search parameter is silently ignored, and a pair is
+    only priced when the matcher is confident — an unconfident candidate is
+    shown as a candidate, with its reasons, for the user to judge."""
     import crossvenue
     import polymarket_public
     ticker = str((p or {}).get("ticker") or "").strip().upper()
@@ -2499,6 +2987,11 @@ async def _h_terminal_preview(p: dict) -> dict:
 
 
 async def _h_shard_transfer(p: dict) -> dict:
+    """Move collateral between exchange shards. Real money — the renderer
+    confirms, but every rail is enforced in kalshi_api regardless."""
+    if kalshi_auth.is_paper():
+        return {"ok": False, "message": "Paper mode has one pool of money — "
+                "there is nothing to move between exchanges."}
     if not STATE.auth_ok:
         return {"ok": False, "message": "No verified Kalshi credentials."}
     p = p or {}
@@ -2512,7 +3005,12 @@ async def _h_shard_transfer(p: dict) -> dict:
         return {"ok": False, "message": str(e)}
     except Exception as e:
         logger.warning(f"shard transfer failed: {e}")
-        return {"ok": False, "message": f"Kalshi refused the transfer: {e}"}
+        return {"ok": False, "message": f"Kalshi refused the transfer: {kalshi_api.rejection_text(e)}"}
+    try:
+        shard_rail.record(kalshi_auth.get_env(), int(p.get("fromShard")), int(p.get("toShard")),
+                          float(p.get("amountUsd") or 0), "you", True)
+    except Exception:
+        pass
 
     try:
         await trader.refresh_balance(merge_with_defaults(dict(STATE.cfg or {})),
@@ -2528,7 +3026,11 @@ async def _h_shard_transfer(p: dict) -> dict:
         ),
     }
 
-async def _h_terminal_submit(p: dict) -> dict:
+async def _h_terminal_submit(p: dict, scope: Optional[str] = None) -> dict:
+    """The desktop ticket's send, and every other manual-style order's.
+    `scope` is never taken from the renderer's params (the ticket names the
+    mode it expects as `expectMode`, which can only refuse): it comes from an
+    in-process caller that decided the order in that scope."""
     if STATE.paused:
         return {
             "ok": False,
@@ -2541,9 +3043,15 @@ async def _h_terminal_submit(p: dict) -> dict:
             "reconciled": False,
         }
     cfg = merge_with_defaults(dict(STATE.cfg or {}))
-    out = await terminal.submit(p or {}, cfg=cfg, authed=STATE.auth_ok)
+    out = await terminal.submit(p or {}, cfg=cfg, authed=STATE.auth_ok, scope=scope)
     if out.get("ok"):
         STATE.ws_fill_pending = True
+        if (out.get("filledContracts") or 0) > 0 and not kalshi_auth.is_paper():
+            try:
+                await trader.refresh_balance(STATE.cfg, force=True)
+                await emit_event("account:update", await _build_account_snapshot())
+            except Exception as e:
+                logger.debug(f"post-fill balance refresh failed: {e}")
         logger.info(
             f"[terminal] manual order {out.get('orderId')} "
             f"{(p or {}).get('action')} {(p or {}).get('count')} "
@@ -2579,13 +3087,20 @@ _HANDLERS = {
     "crossVenue": _h_crossvenue,
     "aiStatus": _h_ai_status,
     "aiSetKey": _h_ai_set_key,
+    "aiCheckProvider": _h_ai_check_provider,
     "aiAnalyze": _h_ai_analyze,
     "aiScoreboard": _h_ai_scoreboard,
     "mcpStatus": _h_mcp_status,
+    "mcpSeen": _h_mcp_seen,
     "mcpRotateToken": _h_mcp_rotate_token,
     "mcpClientConfig": _h_mcp_client_config,
+    "mcpHttpSnippet": _h_mcp_http_snippet,
+    "healthCheck": _h_health_check,
     "mcpActivity": _h_mcp_activity,
     "mcpPaperReset": _h_mcp_paper_reset,
+    "mcp_agent_close_paper": _h_mcp_agent_close_paper,
+    "paperStatus": _h_paper_status,
+    "paperReset": _h_paper_reset,
     "mcpDecide": _h_mcp_decide,
     "autopilotStatus": _h_autopilot_status,
     "autopilotRunNow": _h_autopilot_run_now,
@@ -2626,6 +3141,7 @@ _HANDLERS = {
     "clearCredentials": _h_clearCredentials,
     "credentialStatus": _h_credentialStatus,
     "testCredentials": _h_testCredentials,
+    "verifyCredentials": _h_verifyCredentials,
     "account": _h_account,
     "pnlSeries": _h_pnlSeries,
     "positions": _h_positions,
@@ -2656,7 +3172,7 @@ async def _dispatch_request(req: dict) -> None:
         logger.warning(
             f"RPC {method} failed: {e}\n{traceback.format_exc(limit=3)}"
         )
-        await respond_err(rid, f"{type(e).__name__}: {e}")
+        await respond_err(rid, human_error(e), code=type(e).__name__)
 
 
 
@@ -2767,18 +3283,14 @@ async def _main() -> None:
     script_engine.set_event_callback(emit_event)
     logger.info("Krypt Trader backend starting")
 
-    active_env = STATE.cfg.get("kalshi_env", "demo")
+    active_env = scope_env(STATE.cfg)
     try:
         kalshi_auth.set_env(active_env)
     except Exception:
         pass
-    try:
-        if kalshi_auth.migrate_legacy_credentials(active_env):
-            logger.info(f"Migrated legacy credentials → {active_env}")
-    except Exception as e:
-        logger.warning(f"legacy credential migration failed: {e}")
 
-    if kalshi_auth.credentials_present(active_env):
+    STATE.auth_ok = active_env == kalshi_auth.PAPER
+    if active_env != kalshi_auth.PAPER and kalshi_auth.credentials_present():
         try:
             kalshi_auth.prime_credentials(sync_time=True)
             bal = await kalshi_api.get_balance()
@@ -2869,9 +3381,11 @@ def _selftest() -> int:
         "statistics", "terminal", "crossvenue", "polymarket_public", "remote",
         "remote_discord", "remote_telegram", "logscrub", "kalshi_perps_api",
         "perps_ws", "perps_farmer", "ws_ssl", "certifi",
-        "ai_analyst", "anthropic", "openai",
-        "forecast_ledger", "paper_book", "mcp_server", "mcp_bridge",
-        "mcp_workbench", "autopilot",
+        "ai_analyst", "ai_providers", "anthropic", "openai", "httpx",
+        "httpx2", "httpcore2", "truststore",
+        "forecast_ledger", "paper_book", "paper_exchange", "shard_rail", "mcp_server", "mcp_bridge",
+        "mcp_workbench", "mcp_agents", "autopilot", "health", "kalshi_key_check",
+        "capturetrail",
     ]
     import importlib
     for name in mods:
@@ -2906,12 +3420,18 @@ def _selftest() -> int:
     except Exception as e:
         failures.append(f"websocket TLS check: {type(e).__name__}: {e}")
 
+    try:
+        import ai_providers
+        failures.extend(f"AI SDK: {f}" for f in ai_providers.sdk_selfcheck())
+    except Exception as e:
+        failures.append(f"AI SDK check: {type(e).__name__}: {e}")
+
     if failures:
         print("SELFTEST FAILED:", file=sys.stderr)
         for f in failures:
             print(f"  - {f}", file=sys.stderr)
         return 1
-    print(f"SELFTEST OK ({len(mods)} modules, certifi CA store loaded)")
+    print(f"SELFTEST OK ({len(mods)} modules, certifi CA store loaded, AI SDK clients built)")
     return 0
 
 

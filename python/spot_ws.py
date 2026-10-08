@@ -1,3 +1,28 @@
+"""Coinbase WebSocket spot feed — the BRTI-proxy price source for 15m crypto.
+
+Kalshi's crypto up/down markets settle on a 60-second AVERAGE of the CF
+Benchmarks Real-Time Index (BRTI): in the final minute before close the index
+is sampled about once per second and those ~60 prints are averaged into the
+settlement value. Coinbase is a BRTI constituent exchange (Binance is NOT),
+so its keyless public ticker stream is the closest free real-time proxy for
+the number Kalshi actually settles against — the REST spot chain
+(CryptoCompare → Coinbase → CoinGecko) mixes non-constituent venues and its
+cache makes model inputs up to ~14s stale.
+
+Two jobs:
+  1. Live spot prices for the Coinbase-listed assets (BTC/ETH/SOL/XRP/DOGE;
+     HYPE and BNB aren't listed and stay on the REST chain).
+  2. A once-per-second sample ring per asset, so the settlement model can
+     track the PARTIAL settlement average during a window's final minute —
+     with 30 of 60 prints in, only the remaining 30 are uncertain, which makes
+     the late-window probability far sharper than any terminal-spot model.
+
+STRICT ACCELERATOR like kalshi_ws: every consumer falls back to the REST
+chain per-asset whenever the socket is down, an asset isn't covered, or a
+price is stale. Never MORE fragile than pure REST — only fresher.
+
+Opt out with KRYPT_SPOT_WS=0 (env) or the `crypto15m_spot_ws` config key.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -55,6 +80,7 @@ class _Client:
             a: deque(maxlen=_SAMPLES_MAX) for a in PRODUCTS
         }
 
+
     def start(self) -> None:
         if _DISABLED or not _WS_IMPORT_OK:
             if not _WS_IMPORT_OK and not _DISABLED:
@@ -90,6 +116,7 @@ class _Client:
 
     def is_running(self) -> bool:
         return self._task is not None and not self._task.done()
+
 
     async def _run(self) -> None:
         attempt = 0
@@ -144,6 +171,7 @@ class _Client:
         self.connected = False
         self._ws = None
 
+
     def handle_message(self, m: dict) -> None:
         if not isinstance(m, dict) or m.get("channel") != "ticker":
             return
@@ -160,7 +188,11 @@ class _Client:
                 if px > 0:
                     self.prices[asset] = (now, px)
 
+
     def _sample_once(self, now: Optional[float] = None) -> None:
+        """Append at most one (second, price) sample per asset per wall second
+        — mirroring BRTI's one-print-per-second cadence so window_partial's
+        count maps 1:1 onto settlement prints."""
         if now is None:
             import kalshi_auth
             now = kalshi_auth.server_now()
@@ -181,6 +213,7 @@ class _Client:
                 logger.debug(f"spot_ws: sampler error: {e}")
             await asyncio.sleep(1.0)
 
+
     def spot(self, asset: str) -> Optional[float]:
         rec = self.prices.get((asset or "").upper())
         if not rec:
@@ -191,6 +224,8 @@ class _Client:
         return px
 
     def fresh_spots(self) -> dict[str, float]:
+        """Live prices fresh enough to trust, keyed by asset. Empty when the
+        socket is down/cold — callers then use the REST chain untouched."""
         if not self.connected:
             return {}
         now = time.time()
@@ -202,6 +237,10 @@ class _Client:
     def window_partial(
         self, asset: str, close_epoch: float, now: Optional[float] = None,
     ) -> tuple[float, int]:
+        """(sum, count) of the one-per-second prints observed so far inside a
+        window's final-minute settlement span [close−60s, close). This is the
+        realized part of Kalshi's settlement average; (0, 0) when nothing has
+        been observed (model degrades to the buffer-free approximation)."""
         ring = self.samples.get((asset or "").upper())
         if not ring:
             return 0.0, 0

@@ -1,3 +1,4 @@
+"""Coin Optimizer: bucketing + aggregation logic (pure, network-free)."""
 from __future__ import annotations
 
 import coin_optimizer as co

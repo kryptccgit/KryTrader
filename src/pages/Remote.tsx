@@ -10,6 +10,7 @@ import { useApp } from '../state/AppStateProvider';
 import { usePoll } from '../state/TerminalProvider';
 import { useToast } from '../state/ToastProvider';
 import { cls } from '../utils/format';
+import { userMessage } from '../utils/errors';
 
 export function RemotePage() {
   const { config, refresh } = useApp();
@@ -39,7 +40,7 @@ export function RemotePage() {
       if (which === 'discord') setDiscordToken(''); else setTelegramToken('');
       reload();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     } finally {
       setBusy(null);
     }
@@ -53,7 +54,7 @@ export function RemotePage() {
         'info', 15_000);
       reload();
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     } finally {
       setBusy(null);
     }
@@ -74,7 +75,7 @@ export function RemotePage() {
         }
       }
     } catch (e) {
-      toast.error(e instanceof Error ? e.message : String(e));
+      toast.error(userMessage(e));
     } finally {
       setBusy(null);
     }
@@ -369,10 +370,10 @@ export function RemotePage() {
         body={
           <div className="space-y-2">
             <p>
-              A message from your paired chat will be able to place real orders
-              on the <span className="font-mono text-white">
-                {config?.kalshiEnv ?? 'demo'}
-              </span> environment.
+              A message from your paired chat will be able to place orders on your{' '}
+              <span className="font-mono text-white">
+                {config?.accountMode === 'live' ? 'LIVE (real money)' : 'PAPER (imaginary money, until you Go live)'}
+              </span>{' '}account.
             </p>
             <p>
               Every order is quoted first and needs a confirmation code, and all

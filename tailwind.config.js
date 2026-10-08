@@ -6,8 +6,8 @@ export default {
         krypt: {
           black: '#000000',
           void: '#0A0A0F',
-          surface: '#11111A',
-          surface2: '#171722',
+          surface: 'rgb(17 17 26 / 0.86)',
+          surface2: 'rgb(28 27 42 / 0.74)',
           border: 'rgba(255,255,255,0.08)',
           borderHi: 'rgba(255,255,255,0.16)',
           muted: '#A1A1AA',

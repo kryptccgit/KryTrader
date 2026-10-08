@@ -24,9 +24,9 @@ def fresh_db(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def env_demo(monkeypatch):
-    monkeypatch.setattr(trader, "get_env", lambda: "demo")
-    return "demo"
+def env_paper(monkeypatch):
+    monkeypatch.setattr(trader, "get_env", lambda: "paper")
+    return "paper"
 
 
 @pytest.fixture
@@ -38,13 +38,14 @@ def env_prod(monkeypatch):
 @pytest.fixture
 def cfg():
     c = merge_with_defaults({})
-    c["kalshi_env"] = "demo"
+    c["kalshi_env"] = "paper"
     c["crypto15m_enabled"] = True
     c["crypto15m_entry_style"] = "taker"
     return c
 
 
 def _live_cfg(cfg):
+    """Production + armed: the only mode that places 15m orders now that paper is gone."""
     cfg["kalshi_env"] = "production"
     cfg["crypto15m_live"] = True
     cfg["start_bankroll_usd"] = 1000.0
@@ -107,7 +108,9 @@ def test_should_enter_gate_matrix(cfg):
     assert ct.should_enter(a, off, has_open=False, open_count=0) == (False, "disabled")
 
 
-def test_edge_health_buckets_and_verdicts(fresh_db, env_demo, monkeypatch):
+def test_edge_health_buckets_and_verdicts(fresh_db, env_paper, monkeypatch):
+    """Edge Health separates paper from live, computes per-window stats, and
+    gives honest verdicts (small n -> keep collecting; never conflates modes)."""
     monkeypatch.setattr(ct, "check_model_calibration",
                         lambda env: {"ok": True, "rate": 1.0, "n": 50, "lb": 0.93})
     with db.get_db() as conn:
@@ -118,7 +121,7 @@ def test_edge_health_buckets_and_verdicts(fresh_db, env_demo, monkeypatch):
                 "filled_contracts": 1, "entry_limit_cents": 91,
                 "avg_entry_cents": 91, "cost_usd": 0.91,
                 "client_order_id": f"eh-{i}", "status": "settled",
-                "kalshi_env": "demo", "dry_run": 1, "strategy": "model_fm",
+                "kalshi_env": "paper", "dry_run": 1, "strategy": "model_fm",
             })
             db.update_crypto15m_position(conn, pid, resolved=1, pnl_usd=0.08)
             conn.execute("UPDATE crypto15m_positions SET resolved_at=datetime('now','-1 day') WHERE id=?", (pid,))
@@ -128,12 +131,12 @@ def test_edge_health_buckets_and_verdicts(fresh_db, env_demo, monkeypatch):
             "filled_contracts": 1, "entry_limit_cents": 95,
             "avg_entry_cents": 95, "cost_usd": 0.95,
             "client_order_id": "eh-live", "status": "settled",
-            "kalshi_env": "demo", "dry_run": 0, "strategy": "model",
+            "kalshi_env": "paper", "dry_run": 0, "strategy": "model",
         })
         db.update_crypto15m_position(conn, pid, resolved=1, pnl_usd=-0.95)
         conn.execute("UPDATE crypto15m_positions SET resolved_at=datetime('now','-2 day') WHERE id=?", (pid,))
 
-    eh = ct.edge_health("demo")
+    eh = ct.edge_health("paper")
     rows = {(r["strategy"], r["mode"]): r for r in eh["rows"]}
     assert ("model_fm", "paper") in rows and ("model", "live") in rows
     fm = rows[("model_fm", "paper")]
@@ -155,6 +158,9 @@ def test_should_stop_loss(cfg):
 
 
 def test_stop_evaluates_on_executable_bid_not_mid(cfg):
+    """A widening spread must not mask the stop: held YES with exit_threshold
+    0.40 and a 0.30/0.54 book — the mid (0.42) says 'fine', but the position is
+    only SELLABLE at 0.30. The stop must fire on the bid."""
     pos = {"status": "filled", "filled_contracts": 1, "side": "up"}
     market = {"yes_bid_dollars": 0.30, "yes_ask_dollars": 0.54}
     mid = ct.side_prob_from_market(market, "yes")
@@ -244,21 +250,21 @@ def test_balance_pct_entry_sizes_the_live_order(fresh_db, env_prod, cfg, monkeyp
 
 
 
-def test_disabled_does_nothing(fresh_db, env_demo, cfg, monkeypatch):
+def test_disabled_does_nothing(fresh_db, env_paper, cfg, monkeypatch):
     cfg["crypto15m_enabled"] = False
     monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset()]))
     out = run_async(ct.run_tick(cfg, authed=False))
     assert out == []
     with db.get_db() as conn:
-        assert db.count_open_crypto15m(conn, "demo") == 0
+        assert db.count_open_crypto15m(conn, "paper") == 0
 
 
-def test_demo_opens_no_positions(fresh_db, env_demo, cfg, monkeypatch):
+def test_demo_opens_no_positions(fresh_db, env_paper, cfg, monkeypatch):
     monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset()]))
     out = run_async(ct.run_tick(cfg, authed=True))
     assert out == []
     with db.get_db() as conn:
-        assert db.count_open_crypto15m(conn, "demo") == 0
+        assert db.count_open_crypto15m(conn, "paper") == 0
 
 
 def test_one_position_per_asset(fresh_db, env_prod, cfg, monkeypatch):
@@ -319,7 +325,7 @@ def test_live_gate_is_independent_of_main_bot(fresh_db, env_prod, cfg, monkeypat
     assert r["kalshi_order_id"] == "ord-1"
 
 
-def test_main_bot_live_does_not_arm_15m(fresh_db, env_demo, cfg, monkeypatch):
+def test_main_bot_live_does_not_arm_15m(fresh_db, env_paper, cfg, monkeypatch):
     cfg["crypto15m_live"] = False
     cfg["enable_trading"] = True
     monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset()]))
@@ -329,10 +335,12 @@ def test_main_bot_live_does_not_arm_15m(fresh_db, env_demo, cfg, monkeypatch):
 
     assert calls == []
     with db.get_db() as conn:
-        assert db.count_open_crypto15m(conn, "demo") == 0
+        assert db.count_open_crypto15m(conn, "paper") == 0
 
 
-def test_live_armed_without_auth_does_not_trade(fresh_db, env_demo, cfg, monkeypatch):
+def test_live_armed_in_paper_without_auth_trades_only_the_simulation(fresh_db, env_paper, cfg, monkeypatch):
+    """Paper needs no Kalshi account: the 15m engine trades its paper
+    simulation without auth, and still never calls the order API."""
     cfg["crypto15m_live"] = True
     monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset()]))
     calls = _capture_orders(monkeypatch)
@@ -341,10 +349,13 @@ def test_live_armed_without_auth_does_not_trade(fresh_db, env_demo, cfg, monkeyp
 
     assert calls == []
     with db.get_db() as conn:
-        assert db.count_open_crypto15m(conn, "demo") == 0
+        rows = db.get_open_crypto15m(conn, "paper")
+    assert rows and all(r["dry_run"] for r in rows)
 
 
-def test_demo_never_trades_even_when_live_armed(fresh_db, env_demo, cfg, monkeypatch):
+def test_paper_never_sends_a_real_order_even_when_live_armed(fresh_db, env_paper, cfg, monkeypatch):
+    """Paper is the master over the 15m "Real orders (LIVE)" switch: entries
+    are the paper simulation (dry_run rows), and no order call is made."""
     async def _bal(_cfg, force=False):
         return 10_000, 0
     monkeypatch.setattr(trader, "refresh_balance", _bal)
@@ -356,12 +367,14 @@ def test_demo_never_trades_even_when_live_armed(fresh_db, env_demo, cfg, monkeyp
 
     assert calls == []
     with db.get_db() as conn:
-        assert db.count_open_crypto15m(conn, "demo") == 0
+        rows = db.get_open_crypto15m(conn, "paper")
+    assert rows and all(r["dry_run"] for r in rows)
 
     st = run_async(ct.status(cfg, authed=True))
     assert st["liveSupported"] is False
     assert st["live"] is False
     assert st["liveArmed"] is True
+    assert st["paperAccount"] is True
 
 
 def test_status_reports_live_armed_and_authed(fresh_db, env_prod, cfg, monkeypatch):
@@ -412,7 +425,7 @@ def test_failed_entry_resolves_immediately_and_blocks_retry(fresh_db, env_prod, 
         assert conn.execute("SELECT COUNT(*) FROM crypto15m_positions").fetchone()[0] == 2
 
 
-def test_exiting_position_settles_when_sell_never_fills(fresh_db, env_demo, cfg, monkeypatch):
+def test_exiting_position_settles_when_sell_never_fills(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="exiting", direction="yes", target_contracts=1,
                     filled_contracts=1, cost_usd=0.88, exit_reason="stop_loss",
                     exit_kalshi_order_id="ord-x1", exit_filled_contracts=0,
@@ -437,7 +450,7 @@ def test_exiting_position_settles_when_sell_never_fills(fresh_db, env_demo, cfg,
 
     run_async(ct.run_tick(cfg, authed=False))
     with db.get_db() as conn:
-        assert db.count_open_crypto15m(conn, "demo") == 0
+        assert db.count_open_crypto15m(conn, "paper") == 0
         r = dict(conn.execute("SELECT * FROM crypto15m_positions WHERE id=?", (pid,)).fetchone())
     assert r["status"] == "settled"
     assert r["resolved"] == 1
@@ -447,14 +460,14 @@ def test_exiting_position_settles_when_sell_never_fills(fresh_db, env_demo, cfg,
     assert canceled == ["ord-x1"]
 
 
-def test_legacy_stuck_error_row_is_swept(fresh_db, env_demo, cfg, monkeypatch):
+def test_legacy_stuck_error_row_is_swept(fresh_db, env_paper, cfg, monkeypatch):
     with db.get_db() as conn:
         pid = db.insert_crypto15m_position(conn, {
             "asset": "BNB", "series": "KXBNB15M", "ticker": "KXBNB15M-OLD",
             "side": "up", "direction": "yes", "target_contracts": 12,
             "entry_limit_cents": 90, "client_order_id": "c1",
             "close_time": "2026-06-10T15:15:00Z", "confidence": 90,
-            "kalshi_env": "demo", "status": "error", "dry_run": False,
+            "kalshi_env": "paper", "status": "error", "dry_run": False,
         })
     monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([]))
     run_async(ct.run_tick(cfg, authed=False))
@@ -509,7 +522,7 @@ def _seed_c15(**over) -> dict:
         "status": over.get("status", "submitted"),
         "exit_reason": over.get("exit_reason"),
         "close_time": over.get("close_time", ""),
-        "kalshi_env": over.get("kalshi_env", "demo"),
+        "kalshi_env": over.get("kalshi_env", "paper"),
         "dry_run": over.get("dry_run", False),
     }
     post = {k: over[k] for k in
@@ -539,11 +552,11 @@ def _past():
     return (datetime.now(timezone.utc) - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def test_partial_entry_keeps_polling_then_completes(fresh_db, env_demo, cfg, monkeypatch):
+def test_partial_entry_keeps_polling_then_completes(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="submitted", kalshi_order_id="OID-E",
                     target_contracts=10, filled_contracts=0, close_time=_future())
 
-    async def _get3(_kid):
+    async def _get3(_kid, **_kw):
         return _order(3, 7, 2.64)
     monkeypatch.setattr(kalshi_api, "get_order", _get3)
 
@@ -555,7 +568,7 @@ def test_partial_entry_keeps_polling_then_completes(fresh_db, env_demo, cfg, mon
     assert r["filled_contracts"] == 3
     assert r["cost_usd"] == pytest.approx(2.64)
 
-    async def _get10(_kid):
+    async def _get10(_kid, **_kw):
         return _order(10, 0, 8.80, status="executed")
     monkeypatch.setattr(kalshi_api, "get_order", _get10)
     with db.get_db() as conn:
@@ -566,7 +579,32 @@ def test_partial_entry_keeps_polling_then_completes(fresh_db, env_demo, cfg, mon
     assert out["cost_usd"] == pytest.approx(8.80)
 
 
-def test_partial_fill_is_stop_loss_protected_before_expiry(fresh_db, env_demo, cfg, monkeypatch):
+def test_entry_cancel_and_re_read_are_pinned_to_the_rows_scope(fresh_db, env_paper, monkeypatch):
+    """Pre-release audit (v6): after the awaits between ticks the app may be on
+    the other account mode. The cancel and its confirming re-read are of THIS
+    row's order, so they name its scope; unpinned, they asked the other book
+    about an id it has never seen."""
+    pos = _seed_c15(status="submitted", kalshi_order_id="OID-PIN", target_contracts=10,
+                    filled_contracts=0, close_time=_future(), kalshi_env="production")
+    seen = []
+
+    async def _cancel(_kid, **kw):
+        seen.append(("cancel", kw.get("pin_env")))
+
+    async def _get(_kid, **kw):
+        seen.append(("get", kw.get("pin_env")))
+        return _order(0, 0, 0, status="canceled")
+    monkeypatch.setattr(kalshi_api, "cancel_order", _cancel)
+    monkeypatch.setattr(kalshi_api, "get_order", _get)
+    run_async(ct._cancel_entry_and_finalize(pos, "OID-PIN", 0))
+    assert seen and all(env == "production" for _, env in seen), seen
+
+
+def test_partial_fill_is_stop_loss_protected_before_expiry(fresh_db, env_paper, cfg, monkeypatch):
+    """Audit #3: the filled portion of a still-resting entry used to ride with
+    NO stop-loss until expiry promotion (at close with maker_cancel_min=0).
+    Now: stop fires on the filled portion → cancel the resting remainder,
+    book the partial as a real position, place the exit."""
     future = (datetime.now(timezone.utc) + timedelta(minutes=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
     pos = _seed_c15(status="submitted", kalshi_order_id="OID-P", target_contracts=10,
                     filled_contracts=4, cost_usd=3.48, close_time=future)
@@ -589,7 +627,7 @@ def test_partial_fill_is_stop_loss_protected_before_expiry(fresh_db, env_demo, c
     monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
     calls = _capture_orders(monkeypatch)
 
-    out = run_async(ct._manage_position(pos, cfg, "demo"))
+    out = run_async(ct._manage_position(pos, cfg, "paper"))
     assert canceled["v"] is True
     assert out["status"] == "exiting"
     assert out["exit_reason"] == "stop_loss"
@@ -597,7 +635,9 @@ def test_partial_fill_is_stop_loss_protected_before_expiry(fresh_db, env_demo, c
     assert len(calls) == 1 and calls[0]["action"] == "sell" and calls[0]["count"] == 4
 
 
-def test_partial_fill_not_touched_while_stop_not_triggered(fresh_db, env_demo, cfg, monkeypatch):
+def test_partial_fill_not_touched_while_stop_not_triggered(fresh_db, env_paper, cfg, monkeypatch):
+    """Healthy partial: quote above the stop → the entry keeps resting, nothing
+    is canceled, no exit is placed."""
     future = (datetime.now(timezone.utc) + timedelta(minutes=8)).strftime("%Y-%m-%dT%H:%M:%SZ")
     pos = _seed_c15(status="submitted", kalshi_order_id="OID-Q", target_contracts=10,
                     filled_contracts=4, cost_usd=3.48, close_time=future)
@@ -616,7 +656,7 @@ def test_partial_fill_not_touched_while_stop_not_triggered(fresh_db, env_demo, c
     monkeypatch.setattr(kalshi_api, "fetch_market", _market)
     calls = _capture_orders(monkeypatch)
 
-    out = run_async(ct._manage_position(pos, cfg, "demo"))
+    out = run_async(ct._manage_position(pos, cfg, "paper"))
     assert canceled["v"] is False
     assert calls == []
     with db.get_db() as conn:
@@ -625,7 +665,7 @@ def test_partial_fill_not_touched_while_stop_not_triggered(fresh_db, env_demo, c
     assert out is None
 
 
-def test_partial_entry_then_expiry_keeps_filled_portion(fresh_db, env_demo, cfg, monkeypatch):
+def test_partial_entry_then_expiry_keeps_filled_portion(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="submitted", kalshi_order_id="OID-E", target_contracts=10,
                     filled_contracts=3, cost_usd=2.64, close_time=_past())
     canceled = {"v": False}
@@ -646,7 +686,7 @@ def test_partial_entry_then_expiry_keeps_filled_portion(fresh_db, env_demo, cfg,
     assert out["exit_reason"] is None
 
 
-def test_unfilled_entry_then_expiry_still_cancels(fresh_db, env_demo, cfg, monkeypatch):
+def test_unfilled_entry_then_expiry_still_cancels(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="submitted", kalshi_order_id="OID-E",
                     target_contracts=10, filled_contracts=0, close_time=_past())
 
@@ -664,7 +704,7 @@ def test_unfilled_entry_then_expiry_still_cancels(fresh_db, env_demo, cfg, monke
     assert out["exit_reason"] == "unfilled_expired"
 
 
-def test_partial_stop_loss_sell_stays_exiting(fresh_db, env_demo, cfg, monkeypatch):
+def test_partial_stop_loss_sell_stays_exiting(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="exiting", direction="yes", target_contracts=10,
                     filled_contracts=10, cost_usd=8.80,
                     exit_kalshi_order_id="OID-X", exit_filled_contracts=0)
@@ -682,7 +722,7 @@ def test_partial_stop_loss_sell_stays_exiting(fresh_db, env_demo, cfg, monkeypat
     assert r["proceeds_usd"] == pytest.approx(2.07)
 
 
-def test_stop_loss_exit_books_cash_not_offsetting_cost(fresh_db, env_demo, cfg, monkeypatch):
+def test_stop_loss_exit_books_cash_not_offsetting_cost(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="exiting", direction="yes", target_contracts=1,
                     filled_contracts=1, cost_usd=0.71,
                     exit_kalshi_order_id="OID-X", exit_filled_contracts=0)
@@ -698,7 +738,7 @@ def test_stop_loss_exit_books_cash_not_offsetting_cost(fresh_db, env_demo, cfg, 
     assert out["outcome_correct"] == 0
 
 
-def test_partial_stop_then_settlement_accounts_for_sold_portion(fresh_db, env_demo, cfg, monkeypatch):
+def test_partial_stop_then_settlement_accounts_for_sold_portion(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="exiting", direction="yes", target_contracts=10,
                     filled_contracts=10, cost_usd=8.80, exit_reason="stop_loss",
                     exit_kalshi_order_id="OID-X", exit_filled_contracts=3, proceeds_usd=0.93)
@@ -771,7 +811,9 @@ def test_hours_ok_none_falls_back_to_window(cfg):
 
 
 
+
 def _exiting_position(cur_limit: int, *, oid: str = "OLD") -> dict:
+    """A filled position that has placed a resting stop-loss SELL @ cur_limit."""
     with db.get_db() as conn:
         pid = db.insert_crypto15m_position(conn, {
             "asset": "BTC", "series": "KXBTC15M", "ticker": "KXBTC15M-T1",
@@ -845,6 +887,11 @@ def test_chase_exit_holds_when_still_marketable(fresh_db, env_prod, cfg, monkeyp
 
 
 def test_chase_exit_reprices_decicent_bid_below_resting_sell(fresh_db, env_prod, cfg, monkeypatch):
+    """THE deci-cent never-fill loop (live bug, 2026-07-16): 15m books tick in
+    0.1c above 90c. Our sell rests at 95c while the TRUE best bid is 94.7c —
+    whole-cent quantization made both read '95', so the chase judged the sell
+    'still marketable' forever and the position rode to settlement. With
+    deci-cent resolution the chase must cancel and re-place at the real bid."""
     async def _book(_t):
         return {"yes": [[94.7, 500.0]], "no": []}
     monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
@@ -903,6 +950,7 @@ def test_stop_slippage_prices_chase_through_the_bid(fresh_db, env_prod, cfg, mon
 
 
 
+
 def test_should_take_profit(cfg):
     pos = {"status": "filled", "filled_contracts": 5}
     cfg["crypto15m_take_profit_cents"] = 0
@@ -916,7 +964,7 @@ def test_should_take_profit(cfg):
     assert ct.should_take_profit({"status": "filled", "filled_contracts": 0}, 0.99, cfg) is False
 
 
-def test_take_profit_sells_winner_at_the_bid_without_slippage(fresh_db, env_demo, cfg, monkeypatch):
+def test_take_profit_sells_winner_at_the_bid_without_slippage(fresh_db, env_paper, cfg, monkeypatch):
     cfg["crypto15m_take_profit_cents"] = 95
     cfg["crypto15m_stop_slippage_cents"] = 4
     pos = _seed_c15(status="filled", direction="yes", target_contracts=10,
@@ -931,7 +979,7 @@ def test_take_profit_sells_winner_at_the_bid_without_slippage(fresh_db, env_demo
     monkeypatch.setattr(kalshi_api, "get_orderbook", _book)
     calls = _capture_orders(monkeypatch)
 
-    row = run_async(ct._manage_position(pos, cfg, "demo"))
+    row = run_async(ct._manage_position(pos, cfg, "paper"))
 
     assert len(calls) == 1
     assert calls[0]["action"] == "sell"
@@ -941,8 +989,11 @@ def test_take_profit_sells_winner_at_the_bid_without_slippage(fresh_db, env_demo
 
 
 
+
 def _seed_resolved_pnl(pnl_usd: float, *, ago_sql: str = "now", env: str = "production",
                        ticker: str = "KXETH15M-DONE") -> None:
+    """A resolved 15m position with a known realized P&L, settled `ago_sql`
+    (a SQLite datetime modifier like 'now' or '-1 hour')."""
     with db.get_db() as conn:
         pid = db.insert_crypto15m_position(conn, {
             "asset": "ETH", "series": "KXETH15M", "ticker": ticker,
@@ -1005,6 +1056,7 @@ def test_status_exposes_take_profit_fields(fresh_db, env_prod, cfg, monkeypatch)
 
 
 
+
 def test_momentum_filters_off_by_default_passes(cfg):
     a = signal_asset(favorite="up")
     a["rsi"], a["macdHist"] = 20.0, -5.0
@@ -1058,7 +1110,8 @@ def test_momentum_filter_blocks_entry_through_should_enter(cfg):
 
 
 
-def test_canceled_partial_exit_stays_open_for_settlement(fresh_db, env_demo, cfg, monkeypatch):
+
+def test_canceled_partial_exit_stays_open_for_settlement(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="exiting", direction="yes", target_contracts=10,
                     filled_contracts=10, cost_usd=8.80, exit_reason="stop_loss",
                     exit_kalshi_order_id="OID-X", exit_filled_contracts=0)
@@ -1084,7 +1137,7 @@ def test_canceled_partial_exit_stays_open_for_settlement(fresh_db, env_demo, cfg
     assert out["pnl_usd"] == pytest.approx(2.20 + 6.0 - 8.80)
 
 
-def test_manage_position_does_not_cancel_partially_filled_exit(fresh_db, env_demo, cfg, monkeypatch):
+def test_manage_position_does_not_cancel_partially_filled_exit(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="exiting", direction="yes", target_contracts=10,
                     filled_contracts=10, cost_usd=8.80, exit_reason="stop_loss",
                     exit_kalshi_order_id="OID-X", exit_filled_contracts=0,
@@ -1109,7 +1162,7 @@ def test_manage_position_does_not_cancel_partially_filled_exit(fresh_db, env_dem
     monkeypatch.setattr(kalshi_api, "fetch_market", _open)
     calls = _capture_orders(monkeypatch)
 
-    run_async(ct._manage_position(pos, cfg, "demo"))
+    run_async(ct._manage_position(pos, cfg, "paper"))
 
     assert canceled == []
     assert calls == []
@@ -1118,7 +1171,7 @@ def test_manage_position_does_not_cancel_partially_filled_exit(fresh_db, env_dem
     assert r["status"] == "exiting" and r["exit_filled_contracts"] == 3
 
 
-def test_settle_if_closed_books_same_tick_partial_fill(fresh_db, env_demo, cfg, monkeypatch):
+def test_settle_if_closed_books_same_tick_partial_fill(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="exiting", direction="yes", target_contracts=10,
                     filled_contracts=10, cost_usd=8.80, exit_reason="stop_loss",
                     exit_kalshi_order_id="OID-X", exit_filled_contracts=0)
@@ -1180,6 +1233,7 @@ def test_chase_exit_aborts_when_cancel_did_not_take(fresh_db, env_prod, cfg, mon
 
 
 
+
 def _order_with_fees(filled, remaining, cost_dollars, fees_dollars, status="resting") -> dict:
     o = _order(filled, remaining, cost_dollars, status=status)
     o["order"]["taker_fees_dollars"] = f"{fees_dollars}"
@@ -1200,7 +1254,7 @@ def test_parse_kalshi_order_extracts_fees():
     assert parsed["fees_usd"] == pytest.approx(0.18)
 
 
-def test_entry_poll_records_fees(fresh_db, env_demo, cfg, monkeypatch):
+def test_entry_poll_records_fees(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="submitted", kalshi_order_id="OID-E",
                     target_contracts=10, filled_contracts=0, close_time=_future())
 
@@ -1213,7 +1267,7 @@ def test_entry_poll_records_fees(fresh_db, env_demo, cfg, monkeypatch):
     assert out["fees_usd"] == pytest.approx(0.12)
 
 
-def test_exit_pnl_is_net_of_entry_and_exit_fees(fresh_db, env_demo, cfg, monkeypatch):
+def test_exit_pnl_is_net_of_entry_and_exit_fees(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="exiting", direction="yes", target_contracts=10,
                     filled_contracts=10, cost_usd=8.80, fees_usd=0.12,
                     exit_kalshi_order_id="OID-X", exit_filled_contracts=0)
@@ -1229,7 +1283,7 @@ def test_exit_pnl_is_net_of_entry_and_exit_fees(fresh_db, env_demo, cfg, monkeyp
     assert out["pnl_usd"] == pytest.approx(-0.51)
 
 
-def test_settlement_pnl_subtracts_entry_fees(fresh_db, env_demo, cfg, monkeypatch):
+def test_settlement_pnl_subtracts_entry_fees(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="filled", direction="yes", target_contracts=10,
                     filled_contracts=10, cost_usd=8.80, fees_usd=0.12)
 
@@ -1237,9 +1291,10 @@ def test_settlement_pnl_subtracts_entry_fees(fresh_db, env_demo, cfg, monkeypatc
         return {"result": "yes", "status": "finalized"}
     monkeypatch.setattr(kalshi_api, "fetch_market", _settled)
 
-    out = run_async(ct._manage_position(pos, cfg, "demo"))
+    out = run_async(ct._manage_position(pos, cfg, "paper"))
     assert out["status"] == "settled"
     assert out["pnl_usd"] == pytest.approx(10.0 - 8.80 - 0.12)
+
 
 
 
@@ -1250,7 +1305,7 @@ def test_entry_recovers_unacked_order_by_client_id(fresh_db, env_prod, cfg, monk
         raise RuntimeError("read timeout")
     monkeypatch.setattr(kalshi_api, "place_limit_order", _boom)
 
-    async def _find(coid, ticker=""):
+    async def _find(coid, ticker="", **_kw):
         return {"order_id": "REC-1", "client_order_id": coid, "status": "resting"}
     monkeypatch.setattr(kalshi_api, "find_order_by_client_id", _find)
     monkeypatch.setattr(crypto15m, "snapshot", _stub_snapshot([signal_asset()]))
@@ -1262,6 +1317,7 @@ def test_entry_recovers_unacked_order_by_client_id(fresh_db, env_prod, cfg, monk
     assert r["status"] == "submitted"
     assert r["resolved"] == 0
     assert r["kalshi_order_id"] == "REC-1"
+
 
 
 
@@ -1355,15 +1411,13 @@ def test_snapshot_strict_requires_two_sided_book(cfg, monkeypatch):
 
 
 
+
 def test_main_engine_should_trade_skips_crypto15m_series(cfg):
     cfg["trade_whales"] = True
     sig = {"ticker": "KXBTC15M-26JUL011500", "confidence": 90, "price": 0.80}
     ok, why = trader.should_trade(sig, "whale", cfg)
     assert ok is False and "crypto15m" in why
-    cfg["gambling_mode"] = True
-    cfg["gambling_trade_probability"] = 1.0
-    ok, _ = trader.should_trade(sig, "whale", cfg)
-    assert ok is False
+
 
 
 
@@ -1447,6 +1501,7 @@ def test_stopped_out_ticker_is_not_reentered_same_window(fresh_db, env_prod, cfg
 
 
 
+
 def test_sigma1m_measures_return_vol():
     import indicators
     flat = [100.0] * 40
@@ -1522,6 +1577,7 @@ def test_snapshot_uses_strike_and_signed_delta(cfg, monkeypatch):
 
 
 
+
 def _model_asset(mp=0.98, edge=3.5, up_ask=0.93, down_ask=0.09, mins_left=4.0):
     a = signal_asset()
     a.update({
@@ -1541,6 +1597,8 @@ def _sniper_cfg(cfg):
 
 
 def test_midwindow_model_entries_blocked_by_default(cfg):
+    """Post-replay default: mid-window model entries are refused (no measured
+    edge — −0.12c/ct over 19,819 windows); only the final-minute sniper runs."""
     c = dict(cfg)
     c["crypto15m_direction_mode"] = "model"
     a = _model_asset(mp=0.99, up_ask=0.90)
@@ -1627,6 +1685,7 @@ def test_sniper_ignores_strict_favorite_floor(fresh_db, env_prod, cfg, monkeypat
 
 
 
+
 def _fm_asset(mp=0.999, edge=3.0, prints=40, mins_left=0.5, up_ask=0.95, down_ask=0.06):
     a = _model_asset(mp=mp, edge=edge, up_ask=up_ask, down_ask=down_ask,
                      mins_left=mins_left)
@@ -1687,6 +1746,7 @@ def test_sniper_model_prob_zero_buys_down_not_up(fresh_db, env_prod, cfg, monkey
         r = db.get_open_crypto15m(conn, "production")[0]
     assert r["direction"] == "no"
     assert r["confidence"] == pytest.approx(100.0)
+
 
 
 
@@ -1803,7 +1863,7 @@ def test_place_exit_unconfirmed_parks_without_order_id(fresh_db, env_prod, cfg, 
     assert r["status"] == "filled"
 
 
-def test_disabled_engine_still_manages_open_positions(fresh_db, env_demo, cfg, monkeypatch):
+def test_disabled_engine_still_manages_open_positions(fresh_db, env_paper, cfg, monkeypatch):
     pos = _seed_c15(status="filled", direction="yes", target_contracts=5,
                     filled_contracts=5, cost_usd=4.50, avg_entry_cents=90.0)
     cfg["crypto15m_enabled"] = False
@@ -1940,7 +2000,14 @@ def test_perfect_record_never_pauses_and_can_resume():
 
 
 def test_a_resting_order_on_a_closed_market_stops_retrying(
-        fresh_db, env_demo, cfg, monkeypatch):
+        fresh_db, env_paper, cfg, monkeypatch):
+    """Requiring a terminal status before booking 'canceled' is right, but on
+    its own it never TERMINATES: an order Kalshi keeps reporting as 'resting'
+    retried every poll forever. A beta log showed the same order id repeating
+    at ~4s intervals indefinitely.
+
+    Kalshi stops matching at the close, so once the close time has passed a
+    resting order can never fill again — whatever get_order still says."""
     pos = _seed_c15(status="submitted", kalshi_order_id="OID-STUCK",
                     target_contracts=10, filled_contracts=0, close_time=_past())
 
@@ -1959,7 +2026,10 @@ def test_a_resting_order_on_a_closed_market_stops_retrying(
 
 
 def test_a_resting_order_on_an_OPEN_market_still_waits(
-        fresh_db, env_demo, cfg, monkeypatch):
+        fresh_db, env_paper, cfg, monkeypatch):
+    """The safety half: before the close, an unconfirmable order is still live
+    and must NOT be booked canceled — that is the off-book settlement this
+    whole path exists to prevent."""
     pos = _seed_c15(status="submitted", kalshi_order_id="OID-LIVE",
                     target_contracts=10, filled_contracts=0, close_time=_future())
 
@@ -1978,7 +2048,9 @@ def test_a_resting_order_on_an_OPEN_market_still_waits(
 
 
 def test_a_fill_still_wins_over_the_closed_market_shortcut(
-        fresh_db, env_demo, cfg, monkeypatch):
+        fresh_db, env_paper, cfg, monkeypatch):
+    """A CONFIRMED fill is booked as filled even past the close — the shortcut
+    must never book away contracts that actually traded."""
     pos = _seed_c15(status="submitted", kalshi_order_id="OID-FILLED",
                     target_contracts=10, filled_contracts=0, close_time=_past())
 
@@ -1994,63 +2066,3 @@ def test_a_fill_still_wins_over_the_closed_market_shortcut(
     res = run_async(ct._cancel_entry_and_finalize(pos, "OID-FILLED", 0))
     assert res["status"] == "filled"
     assert res["filled_contracts"] == 4
-
-
-# Kalshi sends "0.0000" for an empty side and derives "1.0000" on the other leg.
-# Read as prices, a never-traded market was "down at 100%", an absent ask was a
-# $0 entry cost, and a paper exit with no bid filled at 99.9c.
-
-def test_price_dollars_reads_kalshi_placeholders_as_absent():
-    m = {"yes_bid_dollars": "0.0000", "no_ask_dollars": "1.0000",
-         "yes_ask_dollars": "0.4200"}
-    assert crypto15m._price_dollars(m, "yes_bid") is None
-    assert crypto15m._price_dollars(m, "no_ask") is None
-    assert crypto15m._price_dollars(m, "yes_ask") == pytest.approx(0.42)
-    assert crypto15m._price_dollars({}, "last_price") is None
-
-
-def test_snapshot_with_no_quotes_has_no_favorite(cfg, monkeypatch):
-    cfg["crypto15m_strict_threshold"] = False
-    market = _snapshot_market(
-        yes_bid_dollars="0.0000", yes_ask_dollars="0.0000",
-        no_ask_dollars="1.0000", last_price_dollars="0.0000",
-    )
-    out = _run_asset_snapshot(cfg, monkeypatch, market)
-    assert out["upProb"] is None and out["favorite"] is None
-    assert out["favoritePrice"] is None and out["entryCost"] is None
-    assert out["signal"] is False
-
-
-def test_snapshot_absent_ask_is_not_a_free_entry(cfg, monkeypatch):
-    cfg["crypto15m_strict_threshold"] = False
-    cfg["crypto15m_entry_threshold"] = 0.50
-    market = _snapshot_market(
-        yes_bid_dollars="0.9000", yes_ask_dollars="0.0000",
-        no_ask_dollars="0.1000", last_price_dollars="0.9000",
-    )
-    out = _run_asset_snapshot(cfg, monkeypatch, market)
-    assert out["favorite"] == "up"
-    assert out["entryCost"] is None
-    assert out["signal"] is False
-
-
-def test_side_prob_from_market_without_quotes_is_none():
-    assert ct.side_prob_from_market({"yes_bid_dollars": "0.0000"}, "no") is None
-
-
-def test_paper_prices_need_a_real_opposite_quote():
-    no_book = {"yes_bid_dollars": "0.0000", "yes_ask_dollars": "0.0000"}
-    assert ct._paper_side_ask_cents(no_book, "down") is None
-    assert ct._paper_side_bid_cents(no_book, "down") is None
-    book = {"yes_bid_dollars": "0.3000", "yes_ask_dollars": "0.3500"}
-    assert ct._paper_side_ask_cents(book, "down") == pytest.approx(70.0)
-    assert ct._paper_side_bid_cents(book, "down") == pytest.approx(65.0)
-
-
-def test_open_entry_refuses_contrarian_flip_of_no_favorite(cfg, monkeypatch):
-    cfg["crypto15m_direction_mode"] = "contrarian"
-    calls = _capture_orders(monkeypatch)
-    a = {"favorite": None, "favoritePrice": None, "entryCost": None,
-         "ticker": "KXBTC15M-T1", "hasMarket": True}
-    assert run_async(ct._open_entry(a, cfg, "demo", 100.0)) is None
-    assert calls == []

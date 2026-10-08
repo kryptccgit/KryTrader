@@ -24,6 +24,11 @@ def db_path() -> Path:
     return _data_dir() / "krypt-trader.db"
 
 
+LIVE_ENV = "production"
+PAPER_ENV = "paper"
+RETIRED_ENV = "demo"
+
+
 @contextmanager
 def get_db():
     conn = sqlite3.connect(str(db_path()), timeout=30)
@@ -477,6 +482,7 @@ CREATE TABLE IF NOT EXISTS ai_forecasts (
     title TEXT DEFAULT '',
     source TEXT NOT NULL,                -- panel | mcp
     model TEXT DEFAULT '',
+    client TEXT DEFAULT '',              -- MCP client (Claude Code, Autopilot…); '' = panel
     prob_yes REAL NOT NULL,              -- 0.01..0.99
     market_mid_cents REAL DEFAULT NULL,
     yes_bid_cents REAL DEFAULT NULL,
@@ -485,7 +491,8 @@ CREATE TABLE IF NOT EXISTS ai_forecasts (
     rationale TEXT DEFAULT '',
     outcome REAL DEFAULT NULL,           -- YES payout 0..1; NULL = unsettled
     resolved_at TEXT DEFAULT NULL,
-    last_checked_at TEXT DEFAULT NULL
+    last_checked_at TEXT DEFAULT NULL,
+    agent_id TEXT DEFAULT NULL           -- the user's named agent (mcp rows); NULL = panel
 );
 
 -- The agents' paper book: real order books, imaginary money. buy/sell rows are
@@ -503,12 +510,50 @@ CREATE TABLE IF NOT EXISTS paper_fills (
     fee_usd REAL NOT NULL DEFAULT 0,
     cash_delta_usd REAL NOT NULL,
     forecast_id INTEGER DEFAULT NULL,
-    client TEXT DEFAULT ''
+    client TEXT DEFAULT '',
+    agent_id TEXT DEFAULT 'default'      -- whose position this is (mcp_agents id)
 );
 
 -- Every order an MCP agent attempted, refused ones included. This is both the
 -- audit trail the AI Agents page shows and the ledger the daily spend cap and
 -- "it may only touch what it opened" rails are computed from.
+-- The paper account's orders (paper_exchange). A paper order can REST, like a
+-- real one: the part that crosses the real book when it is placed fills at
+-- once; the remainder waits and fills only when the real book later crosses
+-- its limit. Fills land in paper_fills (agent_id 'account') with order_id set.
+CREATE TABLE IF NOT EXISTS paper_orders (
+    order_id TEXT PRIMARY KEY,
+    client_order_id TEXT UNIQUE,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    ticker TEXT NOT NULL,
+    side TEXT NOT NULL,                  -- yes | no
+    action TEXT NOT NULL,                -- buy | sell
+    limit_cents REAL NOT NULL,
+    count INTEGER NOT NULL,
+    filled INTEGER NOT NULL DEFAULT 0,
+    fill_cost_usd REAL NOT NULL DEFAULT 0,
+    fees_usd REAL NOT NULL DEFAULT 0,
+    status TEXT NOT NULL,                -- resting | executed | canceled
+    -- Contracts the real book showed crossing this order's limit when it was
+    -- last matched. A paper fill does not deplete the real book, so the same
+    -- visible liquidity must not fill the order twice: only depth beyond this
+    -- is new (see paper_exchange._apply_fill).
+    seen_cross_qty INTEGER NOT NULL DEFAULT 0,
+    note TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_paper_orders_status ON paper_orders(status, ticker);
+
+-- The paper book's own settings that must not move with config. 'bankroll'
+-- is the starting balance IN EFFECT: fixed when the book starts (first read)
+-- and at each Reset. Editing the config value changes only what the NEXT
+-- Reset starts from; otherwise typing a bigger number would be booked as an
+-- instant gain by every balance-delta P&L and daily-risk check.
+CREATE TABLE IF NOT EXISTS paper_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS mcp_orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at TEXT DEFAULT (datetime('now')),
@@ -530,7 +575,12 @@ CREATE TABLE IF NOT EXISTS mcp_orders (
     -- NULL for orders that went straight through; pending | deciding |
     -- approved | rejected | expired | failed when the user approves live
     -- agent orders one by one.
-    status TEXT DEFAULT NULL
+    status TEXT DEFAULT NULL,
+    -- Which of the user's named agents (mcp_agents) asked. Every per-agent
+    -- rail — its own spend, its positions, "only what IT opened" — is
+    -- computed from this column. Rows from before agents existed belong to
+    -- the built-in Default agent, which holds the original token.
+    agent_id TEXT DEFAULT 'default'
 );
 
 -- Everything an agent did that is not an order: scripts saved or switched,
@@ -543,6 +593,23 @@ CREATE TABLE IF NOT EXISTS mcp_actions (
     ok INTEGER NOT NULL DEFAULT 0,
     summary TEXT DEFAULT ''
 );
+
+-- Collateral moved between Kalshi exchange shards (shard_rail.py): by the
+-- app before a live buy ('auto'), by an AI agent ('agent:<id>'), or by the
+-- user's own Move funds button ('you'). The automatic ones share a daily cap,
+-- read from here so a restart cannot reset it.
+CREATE TABLE IF NOT EXISTS shard_transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT DEFAULT (datetime('now')),
+    kalshi_env TEXT NOT NULL,
+    from_shard INTEGER NOT NULL,
+    to_shard INTEGER NOT NULL,
+    amount_usd REAL NOT NULL,
+    by TEXT NOT NULL,
+    ok INTEGER NOT NULL DEFAULT 0,
+    note TEXT DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_shard_transfers_day ON shard_transfers(kalshi_env, created_at);
 
 -- One row per Autopilot session: what it cost and what it did. The token
 -- columns are what the daily budget is enforced from.
@@ -665,11 +732,21 @@ def init_db() -> None:
             "ALTER TABLE bot_positions ADD COLUMN script_id TEXT DEFAULT NULL",
             "ALTER TABLE user_scripts ADD COLUMN author TEXT DEFAULT NULL",
             "ALTER TABLE mcp_orders ADD COLUMN status TEXT DEFAULT NULL",
+            "ALTER TABLE ai_forecasts ADD COLUMN client TEXT DEFAULT ''",
+            "ALTER TABLE mcp_orders ADD COLUMN agent_id TEXT DEFAULT 'default'",
+            "ALTER TABLE paper_fills ADD COLUMN agent_id TEXT DEFAULT 'default'",
+            "ALTER TABLE paper_fills ADD COLUMN order_id TEXT DEFAULT NULL",
+            "ALTER TABLE ai_forecasts ADD COLUMN agent_id TEXT DEFAULT NULL",
         ]:
             try:
                 conn.execute(migration)
             except sqlite3.OperationalError:
                 pass
+        try:
+            conn.execute("UPDATE ai_forecasts SET agent_id='default' "
+                         "WHERE source='mcp' AND (agent_id IS NULL OR agent_id='')")
+        except sqlite3.OperationalError:
+            pass
 
 
 def factory_reset(*, wipe_markets: bool = False) -> dict:
@@ -688,9 +765,11 @@ def factory_reset(*, wipe_markets: bool = False) -> dict:
         "perp_farm_fills",
         "terminal_rules",
         "paper_fills",
+        "paper_orders",
         "mcp_orders",
         "mcp_actions",
         "autopilot_runs",
+        "shard_transfers",
     ]
     if wipe_markets:
         targets.extend(["markets", "events", "trades", "market_snapshots"])
@@ -1081,6 +1160,10 @@ def get_previous_snapshot(conn, ticker: str) -> dict | None:
 
 
 def get_previous_snapshots_bulk(conn, tickers) -> dict:
+    """Second-most-recent snapshot per ticker (same as get_previous_snapshot's
+    LIMIT 1 OFFSET 1, i.e. rn=2) for many tickers in ONE query — replaces a
+    ~500× N+1 in the momentum scan. Returns {ticker: {volume_24h, yes_bid,
+    last_price}}. Chunked under SQLite's 999-variable limit."""
     out: dict[str, dict] = {}
     uniq = [t for t in dict.fromkeys(tickers) if t]
     CHUNK = 400
@@ -1197,7 +1280,7 @@ def insert_bot_position(conn, row: dict) -> int:
             float(row.get("signal_price", 0.0)),
             row.get("error"),
             row.get("balance_before_usd"),
-            row.get("kalshi_env", "demo"),
+            row.get("kalshi_env") or RETIRED_ENV,
         ),
     )
     return cur.lastrowid
@@ -1252,6 +1335,8 @@ def count_open_bot_positions(conn, env: str | None = None) -> int:
 
 
 def get_market_quotes(conn, tickers) -> dict[str, dict]:
+    """Latest stored quote (yes_bid/yes_ask/last_price, in dollars 0..1) per
+    ticker, from the markets table. Used to mark open positions to market."""
     out: dict[str, dict] = {}
     for t in {x for x in tickers if x}:
         row = conn.execute(
@@ -1304,6 +1389,14 @@ def recent_resolved_position_exists(
 def find_flat_resolved_position(
     conn, ticker: str, direction: str, env: str, qty: int
 ) -> dict | None:
+    """A resolved row for (ticker, direction, env) that was closed FLAT —
+    pnl $0, settlement $0, no outcome — i.e. the signature of a wrongful
+    orphan-close / give-up resolve, not of a real settlement (a genuine loss
+    books pnl<0; a genuine win books settlement>0). Used by reconcile: when
+    Kalshi still holds this (ticker, side), such a row is our OWN position
+    that got mis-resolved and must be re-linked instead of re-imported as a
+    cap-exempt 'external' duplicate. Prefers a row whose recorded fill count
+    matches the held quantity."""
     row = conn.execute(
         """SELECT * FROM bot_positions
            WHERE ticker=? AND direction=? AND kalshi_env=?
@@ -1372,6 +1465,12 @@ def current_total_exposure_usd(conn, env: str) -> float:
 
 
 def open_filled_cost_usd(conn, env: str) -> float:
+    """Cost basis of currently-open FILLED contracts only. Unlike
+    current_total_exposure_usd (which counts committed notional of resting orders
+    for risk capping), this EXCLUDES unfilled/resting orders, whose cash is still
+    sitting in Kalshi's `balance` (it isn't held). This is the correct value of
+    open positions for the account total / P&L: cash + filled-cost reconstructs
+    the account with no double-count, and opening a position is P&L-neutral."""
     row = conn.execute(
         """SELECT COALESCE(SUM(cost_usd), 0) FROM bot_positions
            WHERE resolved=0 AND status IN ('filled','partial') AND kalshi_env=?""",
@@ -1381,6 +1480,20 @@ def open_filled_cost_usd(conn, env: str) -> float:
 
 
 def open_unrealized_pnl_usd(conn, env: str) -> float:
+    """Mark-to-market P&L of open FILLED positions with a live mark (written by
+    the 30s reconcile). Feeds the daily stop-loss so a day of positions bleeding
+    toward zero can trigger it BEFORE settlement — the balance-delta measure
+    alone values open positions at cost and sees nothing until cash moves.
+
+    Hand-placed positions are EXCLUDED. The daily stop exists to stop the BOT
+    when the bot is having a bad day; letting a losing manual trade trip it
+    would halt the automation for something the automation did not do, with
+    nothing on screen saying why. The operator can pause trading themselves —
+    that is the whole point of the manual side.
+
+    (The other half of the daily gate, the day's balance delta, is inherently
+    account-wide and cannot be attributed — manual activity does move it. The
+    Terminal's own P&L lives on the Terminal's own page.)"""
     row = conn.execute(
         """SELECT COALESCE(SUM(
               filled_contracts * mark_price_cents / 100.0 - COALESCE(cost_usd, 0)
@@ -1394,6 +1507,21 @@ def open_unrealized_pnl_usd(conn, env: str) -> float:
 
 
 def _c15_matched_adjusted_cost(conn, env: str) -> float:
+    """Open 15m cost basis with MATCHED pairs excluded. Kalshi nets opposing
+    positions: the moment both sides of one market are held, the matched
+    contracts are redeemed for $1×matched CASH on the spot — the position is
+    flat and its basis is no longer held value. Counting it anyway double-
+    counts against the cash credit, inflating the account total while a pair
+    is open and then 'crashing' it at settlement when the rows resolve.
+
+    Sold-but-unsettled contracts are excluded too: a partially-filled exit
+    (stop-loss/TP) leaves the row status='exiting', resolved=0 until
+    settlement, but the sold contracts' cash proceeds have ALREADY landed in
+    the Kalshi balance — still counting their entry cost as held value
+    overstates the account total by sold × avg entry cost, which reads as
+    phantom profit to the balance-delta daily stop-loss at exactly the moment
+    a stop just half-failed. Each row is valued at its RESIDUAL cost:
+    cost × (filled − exit_filled) / filled."""
     rows = conn.execute(
         """SELECT ticker, direction,
                   SUM(MAX(0, filled_contracts - COALESCE(exit_filled_contracts, 0))) f,
@@ -1420,6 +1548,11 @@ def _c15_matched_adjusted_cost(conn, env: str) -> float:
 
 
 def open_crypto15m_filled_cost_usd(conn, env: str) -> float:
+    """Held value of currently-open 15m-crypto positions (its own table),
+    matched-pair aware (see _c15_matched_adjusted_cost). Added to the account
+    total because those positions are excluded from the main bot_positions
+    reconcile import — without this the total would under-count by the crypto
+    cash that's already been spent."""
     return _c15_matched_adjusted_cost(conn, env)
 
 
@@ -1498,7 +1631,7 @@ def insert_crypto15m_position(conn, row: dict) -> int:
             row["status"], row.get("exit_reason"), row.get("close_time", ""),
             float(row.get("confidence", 0.0)),
             row.get("entry_delta_usd"),
-            row.get("kalshi_env", "demo"),
+            row.get("kalshi_env") or RETIRED_ENV,
             1 if row.get("dry_run") else 0,
             row.get("error"),
             row.get("strategy", "") or "",
@@ -1570,12 +1703,16 @@ def crypto15m_errored_tickers(conn, env: str) -> set:
 
 
 def crypto15m_stopped_tickers(conn, env: str) -> set:
+    """Tickers whose position exited via stop-loss — excluded from re-entry so
+    chop can't churn stop → re-enter → stop within one window (each ticker IS
+    one 15-minute window, so the exclusion expires naturally with it)."""
     rows = conn.execute(
         """SELECT DISTINCT ticker FROM crypto15m_positions
            WHERE kalshi_env=? AND exit_reason='stop_loss' AND ticker IS NOT NULL""",
         (env,),
     ).fetchall()
     return {r["ticker"] for r in rows}
+
 
 
 
@@ -1635,6 +1772,12 @@ def delete_user_script(conn, sid: str) -> None:
 
 
 def script_live_stats(conn, env: str) -> dict[str, dict]:
+    """Per-script LIVE P&L across BOTH position tables (crypto windows +
+    main-market signal follows): {script_id: {n, open, wins, losses, pnlUsd}}
+    — the Scripts list's at-a-glance numbers. Paper (dry_run) rows are
+    excluded: the label says live, and mixing simulated wins into it would
+    misrepresent a script's real record. bot_positions has no dry_run column
+    (signal follows are live-only)."""
     agg = """SELECT script_id,
                     COUNT(*) AS n,
                     SUM(CASE WHEN resolved=0 THEN 1 ELSE 0 END) AS open_n,
@@ -1664,6 +1807,12 @@ def script_live_stats(conn, env: str) -> dict[str, dict]:
 
 
 def open_crypto15m_committed_usd(conn, env: str) -> float:
+    """Capital committed to open 15m positions: matched-pair-adjusted cost of
+    filled contracts (matched pairs already redeemed to cash — see
+    _c15_matched_adjusted_cost) plus the committed notional of still-resting
+    entry remainders. Drives the aggregate 15m cap (crypto15m_max_total_pct);
+    without the adjustment, completed pairs kept 'using' budget they had
+    already returned."""
     filled_cost = _c15_matched_adjusted_cost(conn, env)
     row = conn.execute(
         """SELECT COALESCE(SUM(
@@ -1707,6 +1856,8 @@ def crypto15m_stats(conn, env: str) -> dict:
 
 
 def crypto15m_resolved_for_health(conn, env: str, since_days: int = 90) -> list[dict]:
+    """Resolved, actually-filled positions for the Edge Health panel —
+    per-row so the caller can compute t-stats, not just totals."""
     rows = conn.execute(
         """SELECT strategy, dry_run, filled_contracts, pnl_usd,
                   avg_entry_cents, resolved_at
@@ -1721,6 +1872,11 @@ def crypto15m_resolved_for_health(conn, env: str, since_days: int = 90) -> list[
 
 
 def crypto15m_session_realized_pnl(conn, env: str, since: str | None) -> float:
+    """Realized P&L of resolved 15m positions settled at/after `since` — an
+    ISO/SQLite UTC datetime, typically the backend start time. Powers the 15m
+    session take-profit. `since` falsy = the whole history for the env.
+    `datetime(?)` normalises the ISO start to the 'YYYY-MM-DD HH:MM:SS' form
+    that resolved_at is stored in, so the string comparison is valid."""
     if since:
         row = conn.execute(
             """SELECT COALESCE(SUM(pnl_usd), 0) AS pnl
@@ -1758,7 +1914,7 @@ def insert_crypto15m_signal(conn, row: dict) -> bool:
             row.get("macd"), row.get("macd_signal"), row.get("macd_hist"),
             row.get("macd_cross"), row.get("rsi"),
             row.get("strike"), row.get("model_prob"), row.get("edge_net_cents"),
-            row.get("kalshi_env", "demo"),
+            row.get("kalshi_env") or RETIRED_ENV,
         ),
     )
     return (cur.rowcount or 0) > 0
@@ -1829,7 +1985,7 @@ def insert_crypto15m_tick(conn, row: dict) -> None:
             row.get("strike"), row.get("delta_signed_pct"), row.get("sigma1m"),
             row.get("model_prob"), row.get("edge_net_cents"),
             row.get("settle_prints"), row.get("no_ask"), row.get("spot_source"),
-            row.get("kalshi_env", "demo"),
+            row.get("kalshi_env") or RETIRED_ENV,
             row.get("vwap1h"), row.get("ema12"), row.get("sma20"), row.get("sma50"),
             row.get("price_vs_vwap_pct"), row.get("ema12_vs_sma20_pct"),
             row.get("ema1_vs_sma5_pct"), row.get("velocity1m_pct"),
@@ -1839,6 +1995,8 @@ def insert_crypto15m_tick(conn, row: dict) -> None:
 
 
 def crypto15m_strategy_stats(conn, env: str) -> list[dict]:
+    """Fee-true P&L per strategy (favorite/contrarian/model/model_fm/rules/
+    pair). Only real fills; the attribution column is stamped at entry."""
     rows = conn.execute(
         """SELECT COALESCE(NULLIF(strategy, ''), 'directional') strategy,
                   COUNT(*) n,
@@ -1856,6 +2014,13 @@ def crypto15m_strategy_stats(conn, env: str) -> list[dict]:
 
 
 def crypto15m_runner_stats(conn, env: str) -> list[dict]:
+    """Fee-true P&L per Multi-Run runner, split by mode (paper vs live).
+
+    Unlike strategy_stats this KEEPS paper (dry_run=1) rows — comparing many
+    strategies risk-free is the whole point of the Multi-Run panel. Each row is
+    one (runner_id, mode) bucket so a runner's paper and live results never mix.
+    Also returns live open-position counts so the panel can show what's working
+    now. runner_id '' is the legacy/default runner."""
     rows = conn.execute(
         """SELECT COALESCE(runner_id, '') runner_id,
                   CASE WHEN dry_run=1 THEN 'paper' ELSE 'live' END mode,
@@ -1894,6 +2059,10 @@ def crypto15m_runner_stats(conn, env: str) -> list[dict]:
 
 def recent_crypto15m_resolved(conn, env: str, limit: int = 200,
                               include_paper: bool = False) -> list[dict]:
+    """Resolved 15m trades for the History page (newest first). Real trades
+    only by default; include_paper adds Multi-Run paper (dry_run) rows so users
+    can review a strategy's simulated record (the UI badges + separates them so
+    paper P&L is never conflated with real money)."""
     paper_clause = "" if include_paper else "AND dry_run=0"
     rows = conn.execute(
         f"""SELECT * FROM crypto15m_positions
@@ -1908,7 +2077,10 @@ def crypto15m_tick_count(conn) -> int:
     return int(conn.execute("SELECT COUNT(*) FROM crypto15m_ticks").fetchone()[0])
 
 
+
 def insert_perp_farm_fill(conn, row: dict) -> bool:
+    """True when the fill is NEW (dedup on trade_id per env) — callers only
+    apply inventory/P&L updates for new rows."""
     cur = conn.execute(
         """INSERT OR IGNORE INTO perp_farm_fills
               (trade_id, order_id, ticker, ts_ms, side, count_cc,
@@ -1936,6 +2108,8 @@ def perp_farm_fill_seen(conn, trade_id: str, env: str) -> bool:
 
 
 def perp_farm_stats(conn, env: str, *, day_utc: str | None = None) -> dict:
+    """Volume/fees/realized aggregates in micro-dollars. day_utc 'YYYY-MM-DD'
+    filters to that UTC day; None = lifetime."""
     where = "kalshi_env=?"
     params: list = [env]
     if day_utc:
@@ -1960,6 +2134,11 @@ def perp_farm_stats(conn, env: str, *, day_utc: str | None = None) -> dict:
 
 
 def perp_farm_effective_fee_bps(conn, env: str, *, since_days: int = 30) -> float | None:
+    """Trailing realized MAKER fee as bps of notional, from actual fills — the
+    real maker fee Kalshi charged this account (tier-adjusted; no fee-schedule
+    guessing). Taker (flatten) legs are excluded so the estimate reflects the
+    resting-maker cost the farmer gates on. None when there is no recent
+    maker-fill volume to measure (caller then assumes the Tier-0 schedule fee)."""
     row = conn.execute(
         """SELECT COALESCE(SUM(fee_usd_micro), 0),
                   COALESCE(SUM(CAST(price_usd_micro AS REAL) * ABS(count_cc) / 100.0), 0)
@@ -2010,6 +2189,9 @@ def insert_pnl_snapshot(
 
 
 def get_risk_breach_start(conn, env: str, kind: str) -> float | None:
+    """Persisted first-breach timestamp (unix seconds) for the daily-risk
+    gate, or None when no breach is latched. Survives restarts so a reboot
+    mid-breach can't reopen the trading gate for another persistence window."""
     row = conn.execute(
         "SELECT breach_started_at FROM risk_state WHERE kalshi_env=? AND kind=?",
         (env, kind),
@@ -2189,6 +2371,16 @@ def get_pnl_snapshots(
 
 
 def recent_balance_transition(conn, env: str, within_sec: int = 180) -> bool:
+    """True when a bot position was OPENED or RESOLVED within the last
+    `within_sec` seconds — the window where the exchange's cash ledger and
+    our position ledger can disagree (an entry's debit / a settlement's
+    payout is in flight), so account totals built from cash + open-cost
+    transiently dip by ~one position (the "-$3.00 balance" reports) or lag
+    a win. Consumers show a 'syncing' hint instead of the scary number.
+    Keys on created_at / resolved_at, NOT last_updated — the 30s mark
+    reconcile touches last_updated constantly on open rows. Default window
+    matches the measured worst settlement-payout gap (~130s observed) and
+    the daily-risk persistence window (180s)."""
     args = (env, f"-{int(within_sec)} seconds", f"-{int(within_sec)} seconds")
     for table, extra in (("bot_positions", ""),
                          ("crypto15m_positions", "AND dry_run = 0")):
@@ -2241,6 +2433,18 @@ def update_terminal_rule(conn, rule_id: int, **fields) -> None:
 
 
 def claim_terminal_rule(conn, rule_id: int, env: str) -> bool:
+    """Move an armed rule to 'firing', atomically. Returns False if it was not
+    armed any more.
+
+    evaluate_rules snapshots the armed set once, then spends several seconds
+    per rule reading the book, reading the portfolio and POSTing an order. A
+    cancel landing inside that window was accepted and reported "Cancelled." —
+    and the sell went anyway, after which the fire-path UPDATE wrote
+    status='triggered' straight over the cancellation. The user's instruction
+    to stop was both ignored and erased.
+
+    A conditional UPDATE is the whole fix: only one writer can move a row out
+    of 'armed', so the money path runs exactly when the claim succeeds."""
     cur = conn.execute(
         "UPDATE terminal_rules SET status='firing' "
         "WHERE id=? AND kalshi_env=? AND status='armed'",
@@ -2261,6 +2465,7 @@ def cancel_terminal_rule(conn, rule_id: int, env: str) -> bool:
 def manual_positions(
     conn, env: str, *, resolved: bool | None = None, limit: int = 500,
 ) -> list[dict]:
+    """Hand-placed positions, newest first. `resolved=None` returns both."""
     sql = ("SELECT * FROM bot_positions "
            "WHERE signal_source='manual' AND kalshi_env=?")
     args: list = [env]
@@ -2273,6 +2478,12 @@ def manual_positions(
 
 
 def find_open_manual_position(conn, ticker: str, side: str, env: str) -> dict | None:
+    """The one live hand-placed row for this market and side, if any.
+
+    Kalshi reports ONE aggregate position per (ticker, side), and the reconcile
+    pass overwrites filled/cost from that aggregate — so a second buy on the
+    same side must add to this row rather than insert a duplicate the reconciler
+    would then have to pick between (and that exposure would double-count)."""
     row = conn.execute(
         """SELECT * FROM bot_positions
            WHERE signal_source='manual' AND ticker=? AND direction=?
@@ -2285,6 +2496,11 @@ def find_open_manual_position(conn, ticker: str, side: str, env: str) -> dict | 
 
 
 def bot_owns_position(conn, ticker: str, side: str, env: str) -> bool:
+    """Is there a live position here that the BOT is managing?
+
+    Selling it by hand is the user's right — it is their money — but it pulls
+    the rug from under whatever the engine was going to do with it, so the
+    ticket warns rather than silently letting the two halves fight."""
     row = conn.execute(
         """SELECT 1 FROM bot_positions
            WHERE ticker=? AND direction=? AND kalshi_env=? AND resolved=0
@@ -2297,6 +2513,13 @@ def bot_owns_position(conn, ticker: str, side: str, env: str) -> bool:
 
 
 def aggregate_stats(conn, env: str | None = None) -> dict:
+    """The BOT's record: win rate, today's P&L, open cost, fees.
+
+    Hand-placed positions are excluded. Mixing them in makes the one question
+    this table exists to answer — "is the automation working?" — unanswerable,
+    because a good week of manual trading and a broken strategy look identical.
+    Manual trades have their own history on the Terminal's portfolio page.
+    """
     cond = ""
     args: list = []
     if env:
@@ -2433,6 +2656,11 @@ def vacuum() -> None:
 
 
 def backup_research(keep: int = 7) -> str | None:
+    """Nightly copy of the whole DB into data/backups (rotated). The research
+    tables (ticks/signals/positions) are the irreplaceable evidence every
+    strategy verdict came from — before this there was NO backup anywhere and
+    factory_reset wiped them permanently. sqlite3's online backup API is safe
+    against concurrent writers."""
     try:
         src = str(db_path())
         bdir = os.path.join(os.path.dirname(src), "backups")

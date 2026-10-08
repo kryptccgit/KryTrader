@@ -1,3 +1,13 @@
+"""LIVE cross-venue check. Run by hand.
+
+Unit tests pin the matcher against gold cases I chose; this runs it over both
+live universes, where the pairs I did not think of live. It prints every
+confident pair so they can be eyeballed, because the failure mode that matters
+is not a crash — it is a confident, plausible, WRONG pairing that renders as an
+inviting price difference between two different questions.
+
+    python/.venv/Scripts/python.exe python/live_crossvenue_check.py
+"""
 from __future__ import annotations
 
 import asyncio
